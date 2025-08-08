@@ -1,0 +1,10 @@
+Timestamp,Temperature (°C),Frequency (Hz),Voltage (V),Configuration,Current (A)
+2025-06-10 12:19:37,40,6000000,200,Dual Conduction,1.249e-07
+2025-06-10 12:19:40,40,6000000,200,Dual Conduction,-2e-08
+2025-06-10 12:19:42,40,6000000,200,Dual Conduction,3.75e-08
+2025-06-10 12:19:45,40,6000000,200,Dual Conduction,1.75e-08
+2025-06-10 12:19:48,40,6000000,200,Dual Conduction,2.5e-08
+2025-06-10 12:19:51,40,6000000,200,Dual Conduction,2.75e-08
+2025-06-10 12:19:54,40,6000000,200,Dual Conduction,4e-08
+2025-06-10 12:19:57,40,6000000,200,Dual Conduction,6.74e-08
+2025-06-10 12:20:00,40,6000000,200,Dual Conduction,8.74e-08

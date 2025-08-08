@@ -1,0 +1,36 @@
+2025-07-11 17:17:31,152 - __main__ - INFO - Starting GaN Device Test Runner
+2025-07-11 17:19:50,962 - __main__ - INFO - Starting GaN Device Test Runner
+2025-07-11 17:24:12,110 - __main__ - INFO - Starting GaN Device Test Runner
+2025-07-11 17:26:53,175 - __main__ - INFO - Starting GaN Device Test Runner
+2025-07-11 19:16:47,535 - __main__ - INFO - Starting GaN Device Test Runner
+2025-07-11 19:17:25,343 - core.instrument_utils - INFO - Configuring wavegen: Dual Conduction, 6000000Hz, 25%
+2025-07-11 19:17:26,065 - core.instrument_utils - INFO - Wavegen configuration complete
+2025-07-11 19:17:26,131 - core.experiment - INFO - Connected to /dev/tty.usbserial-PX95ZVF1
+2025-07-11 19:17:27,056 - core.experiment - INFO - Configured Prologix for GPIB address 22
+2025-07-11 19:17:27,056 - core.data_utils - INFO - Generated filename: Device Data/GPI65030DFN/6MHz/25/GPI65030DFN_Dual Conduction_25C_6MHz_200V_25duty.csv
+2025-07-11 19:17:31,600 - core.experiment - INFO - Reset instrument to local control
+2025-07-11 19:17:55,519 - __main__ - INFO - Starting GaN Device Test Runner
+2025-07-11 19:18:08,168 - core.instrument_utils - INFO - Configuring wavegen: Dual Conduction, 6000000Hz, 25%
+2025-07-11 19:18:08,887 - core.instrument_utils - INFO - Wavegen configuration complete
+2025-07-11 19:18:10,888 - core.experiment - INFO - Connected to /dev/tty.usbserial-PX95ZVF1
+2025-07-11 19:18:11,812 - core.experiment - INFO - Configured Prologix for GPIB address 22
+2025-07-11 19:18:11,812 - core.data_utils - INFO - Generated filename: Device Data/GPI65030DFN/6MHz/25/GPI65030DFN_Dual Conduction_80C_6MHz_200V_25duty.csv
+2025-07-11 19:19:16,039 - googleapiclient.discovery_cache - INFO - file_cache is only supported with oauth2client<4.0.0
+2025-07-11 19:19:16,041 - googleapiclient.discovery_cache - INFO - file_cache is only supported with oauth2client<4.0.0
+2025-07-11 19:19:16,042 - core.sheet_utils - INFO - Successfully authenticated with Google Sheets API
+2025-07-11 19:19:17,037 - core.sheet_utils - INFO - Successfully wrote 5 values to spreadsheet
+2025-07-11 19:19:17,037 - core.sheet_utils - INFO - Updated Dual Conduction, 25%, 200V on 80°C with Vin=0.0402001791, Iin=7.3e-09, fsw=6.0, Irms=0.0160735127616834, Isw=0.0160735127563568
+2025-07-11 19:19:21,441 - core.experiment - INFO - Reset instrument to local control
+2025-07-11 19:22:52,717 - __main__ - INFO - Starting GaN Device Test Runner
+2025-07-11 19:23:11,902 - __main__ - INFO - Starting GaN Device Test Runner
+2025-07-11 19:23:19,961 - core.instrument_utils - INFO - Configuring wavegen: Dual Conduction, 6000000Hz, 25%
+2025-07-11 19:23:20,680 - core.instrument_utils - INFO - Wavegen configuration complete
+2025-07-11 19:23:51,799 - core.experiment - INFO - Connected to /dev/tty.usbserial-PX95ZVF1
+2025-07-11 19:23:52,724 - core.experiment - INFO - Configured Prologix for GPIB address 22
+2025-07-11 19:23:52,724 - core.data_utils - INFO - Generated filename: Device Data/GPI65030DFN/6MHz/25/GPI65030DFN_Dual Conduction_80C_6MHz_200V_25duty.csv
+2025-07-11 19:24:59,754 - googleapiclient.discovery_cache - INFO - file_cache is only supported with oauth2client<4.0.0
+2025-07-11 19:24:59,756 - googleapiclient.discovery_cache - INFO - file_cache is only supported with oauth2client<4.0.0
+2025-07-11 19:24:59,757 - core.sheet_utils - INFO - Successfully authenticated with Google Sheets API
+2025-07-11 19:25:00,663 - core.sheet_utils - INFO - Successfully wrote 5 values to spreadsheet
+2025-07-11 19:25:00,664 - core.sheet_utils - INFO - Updated Dual Conduction, 25%, 200V on 80°C with Vin=67.1680398, Iin=0.042083072, fsw=6.3, Irms=1.8357917697269, Isw=0.5206702169337548
+2025-07-11 19:25:08,754 - core.experiment - INFO - Reset instrument to local control

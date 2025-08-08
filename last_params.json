@@ -1,0 +1,9 @@
+{
+  "device_name": "GS66508B",
+  "config": "Dual Conduction",
+  "frequency": 6000000,
+  "duty": 25,
+  "temperature": 25,
+  "voltage": 200,
+  "duration": "1"
+}
