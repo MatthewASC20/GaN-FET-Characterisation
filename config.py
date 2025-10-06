@@ -24,7 +24,7 @@ VOLTAGE_DEFAULT_MINUTES = {
 
 INSTRUMENTS = {
     "SDM3055": {
-        "ip": "10.2.90.226",
+        "ip": "10.2.90.56",
         "port": 5025
     },
     "SDG6022X": {
@@ -41,9 +41,28 @@ INSTRUMENTS = {
 
 #Columns
 SHEET_MAPPINGS = {
-    "Dual Conduction": {"vin": 1, "iin": 2, "fsw": 5, "irms" : 9, "isw": 12},
-    "Single Conduction": {"vin": 13, "iin": 14, "fsw": 17, "irms" :18},
-    "Single Device": {"vin": 22, "iin": 23, "fsw": 26, "irms" :27},
+    "Dual Conduction": {
+        "vin": 1,
+        "iin": 2,
+        "fsw": 5,
+        "irms": 9,
+        "vds_pk": 4,
+        "isw": 12,
+    },
+    "Single Conduction": {
+        "vin": 13,
+        "iin": 14,
+        "fsw": 17,
+        "irms": 18,
+        "vds_pk": 16,
+    },
+    "Single Device": {
+        "vin": 22,
+        "iin": 23,
+        "fsw": 26,
+        "irms": 27,
+        "vds_pk": 25,
+    },
 }
 
 DUTY_ROW_MAP = {

@@ -5,13 +5,14 @@ import csv
 def freq_label(freq_val):
     return f"{int(freq_val/1e6)}MHz"
 
-def generate_filename(device_name, temp, freq, volt, config, duty):
+def generate_filename(device_name, temp, freq, volt, config, duty, ensure_dirs=True):
     safe_device = "".join(c for c in device_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
     base_folder = "Device Data"
     device_folder = os.path.join(base_folder, safe_device)
     freq_folder = os.path.join(device_folder, freq_label(freq))
     duty_folder = os.path.join(freq_folder, str(duty))
-    os.makedirs(duty_folder, exist_ok=True)
+    if ensure_dirs:
+        os.makedirs(duty_folder, exist_ok=True)
     filename = f"{safe_device}_{config}_{int(temp)}C_{freq_label(freq)}_{int(volt)}V_{duty}duty.csv"
     return os.path.join(duty_folder, filename)
 
@@ -49,7 +50,7 @@ def get_prior_tuned_frequency(self, device_name, freq, duty, volt, config):
 
     # Try current config at 25°C
     primary_path = generate_filename(
-        device_name, 25, freq, volt, config, duty
+        device_name, 25, freq, volt, config, duty, ensure_dirs=False
     )
     freq_val = load_tuned_frequency_from_csv(primary_path)
     if freq_val:
@@ -57,7 +58,7 @@ def get_prior_tuned_frequency(self, device_name, freq, duty, volt, config):
 
     # Fallback: Dual Conduction at 25°C
     fallback_path = generate_filename(
-        device_name, 25, freq, volt, "Dual Conduction", duty
+        device_name, 25, freq, volt, "Dual Conduction", duty, ensure_dirs=False
     )
     fallback_freq = load_tuned_frequency_from_csv(fallback_path)
     if fallback_freq:

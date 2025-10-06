@@ -5,20 +5,23 @@ import pandas as pd
 from data_utils import freq_label
 import matplotlib.pyplot as plt
 from sheet_utils import clear_test_in_sheet
+from typing import List, Tuple, Optional
 
 class ExperimentTracker(tk.Frame):
     def __init__(self, master, get_device_name, frequencies, duties, temperatures, voltages, configs, **kwargs):
         super().__init__(master, **kwargs)
         self.get_device_name = get_device_name
-        self.frequencies = frequencies
-        self.duties = duties
-        self.temperatures = temperatures
-        self.voltages = voltages
-        self.configs = configs
+        self.frequencies = list(frequencies)
+        self.duties = list(duties)
+        self.temperatures = list(temperatures)
+        self.voltages = list(voltages)
+        self.configs = list(configs)
 
         # Frequency selector variable and dropdown
-        self.selected_freq = tk.IntVar(value=self.frequencies[0][0])
+        initial_freq = self.frequencies[0][0] if self.frequencies else 0
+        self.selected_freq = tk.IntVar(value=initial_freq)
         self.tables = []  # Will hold a table for each temperature
+        self.title_labels = []  # Track temperature headers so we can refresh text
 
         self._build_frequency_selector()
         self.build_tables()
@@ -26,22 +29,48 @@ class ExperimentTracker(tk.Frame):
 
     def _build_frequency_selector(self):
         """Create a frequency dropdown at the top."""
-        freq_labels = [freq_label(freq_val) for freq_val, _ in self.frequencies]
-        freq_values = [freq_val for freq_val, _ in self.frequencies]
         self.freq_dropdown = ttk.Combobox(
-            self, values=freq_labels, state="readonly",
+            self,
+            values=[label for _, label in self.frequencies],
+            state="readonly",
             width=10
         )
-        self.freq_dropdown.current(0)
+        if self.frequencies:
+            self.freq_dropdown.current(0)
         self.freq_dropdown.grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
         self.freq_dropdown.bind("<<ComboboxSelected>>", self._on_freq_selected)
+        self._refresh_frequency_dropdown()
+
+    def _frequency_label_from_value(self, freq_val: int) -> str | None:
+        for value, label in self.frequencies:
+            if value == freq_val:
+                return label
+        return freq_label(freq_val) if freq_val else None
+
+    def _refresh_frequency_dropdown(self):
+        labels = [label for _, label in self.frequencies]
+        self.freq_dropdown["values"] = labels
+        if not labels:
+            self.freq_dropdown.set("")
+            self.selected_freq.set(0)
+            return
+
+        current_val = self.selected_freq.get()
+        available_values = [value for value, _ in self.frequencies]
+        if current_val not in available_values:
+            self.selected_freq.set(available_values[0])
+            current_val = available_values[0]
+
+        current_label = self._frequency_label_from_value(current_val)
+        if current_label:
+            self.freq_dropdown.set(current_label)
 
     def _on_freq_selected(self, event=None):
         """Change all tables to display for the selected frequency."""
         # Update selected_freq from dropdown
         selected_label = self.freq_dropdown.get()
-        for freq_val, _ in self.frequencies:
-            if freq_label(freq_val) == selected_label:
+        for freq_val, label in self.frequencies:
+            if label == selected_label:
                 self.selected_freq.set(freq_val)
                 break
         self.update_tracker()
@@ -52,6 +81,7 @@ class ExperimentTracker(tk.Frame):
             for frame in self.table_frames:
                 frame.destroy()
         self.tables = []
+        self.title_labels = []
         self.table_frames = []
 
         for i, (temp_val, temp_label) in enumerate(self.temperatures):
@@ -61,10 +91,11 @@ class ExperimentTracker(tk.Frame):
 
             title = ttk.Label(
                 frame,
-                text=f"{self.get_device_name()} - {temp_label} @ {freq_label(self.selected_freq.get())}",
+                text=f"{self.get_device_name()} - {temp_label} @ {self._frequency_label_from_value(self.selected_freq.get())}",
                 font=("Arial", 11, "bold")
             )
             title.pack()
+            self.title_labels.append(title)
             tree = ttk.Treeview(
                 frame,
                 columns=("config", "duty", "volt", "done"),
@@ -184,8 +215,13 @@ class ExperimentTracker(tk.Frame):
         safe_device = "".join(c for c in device if c.isalnum() or c in (' ', '_', '-')).rstrip()
         freq_val = self.selected_freq.get()
         freq_str = freq_label(freq_val)
+        freq_display = self._frequency_label_from_value(freq_val) or freq_str
         for idx, (temp_val, temp_label) in enumerate(self.temperatures):
             tree = self.tables[idx]
+            if idx < len(self.title_labels):
+                self.title_labels[idx].config(
+                    text=f"{device} - {temp_label} @ {freq_display}"
+                )
             for row in tree.get_children():
                 tree.delete(row)
             freq_folder = os.path.join("Device Data", safe_device, freq_str)
@@ -201,3 +237,32 @@ class ExperimentTracker(tk.Frame):
             sorted_rows = sorted(rows, key=lambda x: (x[0], x[1], x[2]))
             for row in sorted_rows:
                 tree.insert("", "end", values=row)
+
+    def update_parameter_space(
+        self,
+        *,
+        frequencies: Optional[List[Tuple[int, str]]] = None,
+        duties: Optional[List[Tuple[int, str]]] = None,
+        temperatures: Optional[List[Tuple[int, str]]] = None,
+        voltages: Optional[List[Tuple[int, str]]] = None,
+        configs: Optional[List[Tuple[str, str]]] = None,
+    ):
+        if frequencies is not None:
+            self.frequencies = list(frequencies)
+            if not self.frequencies:
+                self.selected_freq.set(0)
+            elif self.selected_freq.get() not in [value for value, _ in self.frequencies]:
+                self.selected_freq.set(self.frequencies[0][0])
+            self._refresh_frequency_dropdown()
+
+        if duties is not None:
+            self.duties = list(duties)
+        if temperatures is not None:
+            self.temperatures = list(temperatures)
+        if voltages is not None:
+            self.voltages = list(voltages)
+        if configs is not None:
+            self.configs = list(configs)
+
+        self.build_tables()
+        self.update_tracker()

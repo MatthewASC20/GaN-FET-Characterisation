@@ -3,8 +3,9 @@ from tkinter import ttk, messagebox
 from tkmacosx import Button as MacButton
 from tracker import ExperimentTracker
 from config import *
+import config
 from instrument_utils import *
-from data_utils import generate_filename, log_data_to_csv
+from data_utils import generate_filename, log_data_to_csv, freq_label
 from experiment import *
 import matplotlib
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -14,11 +15,12 @@ import threading
 import os
 import json
 from sheet_utils import log_final_results_to_sheet
-from typing import Callable, Optional, Dict, Any
+from typing import Callable, Optional, Dict, Any, List, Tuple
+import copy
 from dataclasses import dataclass
 from enum import Enum
 import csv
-from api import setup_device_in_drive 
+from api import setup_device_in_drive, load_mappings
 
 matplotlib.use('TkAgg')
 
@@ -27,6 +29,58 @@ PARAMS_FILE = "last_params.json"
 PLOT_MAX_POINTS = 100
 VOLTAGE_TOLERANCE = 2.0
 DEFAULT_GEOMETRY = "1700x950"
+
+
+def sanitize_device_name(raw_name: str) -> str:
+    """Sanitize device names for filesystem usage."""
+    if not raw_name:
+        return ""
+    return "".join(
+        c for c in raw_name.strip() if c.isalnum() or c in (" ", "_", "-")
+    )
+
+
+class DeviceConfigStore:
+    """Persist per-device parameter configurations."""
+
+    CONFIG_FILENAME = "device_config.json"
+
+    def __init__(self, base_folder: str = "Device Data"):
+        self.base_folder = base_folder
+
+    def _config_path(self, device_name: str) -> Optional[str]:
+        sanitized = sanitize_device_name(device_name)
+        if not sanitized:
+            return None
+        return os.path.join(self.base_folder, sanitized, self.CONFIG_FILENAME)
+
+    def load(self, device_name: str) -> Optional[Dict[str, Any]]:
+        path = self._config_path(device_name)
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception as exc:
+            print(f"Warning: failed to read device config '{path}': {exc}")
+            return None
+
+    def save(self, device_name: str, data: Dict[str, Any]) -> bool:
+        path = self._config_path(device_name)
+        if not path:
+            return False
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+            return True
+        except Exception as exc:
+            print(f"Warning: failed to save device config '{path}': {exc}")
+            return False
+
+    def exists(self, device_name: str) -> bool:
+        path = self._config_path(device_name)
+        return bool(path and os.path.isfile(path))
 
 class ExperimentState(Enum):
     IDLE = "idle"
@@ -87,58 +141,82 @@ class ParamButtonGroup(tk.Frame):
     def __init__(self, parent, options, variable, label_text):
         super().__init__(parent)
         self.variable = variable
-        self.buttons = {}
-        self.options = options  # Store options for reference
+        self.buttons: Dict[Any, MacButton] = {}
+        self.options = list(options)  # Store options for reference
+        
+        self.label_widget = ttk.Label(self, text=label_text)
+        self.label_widget.pack(side="left", padx=(0, 10))
 
-        label = ttk.Label(self, text=label_text)
-        label.pack(side="left", padx=(0, 10))
+        self.buttons_frame = tk.Frame(self)
+        self.buttons_frame.pack(side="left")
 
-        for value, text in options:
+        self._build_buttons()
+
+        # Trace variable changes
+        self.variable.trace_add("write", lambda *args: self.after(1, self._highlight_selected))
+        
+        # Initial highlight after a short delay
+        self.after(100, self._highlight_selected)
+
+    def _on_button_click(self, value):
+        self.variable.set(value)
+        # Force immediate update
+        self._highlight_selected()
+
+    def _build_buttons(self):
+        for child in self.buttons_frame.winfo_children():
+            child.destroy()
+        self.buttons.clear()
+
+        for value, text in self.options:
             button = MacButton(
-                self, text=text, width=100, height=30, borderless=1,
+                self.buttons_frame,
+                text=text,
+                width=100,
+                height=30,
+                borderless=1,
                 command=lambda v=value: self._on_button_click(v)
             )
             button.pack(side="left", padx=5)
             self.buttons[value] = button
 
-        # Initial highlight
-        self._highlight_selected()
-        
-        # Trace variable changes
-        self.variable.trace_add("write", lambda *args: self.after(1, self._highlight_selected))
-
-    def _on_button_click(self, value):
-        self.variable.set(value)
-        # Immediate visual feedback
-        self._highlight_selected()
+        self._ensure_variable_in_options()
 
     def _highlight_selected(self):
         """Update button highlighting based on current variable value"""
         try:
-            # Get the current value
             selected = self.variable.get()
             
-            # Update each button's appearance
             for value, button in self.buttons.items():
                 if value == selected:
-                    # Selected button - blue
+                    # Selected button - blue background
+                    # Force the button to update by destroying and recreating it
                     button.config(
-                        bg="#2196F3", 
-                        fg="white", 
+                        bg="#2196F3",
+                        fg="white",
                         activebackground="#1976D2",
-                        activeforeground="white"
+                        activeforeground="white",
+                        borderless=1
                     )
+                    # Double-configure to force the update on macOS
+                    button.configure(background="#2196F3")
+                    button.configure(foreground="white")
                 else:
-                    # Unselected button - gray
+                    # Unselected button - gray background
                     button.config(
-                        bg="#E0E0E0", 
-                        fg="black", 
+                        bg="#E0E0E0",
+                        fg="black",
                         activebackground="#D0D0D0",
-                        activeforeground="black"
+                        activeforeground="black",
+                        borderless=1
                     )
+                    # Double-configure to force the update on macOS
+                    button.configure(background="#E0E0E0")
+                    button.configure(foreground="black")
             
-            # Force the frame to update
+            # Multiple update methods to force refresh
             self.update_idletasks()
+            self.update()
             
         except Exception as e:
             print(f"Error in _highlight_selected: {e}")
@@ -147,8 +225,259 @@ class ParamButtonGroup(tk.Frame):
         """Public method to force refresh the visual state"""
         self._highlight_selected()
 
+    def _ensure_variable_in_options(self):
+        current_value = self.variable.get()
+        option_values = [value for value, _ in self.options]
+        if option_values and current_value not in option_values:
+            self.variable.set(option_values[0])
+
+    def set_options(self, options: List[Tuple[Any, str]]):
+        """Replace option set and rebuild buttons"""
+        self.options = list(options)
+        self._build_buttons()
+        self.after(10, self._highlight_selected)
 
 
+class ParameterListEditor(ttk.LabelFrame):
+    """Reusable editor for managing parameter option lists."""
+
+    def __init__(
+        self,
+        master,
+        title: str,
+        initial_options: List[Tuple[Any, str]],
+        on_change: Callable[[List[Tuple[Any, str]]], Optional[List[Tuple[Any, str]]]],
+        *,
+        value_parser: Callable[[str], Any],
+        default_label_factory: Callable[[Any], str],
+        default_options: List[Tuple[Any, str]],
+    ):
+        super().__init__(master, text=title)
+        self.on_change = on_change
+        self.value_parser = value_parser
+        self.default_label_factory = default_label_factory
+        self.default_options = list(default_options)
+        self.options: List[Tuple[Any, str]] = []
+
+        self._build_widgets()
+        self.set_options(initial_options)
+
+    def _build_widgets(self):
+        self.tree = ttk.Treeview(
+            self,
+            columns=("value",),
+            show="headings",
+            height=6,
+        )
+        self.tree.heading("value", text="Value")
+        self.tree.column("value", anchor="center", width=160)
+        self.tree.grid(row=0, column=0, columnspan=3, sticky="nsew", padx=5, pady=5)
+
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+
+        ttk.Label(self, text="Value").grid(row=1, column=0, sticky="w", padx=5)
+
+        self.value_entry = ttk.Entry(self)
+        self.value_entry.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=(0, 5))
+
+        self.add_button = ttk.Button(self, text="Add / Update", command=self._handle_add_or_update)
+        self.add_button.grid(row=2, column=2, sticky="ew", padx=5, pady=(0, 5))
+
+        self.delete_button = ttk.Button(self, text="Delete Selected", command=self._handle_delete)
+        self.delete_button.grid(row=3, column=0, sticky="ew", padx=5, pady=(0, 5))
+
+        self.reset_button = ttk.Button(self, text="Reset to Defaults", command=self._handle_reset)
+        self.reset_button.grid(row=3, column=1, sticky="ew", padx=5, pady=(0, 5))
+
+        self.clear_button = ttk.Button(self, text="Clear Field", command=self._clear_entries)
+        self.clear_button.grid(row=3, column=2, sticky="ew", padx=5, pady=(0, 5))
+
+        for col in range(3):
+            weight = 1 if col == 0 or col == 1 else 0
+            self.grid_columnconfigure(col, weight=weight)
+        self.grid_rowconfigure(0, weight=1)
+
+    def set_options(self, options: List[Tuple[Any, str]]):
+        self.options = list(options)
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        for value, _label in self.options:
+            self.tree.insert("", "end", values=(value,))
+        self._clear_entries()
+
+    def _handle_add_or_update(self):
+        value_raw = self.value_entry.get().strip()
+        if not value_raw:
+            messagebox.showerror("Input Error", "Please provide a value.")
+            return
+
+        try:
+            parsed_value = self.value_parser(value_raw)
+        except Exception:
+            messagebox.showerror("Input Error", f"Invalid value: {value_raw}")
+            return
+
+        label = str(self.default_label_factory(parsed_value))
+
+        updated = self._merge_options((parsed_value, label))
+        normalized = self.on_change(updated)
+        if normalized is not None:
+            self.set_options(normalized)
+
+    def _merge_options(self, entry: Tuple[Any, str]) -> List[Tuple[Any, str]]:
+        value, label = entry
+        merged: List[Tuple[Any, str]] = []
+        found = False
+        for existing_value, existing_label in self.options:
+            if existing_value == value:
+                merged.append((value, label))
+                found = True
+            else:
+                merged.append((existing_value, existing_label))
+        if not found:
+            merged.append((value, label))
+        return merged
+
+    def _handle_delete(self):
+        selected_items = self.tree.selection()
+        if not selected_items:
+            messagebox.showerror("Selection Error", "Please select an entry to delete.")
+            return
+
+        remaining: List[Tuple[Any, str]] = []
+        selected_values = {
+            self.tree.item(item, "values")[0]
+            for item in selected_items
+        }
+
+        for value, label in self.options:
+            if str(value) not in selected_values:
+                remaining.append((value, label))
+
+        normalized = self.on_change(remaining)
+        if normalized is not None:
+            self.set_options(normalized)
+
+    def _handle_reset(self):
+        normalized = self.on_change(list(self.default_options))
+        if normalized is not None:
+            self.set_options(normalized)
+
+    def _clear_entries(self):
+        self.value_entry.delete(0, tk.END)
+
+    def _on_tree_select(self, _event):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        item = selection[0]
+        (value,) = self.tree.item(item, "values")
+        self.value_entry.delete(0, tk.END)
+        self.value_entry.insert(0, value)
+
+
+
+class InstrumentConfigEditor(ttk.LabelFrame):
+    """Editor for instrument IP/port configuration."""
+
+    def __init__(
+        self,
+        master,
+        *,
+        initial_configs: Dict[str, Dict[str, Any]],
+        default_configs: Dict[str, Dict[str, Any]],
+        on_change: Callable[[Dict[str, Dict[str, Any]]], Optional[Dict[str, Dict[str, Any]]]],
+    ):
+        super().__init__(master, text="Instrument Connections")
+        self.on_change = on_change
+        self.default_configs = copy.deepcopy(default_configs)
+        self.entries: Dict[str, Dict[str, ttk.Entry]] = {}
+        self.current_configs: Dict[str, Dict[str, Any]] = copy.deepcopy(initial_configs)
+        self._build_widgets(self.current_configs)
+
+    def _build_widgets(self, configs: Dict[str, Dict[str, Any]]):
+        for child in self.winfo_children():
+            child.destroy()
+        self.entries.clear()
+
+        ttk.Label(self, text="Instrument").grid(row=0, column=0, padx=5, pady=(5, 2), sticky="w")
+        ttk.Label(self, text="IP Address").grid(row=0, column=1, padx=5, pady=(5, 2), sticky="w")
+        ttk.Label(self, text="Port").grid(row=0, column=2, padx=5, pady=(5, 2), sticky="w")
+
+        for row, (name, settings) in enumerate(configs.items(), start=1):
+            ttk.Label(self, text=name).grid(row=row, column=0, padx=5, pady=2, sticky="w")
+
+            ip_entry = ttk.Entry(self)
+            ip_entry.insert(0, settings.get("ip", ""))
+            ip_entry.grid(row=row, column=1, padx=5, pady=2, sticky="ew")
+
+            port_entry = ttk.Entry(self, width=8)
+            port_entry.insert(0, str(settings.get("port", "")))
+            port_entry.grid(row=row, column=2, padx=5, pady=2, sticky="ew")
+
+            self.entries[name] = {"ip": ip_entry, "port": port_entry}
+
+        button_row = len(configs) + 1
+        apply_btn = ttk.Button(self, text="Apply Changes", command=self._apply_changes)
+        apply_btn.grid(row=button_row, column=0, padx=5, pady=(10, 5), sticky="ew")
+
+        reset_btn = ttk.Button(self, text="Reset to Defaults", command=self._reset_to_defaults)
+        reset_btn.grid(row=button_row, column=1, padx=5, pady=(10, 5), sticky="ew")
+
+        reload_btn = ttk.Button(self, text="Reload Current", command=self._reload_current)
+        reload_btn.grid(row=button_row, column=2, padx=5, pady=(10, 5), sticky="ew")
+
+        self.grid_columnconfigure(0, weight=0)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_columnconfigure(2, weight=0)
+
+    def set_configs(self, configs: Dict[str, Dict[str, Any]]):
+        self.current_configs = copy.deepcopy(configs)
+        if set(configs.keys()) != set(self.entries.keys()):
+            self._build_widgets(self.current_configs)
+            return
+
+        for name, fields in self.entries.items():
+            ip_entry = fields["ip"]
+            port_entry = fields["port"]
+            ip_entry.delete(0, tk.END)
+            ip_entry.insert(0, configs.get(name, {}).get("ip", ""))
+            port_entry.delete(0, tk.END)
+            port_entry.insert(0, str(configs.get(name, {}).get("port", "")))
+
+    def _reload_current(self):
+        self.set_configs(self.current_configs)
+
+    def _apply_changes(self):
+        updated: Dict[str, Dict[str, Any]] = {}
+        for name, fields in self.entries.items():
+            ip = fields["ip"].get().strip()
+            port_raw = fields["port"].get().strip()
+
+            if not ip:
+                messagebox.showerror("Validation Error", f"IP address is required for {name}.")
+                return
+
+            try:
+                port = int(port_raw, 10)
+            except ValueError:
+                messagebox.showerror("Validation Error", f"Port must be a number for {name}.")
+                return
+
+            if not (0 < port <= 65535):
+                messagebox.showerror("Validation Error", f"Port out of range for {name}.")
+                return
+
+            updated[name] = {"ip": ip, "port": port}
+
+        normalized = self.on_change(updated)
+        if normalized is not None:
+            self.set_configs(normalized)
+
+    def _reset_to_defaults(self):
+        normalized = self.on_change(copy.deepcopy(self.default_configs))
+        if normalized is not None:
+            self.set_configs(normalized)
 class PlotManager:
     """Manages the real-time plotting functionality"""
     
@@ -241,9 +570,11 @@ class WavegenController:
         new_duty = self.gui.duty_var.get()
         
         try:
+            freq_to_apply = applied_freq if applied_freq is not None else new_freq
+
             # Apply changes based on what changed
             if new_config != self.last_confirmed_config:
-                configure_wavegen(new_config, new_freq, new_duty)
+                configure_wavegen(new_config, freq_to_apply, new_duty)
             else:
                 # Only update frequency if no tuned frequency is being applied
                 if applied_freq is None:
@@ -251,7 +582,7 @@ class WavegenController:
                         query_scpi("SDG6022X", f"C1:BSWV FRQ,{new_freq}")
                         if new_config == "Dual Conduction":
                             query_scpi("SDG6022X", f"C2:BSWV FRQ,{new_freq}")
-                
+
                 if new_duty != self.last_confirmed_duty:
                     query_scpi("SDG6022X", f"C1:BSWV DUTY,{new_duty}")
                     if new_config == "Dual Conduction":
@@ -398,8 +729,12 @@ class ExperimentRunner:
         if os.path.isfile(filename):
             result = messagebox.askyesno(
                 "Overwrite Confirmation",
-                f"A result file for this test already exists:\n\n"
-                f"{os.path.basename(filename)}\n\nDo you want to overwrite it?"
+                (
+                    "An existing data log was found for this test setup.\n\n"
+                    "File:\n"
+                    f"  {os.path.basename(filename)}\n\n"
+                    "Overwrite the current file with new results?"
+                )
             )
             if not result:
                 messagebox.showinfo("Experiment Cancelled", "Test was cancelled.")
@@ -432,20 +767,33 @@ class ExperimentRunner:
     def _capture_final_readings(self, filename: str, params: ExperimentParams):
         """Capture and log final instrument readings"""
         try:
-            dc_voltage = float(get_multimeter_voltage())
-            rms_current = float(get_oscilloscope_rms_current())
-            isw_rms = float(get_oscilloscope_isw_rms())
+            def _get_float_reading(fetcher, label: str) -> float:
+                """Safely convert instrument readings to float"""
+                raw_value = fetcher()
+                if raw_value is None:
+                    raise ValueError(f"{label} reading unavailable")
+                try:
+                    return float(raw_value)
+                except (TypeError, ValueError):
+                    raise ValueError(f"{label} reading invalid: {raw_value}")
+
+            dc_voltage = _get_float_reading(get_multimeter_voltage, "DC voltage")
+            rms_current = _get_float_reading(get_oscilloscope_rms_current, "RMS current")
+            isw_rms = _get_float_reading(get_oscilloscope_isw_rms, "Isw RMS current")
+            vds_pk = _get_float_reading(get_oscilloscope_peak_voltage, "Vds peak voltage")
             dc_current = self.gui.last_current_value
-            measured_freq = float(get_wavegen_frequency())
+            if dc_current is None:
+                raise ValueError("DC current reading unavailable")
+            measured_freq = _get_float_reading(get_wavegen_frequency, "Wavegen frequency")
 
             # Log to CSV
             log_data_to_csv(filename, [
                 "FINAL_READINGS", dc_voltage, rms_current, dc_current,
-                measured_freq, isw_rms
+                measured_freq, isw_rms, vds_pk
             ])
 
             # Log to Google Sheet
-            success = log_final_results_to_sheet(
+            success, error_message = log_final_results_to_sheet(
                 device_name=params.device_name,
                 freq=params.frequency,
                 temp=params.temperature,
@@ -456,6 +804,7 @@ class ExperimentRunner:
                 iin=dc_current,
                 fsw=measured_freq / 1e6,
                 irms=rms_current,
+                vds_pk=vds_pk,
                 isw=isw_rms
             )
 
@@ -464,6 +813,7 @@ class ExperimentRunner:
             print(f"RMS Current: {rms_current} A")
             print(f"DC Current: {dc_current} A")
             print(f"Frequency: {measured_freq} Hz")
+            print(f"Vds Peak: {vds_pk} V")
 
             if params.config == "Dual Conduction":
                 print(f"Isw RMS Current: {isw_rms} A")
@@ -471,7 +821,8 @@ class ExperimentRunner:
             if success:
                 print("Logged final readings to Google Sheet.")
             else:
-                print("Failed to log final readings to Google Sheet.")
+                detail = f": {error_message}" if error_message else "."
+                print(f"Failed to log final readings to Google Sheet{detail}")
 
         except Exception as e:
             print(f"Error capturing final readings: {e}")
@@ -505,26 +856,49 @@ class ParameterManager:
         except Exception as e:
             print(f"Error saving parameters: {e}")
     
-    def load_params(self):
+    def load_params(self, preloaded_params: Optional[Dict[str, Any]] = None):
         """Load parameters from file"""
+        params: Optional[Dict[str, Any]] = None
         try:
-            if os.path.isfile(PARAMS_FILE):
-                with open(PARAMS_FILE, "r") as f:
-                    params = json.load(f)
-                
-                self.gui.device_name_var.set(params.get("device_name", ""))
-                self.gui.config_var.set(params.get("config", self.gui.config_var.get()))
-                self.gui.frequency_var.set(int(params.get("frequency", self.gui.frequency_var.get())))
-                self.gui.duty_var.set(int(params.get("duty", self.gui.duty_var.get())))
-                self.gui.temperature_var.set(int(params.get("temperature", self.gui.temperature_var.get())))
-                self.gui.voltage_var.set(int(params.get("voltage", self.gui.voltage_var.get())))
-                
-                duration = params.get("duration", VOLTAGE_DEFAULT_MINUTES.get(self.gui.voltage_var.get(), 1))
-                self.gui._cached_duration = duration
-                
-        except Exception as e:
-            print(f"Error loading parameters: {e}")
+            if preloaded_params is not None:
+                params = preloaded_params
+            elif os.path.isfile(PARAMS_FILE):
+                with open(PARAMS_FILE, "r", encoding="utf-8") as fh:
+                    params = json.load(fh)
+
+            if not params:
+                return
+
+            self.gui.device_name_var.set(params.get("device_name", ""))
+            self._assign_option(self.gui.config_var, params.get("config"), "configurations", cast=str)
+            self._assign_option(self.gui.frequency_var, params.get("frequency"), "frequencies", cast=int)
+            self._assign_option(self.gui.duty_var, params.get("duty"), "duties", cast=int)
+            self._assign_option(self.gui.temperature_var, params.get("temperature"), "temperatures", cast=int)
+            self._assign_option(self.gui.voltage_var, params.get("voltage"), "voltages", cast=int)
+
+            duration = params.get(
+                "duration",
+                VOLTAGE_DEFAULT_MINUTES.get(self.gui.voltage_var.get(), 1),
+            )
+            self.gui._cached_duration = duration
+
+        except Exception as exc:
+            print(f"Error loading parameters: {exc}")
             self.gui._cached_duration = VOLTAGE_DEFAULT_MINUTES.get(self.gui.voltage_var.get(), 1)
+
+    def _assign_option(self, variable, raw_value, key: str, *, cast):
+        if raw_value is None:
+            return
+        try:
+            value = cast(raw_value)
+        except (TypeError, ValueError):
+            return
+
+        available = [option_value for option_value, _ in self.gui.param_options.get(key, [])]
+        if value in available:
+            variable.set(value)
+        elif available:
+            variable.set(available[0])
 
 class GaNExperimentGUI(tk.Tk):
     """Main GUI application class"""
@@ -534,43 +908,98 @@ class GaNExperimentGUI(tk.Tk):
         self.title("GaN Device Test Runner")
         self.geometry(DEFAULT_GEOMETRY)
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
-        
+
+        # Track default and current parameter option sets
+        self.default_param_options = {
+            "configurations": [tuple(option) for option in CONFIGURATIONS],
+            "frequencies": [tuple(option) for option in FREQUENCIES],
+            "duties": [tuple(option) for option in DUTIES],
+            "temperatures": [tuple(option) for option in TEMPERATURES],
+            "voltages": [tuple(option) for option in VOLTAGES],
+        }
+
+        self.device_config_store = DeviceConfigStore()
+        self._ui_ready = False
+        self._active_device_display_name = ""
+        self._active_device_sanitized = ""
+
+        initial_params = self._read_last_params_file()
+        initial_device = initial_params.get("device_name", "") if initial_params else ""
+
+        self.param_options = self._load_device_param_options(initial_device)
+        self.parameter_editors: Dict[str, ParameterListEditor] = {}
+
+        self.default_instrument_configs = copy.deepcopy(INSTRUMENTS)
+        self.instrument_configs = copy.deepcopy(INSTRUMENTS)
+
         # Initialize variables
         self._init_variables()
-        
+        self._drive_setup_cache = self._load_drive_setup_cache()
+
         # Initialize managers
         self.param_manager = ParameterManager(self)
         self.wavegen_controller = WavegenController(self)
         self.experiment_runner = ExperimentRunner(self)
         
         # Load parameters and build UI
-        self.param_manager.load_params()
+        self.param_manager.load_params(initial_params)
+        self._active_device_display_name = self.device_name_var.get().strip()
+        self._active_device_sanitized = sanitize_device_name(self._active_device_display_name)
+        self._activate_device(self._active_device_display_name, persist_previous=False, force_reload=True)
+
         self._build_ui()
+        self._ui_ready = True
+        self._apply_current_param_options_to_ui()
         self._setup_callbacks()
         
         # Initialize state
         self.last_current_value = None
-        self._cached_duration = VOLTAGE_DEFAULT_MINUTES.get(self.voltage_var.get(), 1)
-        
+        if not hasattr(self, "_cached_duration"):
+            self._cached_duration = VOLTAGE_DEFAULT_MINUTES.get(self.voltage_var.get(), 1)
+
         # Update UI after loading    
+
+    def _read_last_params_file(self) -> Optional[Dict[str, Any]]:
+        """Return cached parameter selections if available."""
+        if not os.path.isfile(PARAMS_FILE):
+            return None
+        try:
+            with open(PARAMS_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                return data
+        except Exception as exc:
+            print(f"Warning: failed to read '{PARAMS_FILE}': {exc}")
+        return None
+
     def _init_variables(self):
         """Initialize tkinter variables"""
         self.device_name_var = tk.StringVar(value="")
-        self.config_var = tk.StringVar(value=CONFIGURATIONS[0][0])
-        self.frequency_var = tk.IntVar(value=FREQUENCIES[0][0])
-        self.duty_var = tk.IntVar(value=DUTIES[0][0])
-        self.temperature_var = tk.IntVar(value=TEMPERATURES[0][0])
-        self.voltage_var = tk.IntVar(value=VOLTAGES[0][0])
-    
+        self.config_var = tk.StringVar(value=self._get_default_option_value("configurations", ""))
+        self.frequency_var = tk.IntVar(value=self._get_default_option_value("frequencies", 0))
+        self.duty_var = tk.IntVar(value=self._get_default_option_value("duties", 0))
+        self.temperature_var = tk.IntVar(value=self._get_default_option_value("temperatures", 0))
+        self.voltage_var = tk.IntVar(value=self._get_default_option_value("voltages", 0))
+
     def _build_ui(self):
         """Build the main UI"""
-        # Main frame
-        self.main_frame = tk.Frame(self)
-        self.main_frame.grid(row=0, column=0, sticky="nsew")
-        
+        # Root layout uses notebook tabs for experiment + configuration
+        self.notebook = ttk.Notebook(self)
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+
+        self.experiment_tab = ttk.Frame(self.notebook)
+        self.configuration_tab = ttk.Frame(self.notebook)
+
+        self.notebook.add(self.experiment_tab, text="Experiment")
+        self.notebook.add(self.configuration_tab, text="Configuration")
+
+        # Main experiment frame
+        self.main_frame = tk.Frame(self.experiment_tab)
+        self.main_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+
         # Device name entry
         self._build_device_entry()
-        
+
         # Parameter groups
         self._build_parameter_groups()
         
@@ -585,13 +1014,16 @@ class GaNExperimentGUI(tk.Tk):
         
         # Plot frame
         self._build_plot_frame()
-        
+
         # Experiment tracker
         self._build_tracker_frame()
-        
+
+        # Configuration editor tab
+        self._build_configuration_tab()
+
         # Status bar
         self.status_bar = StatusBar(self)
-        
+
         # Configure grid weights
         self._configure_grid_weights()
     
@@ -620,52 +1052,241 @@ class GaNExperimentGUI(tk.Tk):
         self.device_dropdown.grid(row=0, column=1, sticky="w", padx=5, pady=5, columnspan=2)
 
         # Bind updates
-        self.device_dropdown.bind("<KeyRelease>", self._on_device_change)
-        self.device_dropdown.bind("<<ComboboxSelected>>", self._on_device_change)
+        self.device_dropdown.bind("<<ComboboxSelected>>", self._on_device_committed)
+        self.device_dropdown.bind("<FocusOut>", self._on_device_committed)
+        self.device_dropdown.bind("<Return>", self._on_device_committed)
 
-    def _on_device_change(self, *args):
+    def _on_device_committed(self, *args):
         name = self.device_name_var.get().strip()
         if not name:
             return
 
-        # Sync tracker UI
-        self.tracker.update_tracker()
+        self._activate_device(name)
+        if hasattr(self, "tracker"):
+            self.tracker.update_tracker()
+        self._ensure_drive_setup(name, notify_on_success=True)
 
-        # Check if it's a new device
-        known_devices = self._get_known_device_names()
-        if name not in known_devices:
-            try:
-                setup_device_in_drive(name)  # ⬅️ API call here!
-                # Update dropdown with new entry
-                self.device_dropdown["values"] = known_devices + [name]
-                messagebox.showinfo("Folder Created", f"Drive setup created for: {name}")
-            except Exception as e:
-                messagebox.showerror("Drive Setup Failed", f"Google Drive setup failed:\n{e}")
+    def _ensure_drive_setup(self, device_name: str, *, notify_on_success: bool) -> bool:
+        """Create Drive folder + spreadsheets for the device if needed."""
+        if not device_name:
+            return True
+
+        if device_name in self._drive_setup_cache:
+            return True
+
+        try:
+            setup_device_in_drive(device_name)
+        except Exception as e:
+            messagebox.showerror(
+                "Drive Setup Failed",
+                f"Google Drive setup failed:\n{e}"
+            )
+            return False
+
+        # Update cache and dropdown values
+        self._drive_setup_cache.add(device_name)
+        current_values = self.device_dropdown.cget("values")
+        if isinstance(current_values, str):
+            current_values = [current_values] if current_values else []
+        else:
+            current_values = list(current_values)
+
+        if device_name not in current_values:
+            current_values.append(device_name)
+            current_values.sort()
+            self.device_dropdown["values"] = tuple(current_values)
+
+        if notify_on_success:
+            messagebox.showinfo("Folder Created", f"Drive setup created for: {device_name}")
+
+        return True
+
+    def _load_drive_setup_cache(self):
+        """Return a set of device names that already have Drive mappings."""
+        try:
+            mappings = load_mappings()
+        except Exception as e:
+            print(f"Warning: failed to load Drive mappings: {e}")
+            return set()
+
+        cache = set()
+        for key in mappings.keys():
+            if "_" in key:
+                cache.add(key.rsplit("_", 1)[0])
+        return cache
+
+    def _activate_device(
+        self,
+        device_name: str,
+        *,
+        persist_previous: bool = True,
+        force_reload: bool = False,
+    ) -> None:
+        """Load parameter options for the selected device and persist previous."""
+        raw_name = device_name.strip()
+        new_sanitized = sanitize_device_name(raw_name)
+        previous_sanitized = self._active_device_sanitized or ""
+
+        if not force_reload and new_sanitized == previous_sanitized:
+            self._active_device_display_name = raw_name
+            return
+
+        if persist_previous and previous_sanitized:
+            self._persist_device_configuration(self._active_device_display_name, silent=True)
+
+        self._active_device_display_name = raw_name
+        self._active_device_sanitized = new_sanitized
+
+        self.param_options = self._load_device_param_options(raw_name)
+
+        if raw_name and not self.device_config_store.exists(raw_name):
+            self._persist_device_configuration(raw_name, silent=True)
+
+        self._apply_current_param_options_to_ui()
+
+        if hasattr(self, "status_bar") and raw_name:
+            self.status_bar.set_message(f"Loaded configuration for {raw_name}.")
+
+    def _load_device_param_options(self, device_name: str) -> Dict[str, List[Tuple[Any, str]]]:
+        """Return parameter options for the given device."""
+        stored = self.device_config_store.load(device_name) or {}
+        options: Dict[str, List[Tuple[Any, str]]] = {}
+
+        for key, defaults in self.default_param_options.items():
+            raw_values = stored.get(key)
+            normalized = self._normalize_stored_options(key, raw_values)
+            if normalized:
+                options[key] = normalized
+            else:
+                options[key] = copy.deepcopy(defaults)
+        return options
+
+    def _normalize_stored_options(
+        self,
+        key: str,
+        stored: Optional[List[Any]],
+    ) -> List[Tuple[Any, str]]:
+        if not stored:
+            return []
+
+        cleaned: List[Tuple[Any, str]] = []
+        seen: set[Any] = set()
+
+        for entry in stored:
+            value: Any
+            label: str = ""
+
+            if isinstance(entry, dict):
+                value = entry.get("value")
+                label = str(entry.get("label", ""))
+            elif isinstance(entry, (list, tuple)):
+                if not entry:
+                    continue
+                value = entry[0]
+                label = str(entry[1]) if len(entry) > 1 else ""
+            else:
+                value = entry
+
+            if key == "configurations":
+                value_str = str(value).strip()
+                if not value_str or value_str in seen:
+                    continue
+                label_str = label.strip() or self._default_label_for(key, value_str)
+                cleaned.append((value_str, label_str))
+                seen.add(value_str)
+            else:
+                try:
+                    value_int = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if value_int in seen:
+                    continue
+                label_str = label.strip() or self._default_label_for(key, value_int)
+                cleaned.append((value_int, label_str))
+                seen.add(value_int)
+
+        if not cleaned:
+            return []
+
+        if key == "configurations":
+            cleaned.sort(key=lambda item: item[1].lower())
+        else:
+            cleaned.sort(key=lambda item: item[0])
+        return cleaned
+
+    def _apply_current_param_options_to_ui(self) -> None:
+        """Refresh all parameter controls using current option sets."""
+        if not getattr(self, "_ui_ready", False):
+            return
+
+        group_map = {
+            "configurations": getattr(self, "config_group", None),
+            "frequencies": getattr(self, "frequency_group", None),
+            "duties": getattr(self, "duty_group", None),
+            "temperatures": getattr(self, "temperature_group", None),
+            "voltages": getattr(self, "voltage_group", None),
+        }
+
+        for key, group in group_map.items():
+            if group is not None and key in self.param_options:
+                group.set_options(self.param_options[key])
+
+        for key, editor in getattr(self, "parameter_editors", {}).items():
+            if key in self.param_options:
+                editor.set_options(self.param_options[key])
+
+        if hasattr(self, "tracker"):
+            self.tracker.update_parameter_space(
+                configs=self.param_options.get("configurations", []),
+                frequencies=self.param_options.get("frequencies", []),
+                duties=self.param_options.get("duties", []),
+                temperatures=self.param_options.get("temperatures", []),
+                voltages=self.param_options.get("voltages", []),
+            )
+
+        self._update_duration_default()
+
+    def _serialize_param_options(self) -> Dict[str, List[List[Any]]]:
+        """Convert parameter options to a JSON-friendly structure."""
+        payload: Dict[str, List[List[Any]]] = {}
+        for key, entries in self.param_options.items():
+            payload[key] = [[value, label] for value, label in entries]
+        return payload
+
+    def _persist_device_configuration(self, device_name: str, *, silent: bool = False) -> None:
+        """Write the current options to disk for the given device."""
+        sanitized = sanitize_device_name(device_name)
+        if not sanitized:
+            return
+
+        saved = self.device_config_store.save(device_name, self._serialize_param_options())
+        if saved and not silent and hasattr(self, "status_bar"):
+            self.status_bar.set_message(f"Saved configuration for {device_name}.")
     
     def _build_parameter_groups(self):
         """Build parameter selection groups"""
         self.frequency_group = ParamButtonGroup(
-            self.main_frame, FREQUENCIES, self.frequency_var, "Frequency (Hz)"
+            self.main_frame, self.param_options["frequencies"], self.frequency_var, "Frequency (Hz)"
         )
         self.frequency_group.grid(row=1, column=0, columnspan=3, pady=10, sticky="w")
 
         self.temperature_group = ParamButtonGroup(
-            self.main_frame, TEMPERATURES, self.temperature_var, "Temperature (°C)"
+            self.main_frame, self.param_options["temperatures"], self.temperature_var, "Temperature (°C)"
         )
         self.temperature_group.grid(row=2, column=0, columnspan=3, pady=10, sticky="w")
 
         self.duty_group = ParamButtonGroup(
-            self.main_frame, DUTIES, self.duty_var, "Duty Cycle"
+            self.main_frame, self.param_options["duties"], self.duty_var, "Duty Cycle"
         )
         self.duty_group.grid(row=3, column=0, columnspan=3, pady=10, sticky="w")
 
         self.config_group = ParamButtonGroup(
-            self.main_frame, CONFIGURATIONS, self.config_var, "Configuration"
+            self.main_frame, self.param_options["configurations"], self.config_var, "Configuration"
         )
         self.config_group.grid(row=4, column=0, columnspan=3, pady=10, sticky="w")
 
         self.voltage_group = ParamButtonGroup(
-            self.main_frame, VOLTAGES, self.voltage_var, "Voltage (V)"
+            self.main_frame, self.param_options["voltages"], self.voltage_var, "Voltage (V)"
         )
         self.voltage_group.grid(row=5, column=0, columnspan=3, pady=10, sticky="w")
 
@@ -726,41 +1347,286 @@ class GaNExperimentGUI(tk.Tk):
     
     def _build_tracker_frame(self):
         """Build experiment tracker frame"""
-        self.tracker_frame = tk.Frame(self)
-        self.tracker_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
-        
+        self.tracker_frame = tk.Frame(self.experiment_tab)
+        self.tracker_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
         self.tracker = ExperimentTracker(
             self.tracker_frame,
             get_device_name=lambda: self.device_name_var.get(),
-            frequencies=FREQUENCIES,
-            duties=DUTIES,
-            temperatures=TEMPERATURES,
-            voltages=VOLTAGES,
-            configs=CONFIGURATIONS
+            frequencies=self.param_options["frequencies"],
+            duties=self.param_options["duties"],
+            temperatures=self.param_options["temperatures"],
+            voltages=self.param_options["voltages"],
+            configs=self.param_options["configurations"],
         )
         self.tracker.grid(row=0, column=0, columnspan=3, sticky="nsew")
-    
+
+    def _build_configuration_tab(self):
+        """Build runtime configuration editor tab"""
+
+        instructions = (
+            "Update the available parameter buttons without restarting the app. "
+            "Changes apply immediately to the experiment controls and tracker."
+        )
+        ttk.Label(
+            self.configuration_tab,
+            text=instructions,
+            wraplength=700,
+            justify="left",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 5))
+
+        # Align the configuration editors in a balanced two-column grid
+        editors_frame = ttk.Frame(self.configuration_tab)
+        editors_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        editors_frame.grid_columnconfigure(0, weight=1, uniform="config_cols")
+        editors_frame.grid_columnconfigure(1, weight=1, uniform="config_cols")
+        editors_frame.grid_rowconfigure(0, weight=1)
+        editors_frame.grid_rowconfigure(1, weight=1)
+
+        editor_specs = [
+            ("Configurations", "configurations", self._parse_string_entry, lambda v: v),
+            ("Frequencies (Hz)", "frequencies", self._parse_int_entry, lambda v: freq_label(v)),
+            ("Duty Cycles (%)", "duties", self._parse_int_entry, lambda v: f"{v}%"),
+            ("Temperatures (°C)", "temperatures", self._parse_int_entry, lambda v: f"{v}°C"),
+        ]
+
+        for idx, (title, key, parser, label_factory) in enumerate(editor_specs, start=1):
+            row = (idx - 1) // 2
+            col = (idx - 1) % 2
+            editor = ParameterListEditor(
+                editors_frame,
+                title,
+                self.param_options[key],
+                on_change=lambda opts, option_key=key: self._on_parameter_options_changed(option_key, opts),
+                value_parser=parser,
+                default_label_factory=label_factory,
+                default_options=self.default_param_options[key],
+            )
+            editor.grid(row=row, column=col, sticky="nsew", padx=10, pady=10)
+            self.parameter_editors[key] = editor
+
+        voltages_editor = ParameterListEditor(
+            self.configuration_tab,
+            "Voltages (V)",
+            self.param_options["voltages"],
+            on_change=lambda opts: self._on_parameter_options_changed("voltages", opts),
+            value_parser=self._parse_int_entry,
+            default_label_factory=lambda v: f"{v}V",
+            default_options=self.default_param_options["voltages"],
+        )
+        voltages_editor.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.parameter_editors["voltages"] = voltages_editor
+
+        self.instrument_config_editor = InstrumentConfigEditor(
+            self.configuration_tab,
+            initial_configs=self.instrument_configs,
+            default_configs=self.default_instrument_configs,
+            on_change=self._on_instrument_config_changed,
+        )
+        self.instrument_config_editor.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+        # Allow the editors to resize proportionally with the window
+        self.configuration_tab.grid_columnconfigure(0, weight=1)
+        self.configuration_tab.grid_rowconfigure(1, weight=1)
+        self.configuration_tab.grid_rowconfigure(2, weight=1)
+        self.configuration_tab.grid_rowconfigure(3, weight=1)
+
+    @staticmethod
+    def _parse_string_entry(value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Empty string")
+        return cleaned
+
+    @staticmethod
+    def _parse_int_entry(value: str) -> int:
+        cleaned = value.replace(",", "").strip()
+        if not cleaned:
+            raise ValueError("Empty value")
+        try:
+            if any(ch in cleaned.lower() for ch in ("e", ".")):
+                return int(float(cleaned))
+            return int(cleaned, 10)
+        except ValueError as exc:
+            raise ValueError("Invalid integer") from exc
+
+    def _default_label_for(self, key: str, value: Any) -> str:
+        if key == "frequencies":
+            return freq_label(value)
+        if key == "duties":
+            return f"{value}%"
+        if key == "temperatures":
+            return f"{value}°C"
+        if key == "voltages":
+            return f"{value}V"
+        return str(value)
+
+    def _on_parameter_options_changed(
+        self,
+        key: str,
+        options: List[Tuple[Any, str]],
+    ) -> Optional[List[Tuple[Any, str]]]:
+        """Validate and apply updated parameter options."""
+        device_name = self.device_name_var.get().strip()
+        if not device_name:
+            messagebox.showerror(
+                "Device Required",
+                "Select a device before editing configuration options.",
+            )
+            return None
+
+        sanitized: List[Tuple[Any, str]] = []
+        seen = set()
+
+        for value, label in options:
+            if key == "configurations":
+                normalized_value = str(value).strip()
+                if not normalized_value:
+                    messagebox.showerror("Validation Error", "Configuration value cannot be empty.")
+                    return None
+            else:
+                try:
+                    normalized_value = int(value)
+                except (TypeError, ValueError):
+                    messagebox.showerror("Validation Error", f"Invalid numeric value: {value}")
+                    return None
+
+            normalized_label = str(label).strip() if label else ""
+            if not normalized_label:
+                normalized_label = self._default_label_for(key, normalized_value)
+
+            if normalized_value in seen:
+                messagebox.showerror("Validation Error", "Duplicate values are not allowed.")
+                return None
+            seen.add(normalized_value)
+            sanitized.append((normalized_value, normalized_label))
+
+        if not sanitized:
+            messagebox.showerror("Validation Error", "At least one option is required.")
+            return None
+
+        if key == "configurations":
+            sanitized.sort(key=lambda item: item[1].lower())
+        else:
+            sanitized.sort(key=lambda item: item[0])
+
+        self.param_options[key] = sanitized
+        self._refresh_parameter_controls(key)
+        self._persist_device_configuration(device_name)
+
+        return sanitized
+
+    def _refresh_parameter_controls(self, key: str):
+        group_map = {
+            "configurations": self.config_group,
+            "frequencies": self.frequency_group,
+            "duties": self.duty_group,
+            "temperatures": self.temperature_group,
+            "voltages": self.voltage_group,
+        }
+
+        if key in group_map and group_map[key] is not None:
+            group_map[key].set_options(self.param_options[key])
+
+        editors = getattr(self, "parameter_editors", {})
+        if key in editors:
+            editors[key].set_options(self.param_options[key])
+
+        tracker_kwargs: Dict[str, List[Tuple[Any, str]]] = {}
+        if hasattr(self, "tracker"):
+            if key == "configurations":
+                tracker_kwargs["configs"] = self.param_options[key]
+            elif key == "frequencies":
+                tracker_kwargs["frequencies"] = self.param_options[key]
+            elif key == "duties":
+                tracker_kwargs["duties"] = self.param_options[key]
+            elif key == "temperatures":
+                tracker_kwargs["temperatures"] = self.param_options[key]
+            elif key == "voltages":
+                tracker_kwargs["voltages"] = self.param_options[key]
+
+            if tracker_kwargs:
+                self.tracker.update_parameter_space(**tracker_kwargs)
+
+        if key == "voltages":
+            self._update_duration_default()
+
+        self._force_visual_update()
+
+    def _get_option_values(self, key: str) -> List[Any]:
+        return [value for value, _ in self.param_options.get(key, [])]
+
+    def _get_default_option_value(self, key: str, fallback: Any) -> Any:
+        options = self.param_options.get(key, [])
+        return options[0][0] if options else fallback
+
+    def _on_instrument_config_changed(
+        self, configs: Dict[str, Dict[str, Any]]
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        sanitized: Dict[str, Dict[str, Any]] = {}
+
+        for name, settings in configs.items():
+            ip_raw = str(settings.get("ip", "")).strip()
+            port_raw = settings.get("port")
+
+            if not ip_raw:
+                messagebox.showerror("Validation Error", f"IP address is required for {name}.")
+                return None
+
+            try:
+                port_int = int(port_raw)
+            except (TypeError, ValueError):
+                messagebox.showerror("Validation Error", f"Invalid port for {name}.")
+                return None
+
+            if not (0 < port_int <= 65535):
+                messagebox.showerror("Validation Error", f"Port out of range for {name}.")
+                return None
+
+            sanitized[name] = {"ip": ip_raw, "port": port_int}
+
+        config.INSTRUMENTS.clear()
+        config.INSTRUMENTS.update(copy.deepcopy(sanitized))
+        self.instrument_configs = copy.deepcopy(sanitized)
+
+        if hasattr(self, "status_bar"):
+            self.status_bar.set_message("Instrument configuration updated.")
+
+        return copy.deepcopy(self.instrument_configs)
+
     def _configure_grid_weights(self):
         """Configure grid weights for proper resizing"""
+        # Root window
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        # Notebook tabs
+        self.experiment_tab.grid_rowconfigure(0, weight=1)
+        self.experiment_tab.grid_rowconfigure(1, weight=1)
+        self.experiment_tab.grid_columnconfigure(0, weight=1)
+
+        self.configuration_tab.grid_rowconfigure(0, weight=0)
+        self.configuration_tab.grid_rowconfigure(1, weight=1)
+        self.configuration_tab.grid_rowconfigure(2, weight=1)
+        self.configuration_tab.grid_rowconfigure(3, weight=1)
+        self.configuration_tab.grid_rowconfigure(4, weight=0)
+        for col in range(2):
+            self.configuration_tab.grid_columnconfigure(col, weight=1)
+
         # Main frame columns
-        self.main_frame.grid_columnconfigure(0, weight=0)
-        self.main_frame.grid_columnconfigure(1, weight=0)
-        self.main_frame.grid_columnconfigure(2, weight=0)
+        for col in range(3):
+            self.main_frame.grid_columnconfigure(col, weight=0)
         self.main_frame.grid_columnconfigure(3, weight=1)
-        
-        # Main frame rows
-        for r in range(9):
+
+        # Main frame rows (allow plot to expand)
+        self.main_frame.grid_rowconfigure(0, weight=1)
+        for r in range(1, 9):
             self.main_frame.grid_rowconfigure(r, weight=0)
-        
-        # Tracker frame
+
+        # Tracker frame sizing
         self.tracker_frame.grid_rowconfigure(0, weight=1)
         for i in range(3):
             self.tracker_frame.grid_columnconfigure(i, weight=1)
-        
-        # Root window
-        self.grid_rowconfigure(0, weight=0)
-        self.grid_rowconfigure(1, weight=1)
-        self.grid_columnconfigure(0, weight=1)
     
     def _setup_callbacks(self):
         # Param changes
@@ -803,46 +1669,89 @@ class GaNExperimentGUI(tk.Tk):
         default_min = VOLTAGE_DEFAULT_MINUTES.get(voltage, 1)
         self.duration_entry.delete(0, tk.END)
         self.duration_entry.insert(0, str(default_min))
-    
+
+    def _sanitize_device_name(self, raw_name: str) -> str:
+        return sanitize_device_name(raw_name)
+
+    def _canonical_config(self, value: str) -> str:
+        for canonical, label in CONFIGURATIONS:
+            if value == canonical or value == label:
+                return canonical
+        return value
+
+    def _find_prior_tuned_frequency(
+        self,
+        device: str,
+        temp: int,
+        freq: int,
+        volt: int,
+        duty: int,
+        config: str,
+    ):
+        if not device:
+            return None
+
+        config_canonical = self._canonical_config(config)
+        search_order = [(temp, config_canonical)]
+
+        for cfg_value, _ in CONFIGURATIONS:
+            cfg_canonical = self._canonical_config(cfg_value)
+            if cfg_canonical != config_canonical:
+                search_order.append((temp, cfg_canonical))
+
+        if temp != 25:
+            search_order.append((25, config_canonical))
+            for cfg_value, _ in CONFIGURATIONS:
+                cfg_canonical = self._canonical_config(cfg_value)
+                if cfg_canonical != config_canonical:
+                    search_order.append((25, cfg_canonical))
+
+        seen = set()
+        for temp_candidate, config_candidate in search_order:
+            key = (temp_candidate, config_candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            path = generate_filename(
+                device,
+                temp_candidate,
+                freq,
+                volt,
+                config_candidate,
+                duty,
+                ensure_dirs=False,
+            )
+            freq_val = self._load_tuned_frequency_from_csv(path)
+            if freq_val is not None:
+                return freq_val, config_candidate, temp_candidate, path
+
+        return None
+
     def _tuning_available(self):
-        device = "".join(c for c in self.device_name_var.get().strip()
-                        if c.isalnum() or c in (' ', '_', '-'))
+        device = self._sanitize_device_name(self.device_name_var.get())
         freq = self.frequency_var.get()
         duty = self.duty_var.get()
         volt = self.voltage_var.get()
-        config = self.config_var.get()
         temp = self.temperature_var.get()
 
-        if temp == 25:
+        candidate = self._find_prior_tuned_frequency(
+            device,
+            temp,
+            freq,
+            volt,
+            duty,
+            self.config_var.get(),
+        )
+
+        if not candidate:
             return False
 
-        def _get_canonical(val):
-            for v, lbl in CONFIGURATIONS:
-                if val == v or val == lbl:
-                    return v
-            return val
-
-        config_canonical = _get_canonical(config)
-
-        # Check same config at 25C
-        path_primary = generate_filename(device, 25, freq, volt, config_canonical, duty)
-        if os.path.isfile(path_primary):
-            with open(path_primary, newline='') as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    if row and row[0].strip() == "FINAL_READINGS" and len(row) >= 5 and row[4]:
-                        return True
-
-        # Fallback: Dual Conduction at 25C if needed
-        if config_canonical != "Dual Conduction":
-            path_dual = generate_filename(device, 25, freq, volt, "Dual Conduction", duty)
-            if os.path.isfile(path_dual):
-                with open(path_dual, newline='') as f:
-                    reader = csv.reader(f)
-                    for row in reader:
-                        if row and row[0].strip() == "FINAL_READINGS" and len(row) >= 5 and row[4]:
-                            return True
-        return False
+        freq_val, *_ = candidate
+        last_applied = self.wavegen_controller.last_applied_freq
+        if last_applied is None:
+            return True
+        return abs(last_applied - freq_val) > 1
 
     def _update_confirm_button_color(self):
         """Update confirm button color based on state"""
@@ -864,51 +1773,40 @@ class GaNExperimentGUI(tk.Tk):
         tuning_applied = False
         applied_freq = None
         
-        device = "".join(c for c in self.device_name_var.get().strip()
-                        if c.isalnum() or c in (' ', '_', '-'))
+        device = self._sanitize_device_name(self.device_name_var.get())
         freq = self.frequency_var.get()
         duty = self.duty_var.get()
         volt = self.voltage_var.get()
         config = self.config_var.get()
         temp = self.temperature_var.get()
 
-        # Check if tuning should be applied
-        should_apply_tuning = temp != 25 and self._tuning_available()
-        
-        if should_apply_tuning:
-            def _get_canonical(val):
-                for v, lbl in CONFIGURATIONS:
-                    if val == v or val == lbl:
-                        return v
-                return val
+        tuning_candidate = self._find_prior_tuned_frequency(
+            device,
+            temp,
+            freq,
+            volt,
+            duty,
+            config,
+        )
 
-            config_canonical = _get_canonical(config)
+        if tuning_candidate:
+            freq_val, source_config, source_temp, _ = tuning_candidate
+            last_applied = self.wavegen_controller.last_applied_freq
 
-            # Try same config at 25°C
-            path_primary = generate_filename(device, 25, freq, volt, config_canonical, duty)
-            freq_val = self._load_tuned_frequency_from_csv(path_primary)
-            used_config = config_canonical
-            used_file = path_primary
-
-            # Fallback: Dual Conduction at 25°C
-            if freq_val is None and config_canonical != "Dual Conduction":
-                path_fallback = generate_filename(device, 25, freq, volt, "Dual Conduction", duty)
-                freq_val = self._load_tuned_frequency_from_csv(path_fallback)
-                used_config = "Dual Conduction"
-                used_file = path_fallback
-
-            # Apply frequency if found
-            if freq_val:
+            if last_applied is None or abs(last_applied - freq_val) > 1:
+                config_canonical = self._canonical_config(config)
                 try:
                     query_scpi("SDG6022X", f"C1:BSWV FRQ,{freq_val}")
                     if config_canonical == "Dual Conduction":
                         query_scpi("SDG6022X", f"C2:BSWV FRQ,{freq_val}")
                     NotificationManager.show_temporary_popup(
                         self,
-                        f"Tuned frequency {int(freq_val)} Hz applied\n({used_config} @ 25°C)",
+                        f"Tuned frequency {int(freq_val)} Hz applied\n({source_config} @ {int(source_temp)}°C)",
                         duration_ms=2000
                     )
-                    self.status_bar.set_message(f"Tuned frequency {int(freq_val)} Hz applied from '{os.path.basename(used_file)}'")
+                    self.status_bar.set_message(
+                        f"Tuned frequency {int(freq_val)} Hz applied from {source_config} @ {int(source_temp)}°C"
+                    )
                     tuning_applied = True
                     applied_freq = freq_val
                 except Exception as e:
@@ -948,16 +1846,20 @@ class GaNExperimentGUI(tk.Tk):
         if not self.device_name_var.get().strip():
             messagebox.showerror("Input Error", "Please enter a device name.")
             return
-        
+
+        device_name = self.device_name_var.get().strip()
+        if not self._ensure_drive_setup(device_name, notify_on_success=False):
+            return
+
         try:
             duration_minutes = float(self.duration_entry.get())
         except ValueError:
             messagebox.showerror("Input Error", "Please enter a valid duration.")
             return
-        
+
         # Create experiment parameters
         params = ExperimentParams(
-            device_name=self.device_name_var.get().strip(),
+            device_name=device_name,
             config=self.config_var.get(),
             frequency=self.frequency_var.get(),
             duty=self.duty_var.get(),
@@ -1024,6 +1926,7 @@ class GaNExperimentGUI(tk.Tk):
     
     def _on_closing(self):
         """Handle window closing"""
+        self._persist_device_configuration(self.device_name_var.get(), silent=True)
         self.param_manager.save_params()
         self.experiment_runner.cancel_experiment()
         self.after(500, self.destroy)
