@@ -1,8 +1,8 @@
 {
-  "device_name": "EPC2307",
+  "device_name": "GS66504B",
   "config": "Dual Conduction",
-  "frequency": 13000000,
-  "duty": 50,
+  "frequency": 6000000,
+  "duty": 25,
   "temperature": 25,
   "voltage": 400,
   "duration": "1"

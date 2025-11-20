@@ -2,7 +2,7 @@ import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 import pandas as pd
-from data_utils import freq_label
+from data_utils import freq_label, DEVICE_DATA_ROOT
 import matplotlib.pyplot as plt
 from sheet_utils import clear_test_in_sheet
 from typing import List, Tuple, Optional
@@ -144,12 +144,12 @@ class ExperimentTracker(tk.Frame):
         device = self.get_device_name().strip()
         safe_device = "".join(c for c in device if c.isalnum() or c in (' ', '_', '-')).rstrip()
         freq_str = freq_label(freq_val)
-        duty_folder = os.path.join("Device Data", safe_device, freq_str, str(duty_val))
+        duty_folder = DEVICE_DATA_ROOT / safe_device / freq_str / str(duty_val)
         filename = f"{safe_device}_{config_val}_{temp}C_{freq_str}_{volt_val}V_{duty_val}duty.csv"
-        file_path = os.path.join(duty_folder, filename)
-        if os.path.isfile(file_path):
+        file_path = duty_folder / filename
+        if file_path.is_file():
             try:
-                os.remove(file_path)
+                file_path.unlink()
                 messagebox.showinfo("Deleted", f"Deleted: {file_path}")
             except Exception as e:
                 messagebox.showerror("Error", f"Could not delete file: {e}")
@@ -183,11 +183,11 @@ class ExperimentTracker(tk.Frame):
         device = self.get_device_name().strip()
         safe_device = "".join(c for c in device if c.isalnum() or c in (' ', '_', '-')).rstrip()
         freq_str = freq_label(freq_val)
-        duty_folder = os.path.join("Device Data", safe_device, freq_str, str(duty_val))
+        duty_folder = DEVICE_DATA_ROOT / safe_device / freq_str / str(duty_val)
         filename = f"{safe_device}_{config_val}_{temp}C_{freq_str}_{volt_val}V_{duty_val}duty.csv"
-        file_path = os.path.join(duty_folder, filename)
+        file_path = duty_folder / filename
 
-        if not os.path.isfile(file_path):
+        if not file_path.is_file():
             messagebox.showerror("Error", f"File not found: {file_path}")
             return
         try:
@@ -224,15 +224,15 @@ class ExperimentTracker(tk.Frame):
                 )
             for row in tree.get_children():
                 tree.delete(row)
-            freq_folder = os.path.join("Device Data", safe_device, freq_str)
+            freq_folder = DEVICE_DATA_ROOT / safe_device / freq_str
             rows = []
             for config_val, config_label in self.configs:
                 for duty_val, duty_label in self.duties:
                     for volt_val, volt_label in self.voltages:
-                        duty_folder = os.path.join(freq_folder, str(duty_val))
+                        duty_folder = freq_folder / str(duty_val)
                         filename = f"{safe_device}_{config_val}_{int(temp_val)}C_{freq_str}_{int(volt_val)}V_{duty_val}duty.csv"
-                        file_path = os.path.join(duty_folder, filename)
-                        done = "✅" if os.path.isfile(file_path) else "❌"
+                        file_path = duty_folder / filename
+                        done = "✅" if file_path.is_file() else "❌"
                         rows.append((config_label, duty_label, volt_label, done))
             sorted_rows = sorted(rows, key=lambda x: (x[0], x[1], x[2]))
             for row in sorted_rows:

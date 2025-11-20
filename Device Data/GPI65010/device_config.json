@@ -1,0 +1,68 @@
+{
+  "configurations": [
+    [
+      "Dual Conduction",
+      "Dual Conduction"
+    ],
+    [
+      "Single Conduction",
+      "Single Conduction"
+    ],
+    [
+      "Single Device",
+      "Single Device"
+    ]
+  ],
+  "frequencies": [
+    [
+      6000000,
+      "6MHz"
+    ],
+    [
+      13000000,
+      "13MHz"
+    ],
+    [
+      27000000,
+      "27MHz"
+    ]
+  ],
+  "duties": [
+    [
+      25,
+      "25%"
+    ],
+    [
+      50,
+      "50%"
+    ]
+  ],
+  "temperatures": [
+    [
+      25,
+      "25\u00b0C"
+    ],
+    [
+      40,
+      "40\u00b0C"
+    ],
+    [
+      80,
+      "80\u00b0C"
+    ]
+  ],
+  "voltages": [
+    [
+      200,
+      "200V"
+    ],
+    [
+      300,
+      "300V"
+    ],
+    [
+      400,
+      "400V"
+    ]
+  ]
+}

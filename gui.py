@@ -5,7 +5,7 @@ from tracker import ExperimentTracker
 from config import *
 import config
 from instrument_utils import *
-from data_utils import generate_filename, log_data_to_csv, freq_label
+from data_utils import generate_filename, log_data_to_csv, freq_label, DEVICE_DATA_ROOT
 from experiment import *
 import matplotlib
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from enum import Enum
 import csv
 from api import setup_device_in_drive, load_mappings
+from pathlib import Path
+import time
 
 matplotlib.use('TkAgg')
 
@@ -29,6 +31,10 @@ PARAMS_FILE = "last_params.json"
 PLOT_MAX_POINTS = 100
 VOLTAGE_TOLERANCE = 2.0
 DEFAULT_GEOMETRY = "1700x950"
+AUTOTUNE_STEP_HZ = 100_000  # 0.1 MHz
+AUTOTUNE_STEP_DELAY = 0.5   # seconds between steps
+AUTOTUNE_BUTTON_WIDTH = 160
+AUTOTUNE_BUTTON_HEIGHT = 36
 
 
 def sanitize_device_name(raw_name: str) -> str:
@@ -45,21 +51,21 @@ class DeviceConfigStore:
 
     CONFIG_FILENAME = "device_config.json"
 
-    def __init__(self, base_folder: str = "Device Data"):
-        self.base_folder = base_folder
+    def __init__(self, base_folder: Path = DEVICE_DATA_ROOT):
+        self.base_folder = Path(base_folder)
 
-    def _config_path(self, device_name: str) -> Optional[str]:
+    def _config_path(self, device_name: str) -> Optional[Path]:
         sanitized = sanitize_device_name(device_name)
         if not sanitized:
             return None
-        return os.path.join(self.base_folder, sanitized, self.CONFIG_FILENAME)
+        return self.base_folder / sanitized / self.CONFIG_FILENAME
 
     def load(self, device_name: str) -> Optional[Dict[str, Any]]:
         path = self._config_path(device_name)
-        if not path or not os.path.isfile(path):
+        if not path or not path.is_file():
             return None
         try:
-            with open(path, "r", encoding="utf-8") as fh:
+            with path.open("r", encoding="utf-8") as fh:
                 return json.load(fh)
         except Exception as exc:
             print(f"Warning: failed to read device config '{path}': {exc}")
@@ -70,8 +76,8 @@ class DeviceConfigStore:
         if not path:
             return False
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as fh:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as fh:
                 json.dump(data, fh, indent=2)
             return True
         except Exception as exc:
@@ -80,7 +86,7 @@ class DeviceConfigStore:
 
     def exists(self, device_name: str) -> bool:
         path = self._config_path(device_name)
-        return bool(path and os.path.isfile(path))
+        return bool(path and path.is_file())
 
 class ExperimentState(Enum):
     IDLE = "idle"
@@ -141,20 +147,22 @@ class ParamButtonGroup(tk.Frame):
     def __init__(self, parent, options, variable, label_text):
         super().__init__(parent)
         self.variable = variable
-        self.buttons: Dict[Any, MacButton] = {}
+        self.buttons: Dict[Any, tk.Radiobutton] = {}
         self.options = list(options)  # Store options for reference
-        
+
+        self.grid_columnconfigure(1, weight=1)
+
         self.label_widget = ttk.Label(self, text=label_text)
-        self.label_widget.pack(side="left", padx=(0, 10))
+        self.label_widget.grid(row=0, column=0, sticky="e", padx=(0, 12))
 
         self.buttons_frame = tk.Frame(self)
-        self.buttons_frame.pack(side="left")
+        self.buttons_frame.grid(row=0, column=1, sticky="ew")
 
         self._build_buttons()
 
         # Trace variable changes
         self.variable.trace_add("write", lambda *args: self.after(1, self._highlight_selected))
-        
+
         # Initial highlight after a short delay
         self.after(100, self._highlight_selected)
 
@@ -168,17 +176,49 @@ class ParamButtonGroup(tk.Frame):
             child.destroy()
         self.buttons.clear()
 
-        for value, text in self.options:
-            button = MacButton(
+        uniform_id = f"param_btn_cols_{id(self)}"
+        for col in range(3):
+            self.buttons_frame.grid_columnconfigure(col, weight=1, uniform=uniform_id, minsize=120)
+
+        button_kwargs = {
+            "indicatoron": False,
+            "selectcolor": "#2196F3",
+            "background": "#E0E0E0",
+            "foreground": "black",
+            "activebackground": "#1976D2",
+            "activeforeground": "white",
+            "highlightthickness": 0,
+            "borderwidth": 1,
+            "relief": "raised",
+            "padx": 10,
+            "pady": 6,
+        }
+
+        for idx, (value, text) in enumerate(self.options):
+            row = idx // 3
+            col = idx % 3
+            button = tk.Radiobutton(
                 self.buttons_frame,
+                variable=self.variable,
+                value=value,
                 text=text,
-                width=100,
-                height=30,
-                borderless=1,
-                command=lambda v=value: self._on_button_click(v)
+                command=lambda v=value: self._on_button_click(v),
+                **button_kwargs,
             )
-            button.pack(side="left", padx=5)
+            button.grid(row=row, column=col, padx=6, pady=4, sticky="nsew")
             self.buttons[value] = button
+
+        if self.options:
+            remainder = len(self.options) % 3
+            if remainder:
+                last_row = (len(self.options) - 1) // 3
+                for col in range(remainder, 3):
+                    spacer = tk.Frame(self.buttons_frame, height=1, bd=0, relief="flat")
+                    spacer.grid(row=last_row, column=col, padx=6, pady=4, sticky="nsew")
+        else:
+            for col in range(3):
+                spacer = tk.Frame(self.buttons_frame, height=1, bd=0, relief="flat")
+                spacer.grid(row=0, column=col, padx=6, pady=4, sticky="nsew")
 
         self._ensure_variable_in_options()
 
@@ -186,21 +226,18 @@ class ParamButtonGroup(tk.Frame):
         """Update button highlighting based on current variable value"""
         try:
             selected = self.variable.get()
-            
+
             for value, button in self.buttons.items():
                 if value == selected:
                     # Selected button - blue background
-                    # Force the button to update by destroying and recreating it
                     button.config(
                         bg="#2196F3",
                         fg="white",
                         activebackground="#1976D2",
                         activeforeground="white",
-                        borderless=1
+                        selectcolor="#2196F3",
+                        relief="sunken",
                     )
-                    # Double-configure to force the update on macOS
-                    button.configure(background="#2196F3")
-                    button.configure(foreground="white")
                 else:
                     # Unselected button - gray background
                     button.config(
@@ -208,16 +245,13 @@ class ParamButtonGroup(tk.Frame):
                         fg="black",
                         activebackground="#D0D0D0",
                         activeforeground="black",
-                        borderless=1
+                        selectcolor="#E0E0E0",
+                        relief="raised",
                     )
-                    # Double-configure to force the update on macOS
-                    button.configure(background="#E0E0E0")
-                    button.configure(foreground="black")
-            
+
             # Multiple update methods to force refresh
             self.update_idletasks()
-            self.update()
-            
+
         except Exception as e:
             print(f"Error in _highlight_selected: {e}")
 
@@ -922,6 +956,13 @@ class GaNExperimentGUI(tk.Tk):
         self._ui_ready = False
         self._active_device_display_name = ""
         self._active_device_sanitized = ""
+        self._autotune_running = False
+        self._auto_sequence_active = False
+        self._auto_sequence_cancel = threading.Event()
+        self._auto_sequence_thread: Optional[threading.Thread] = None
+        self._auto_sequence_duration = 0.0
+        self._autotune_voltage_prompt_pending = False
+        self._last_confirmed_voltage: Optional[int] = None
 
         initial_params = self._read_last_params_file()
         initial_device = initial_params.get("device_name", "") if initial_params else ""
@@ -1028,10 +1069,10 @@ class GaNExperimentGUI(tk.Tk):
         self._configure_grid_weights()
     
     def _get_known_device_names(self):
-        base_path = "Device Data"
-        if not os.path.isdir(base_path):
+        base_path = DEVICE_DATA_ROOT
+        if not base_path.is_dir():
             return []
-        return [f for f in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, f))]
+        return sorted(entry.name for entry in base_path.iterdir() if entry.is_dir())
 
 
     def _build_device_entry(self):
@@ -1306,7 +1347,7 @@ class GaNExperimentGUI(tk.Tk):
         self.last_current_label = ttk.Label(
             self.main_frame, text="Last Current: N/A A"
         )
-        self.last_current_label.grid(row=7, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+        self.last_current_label.grid(row=7, column=0, sticky="w", padx=5, pady=5)
         
         self.confirm_button = MacButton(
             self.main_frame, text="Confirm Changes", 
@@ -1314,6 +1355,25 @@ class GaNExperimentGUI(tk.Tk):
             width=120, height=40, borderless=1, highlightthickness=1
         )
         self.confirm_button.grid(row=7, column=2, sticky="w", padx=5, pady=5)
+
+        self.autotune_button = MacButton(
+            self.main_frame,
+            text="Autotune Unavailable",
+            command=self._start_autotune_sequence,
+            width=AUTOTUNE_BUTTON_WIDTH,
+            height=AUTOTUNE_BUTTON_HEIGHT,
+            borderless=1,
+            highlightthickness=1,
+        )
+        self.autotune_button.grid(row=7, column=1, sticky="w", padx=5, pady=5)
+        self._set_autotune_button_style(
+            text="Autotune Unavailable",
+            state="disabled",
+            bg="#bdbdbd",
+            fg="white",
+            active_bg="#bdbdbd",
+            active_fg="white",
+        )
     
     def _build_control_buttons(self):
         """Build experiment control buttons"""
@@ -1337,6 +1397,13 @@ class GaNExperimentGUI(tk.Tk):
             command=self._cancel_experiment, state="disabled"
         )
         self.cancel_button.pack(side="left")
+
+        self.auto_sequence_button = ttk.Button(
+            self.button_frame,
+            text="Start Auto Sequence",
+            command=self._toggle_auto_sequence,
+        )
+        self.auto_sequence_button.pack(side="left", padx=(20, 0))
     
     def _build_plot_frame(self):
         """Build plot frame"""
@@ -1728,7 +1795,7 @@ class GaNExperimentGUI(tk.Tk):
 
         return None
 
-    def _tuning_available(self):
+    def _get_tuning_candidate(self) -> Optional[Tuple[float, str, float, str]]:
         device = self._sanitize_device_name(self.device_name_var.get())
         freq = self.frequency_var.get()
         duty = self.duty_var.get()
@@ -1745,13 +1812,16 @@ class GaNExperimentGUI(tk.Tk):
         )
 
         if not candidate:
-            return False
+            return None
 
-        freq_val, *_ = candidate
+        freq_val, source_config, source_temp, path = candidate
         last_applied = self.wavegen_controller.last_applied_freq
-        if last_applied is None:
-            return True
-        return abs(last_applied - freq_val) > 1
+        if last_applied is not None and abs(last_applied - freq_val) <= 1:
+            return None
+        return freq_val, source_config, source_temp, path
+
+    def _tuning_available(self):
+        return self._get_tuning_candidate() is not None
 
     def _update_confirm_button_color(self):
         """Update confirm button color based on state"""
@@ -1766,34 +1836,105 @@ class GaNExperimentGUI(tk.Tk):
         else:
             # No changes and no tuning available - show green
             self.confirm_button.config(bg="#43a047", fg="white", activebackground="#43a047")
-            # Fixed _confirm_wavegen_changes method
+        self._update_autotune_button_state()
 
-    def _confirm_wavegen_changes(self):
+    def _update_autotune_button_state(self):
+        if not hasattr(self, "autotune_button"):
+            return
+        if getattr(self, "_autotune_running", False):
+            return
+
+        if self._tuning_available():
+            self._set_autotune_button_style(
+                text="Autotune Available",
+                state="normal",
+                bg="#43a047",
+                fg="white",
+                active_bg="#388e3c",
+                active_fg="white",
+            )
+        else:
+            self._set_autotune_button_style(
+                text="Autotune Unavailable",
+                state="disabled",
+                bg="#bdbdbd",
+                fg="white",
+                active_bg="#bdbdbd",
+                active_fg="white",
+            )
+
+    def _set_autotune_button_style(
+        self,
+        *,
+        text: str,
+        state: str,
+        bg: str,
+        fg: str,
+        active_bg: str,
+        active_fg: str,
+    ):
+        if not hasattr(self, "autotune_button"):
+            return
+        self.autotune_button.config(
+            text=text,
+            state=state,
+            bg=bg,
+            fg=fg,
+            activebackground=active_bg,
+            activeforeground=active_fg,
+            width=AUTOTUNE_BUTTON_WIDTH,
+            height=AUTOTUNE_BUTTON_HEIGHT,
+            borderless=1,
+            highlightthickness=1,
+        )
+
+    def _confirm_high_risk_change(self, new_voltage: int, new_duty: int) -> bool:
+        warnings: List[str] = []
+        previous_voltage = self._last_confirmed_voltage
+        if previous_voltage is not None and new_voltage != previous_voltage:
+            if previous_voltage >= 400 and new_voltage <= 200:
+                warnings.append(f"Voltage drop from {previous_voltage} V to {new_voltage} V.")
+            elif abs(new_voltage - previous_voltage) >= 100:
+                warnings.append(f"Voltage change from {previous_voltage} V to {new_voltage} V.")
+
+        previous_duty = self.wavegen_controller.last_confirmed_duty
+        if previous_duty is not None and new_duty != previous_duty:
+            warnings.append(f"Duty cycle change from {previous_duty}% to {new_duty}%.")
+
+        if not warnings:
+            return True
+
+        message_lines = [
+            "The following high-risk changes were detected:",
+            "",
+            *[f"- {item}" for item in warnings],
+            "",
+            "These changes may damage the device. Proceed?"
+        ]
+        response = messagebox.askyesno(
+            "Confirm High-Risk Change",
+            "\n".join(message_lines),
+            icon="warning",
+        )
+        return bool(response)
+
+    def _confirm_wavegen_changes(self, *, apply_tuned_immediately: bool = True) -> bool:
         """Confirm wavegen changes and apply prior tuning if available"""
         tuning_applied = False
         applied_freq = None
-        
-        device = self._sanitize_device_name(self.device_name_var.get())
-        freq = self.frequency_var.get()
-        duty = self.duty_var.get()
-        volt = self.voltage_var.get()
         config = self.config_var.get()
-        temp = self.temperature_var.get()
+        new_voltage = self.voltage_var.get()
+        new_duty = self.duty_var.get()
 
-        tuning_candidate = self._find_prior_tuned_frequency(
-            device,
-            temp,
-            freq,
-            volt,
-            duty,
-            config,
-        )
+        if not self._confirm_high_risk_change(new_voltage, new_duty):
+            return False
+
+        skip_tuning = getattr(self, "_autotune_voltage_prompt_pending", False)
+        tuning_candidate = None if skip_tuning else self._get_tuning_candidate()
 
         if tuning_candidate:
             freq_val, source_config, source_temp, _ = tuning_candidate
-            last_applied = self.wavegen_controller.last_applied_freq
-
-            if last_applied is None or abs(last_applied - freq_val) > 1:
+            if apply_tuned_immediately:
                 config_canonical = self._canonical_config(config)
                 try:
                     query_scpi("SDG6022X", f"C1:BSWV FRQ,{freq_val}")
@@ -1811,6 +1952,12 @@ class GaNExperimentGUI(tk.Tk):
                     applied_freq = freq_val
                 except Exception as e:
                     messagebox.showerror("Wavegen Error", f"Failed to set tuned frequency: {e}")
+            else:
+                self.status_bar.set_message(
+                    f"Tuned frequency {int(freq_val)} Hz ready (source: {source_config} @ {int(source_temp)}°C)"
+                )
+        elif skip_tuning:
+            applied_freq = self.wavegen_controller.last_applied_freq
 
         # Confirm other wavegen parameters, passing the applied frequency if any
         if self.wavegen_controller.confirm_changes(applied_freq=applied_freq):
@@ -1827,6 +1974,394 @@ class GaNExperimentGUI(tk.Tk):
             
             # Schedule visual update
             self.after(10, self._force_visual_update)
+            self._autotune_voltage_prompt_pending = False
+            self._last_confirmed_voltage = new_voltage
+            return True
+        return False
+
+    def _start_autotune_sequence(self):
+        self._autotune_voltage_prompt_pending = False
+        if getattr(self, "_autotune_running", False):
+            return
+
+        tuning_candidate = self._get_tuning_candidate()
+        if not tuning_candidate:
+            messagebox.showinfo("Autotune", "No tuned frequency is available for the current settings.")
+            self._update_autotune_button_state()
+            return
+
+        freq_val, source_config, source_temp, _ = tuning_candidate
+
+        if not self._confirm_wavegen_changes(apply_tuned_immediately=False):
+            self._update_autotune_button_state()
+            return
+
+        self._autotune_running = True
+        self._set_autotune_button_style(
+            text="Autotuning...",
+            state="disabled",
+            bg="#1976D2",
+            fg="white",
+            active_bg="#1976D2",
+            active_fg="white",
+        )
+        self.status_bar.set_message(f"Autotuning to {int(freq_val)} Hz...")
+
+        config_canonical = self._canonical_config(self.config_var.get())
+        worker = threading.Thread(
+            target=self._run_autotune_ramp,
+            args=(freq_val, source_config, source_temp, config_canonical),
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_autotune_ramp(self, target_freq: float, source_config: str, source_temp: float, config_canonical: str):
+        try:
+            start_freq = self._perform_frequency_ramp(target_freq, config_canonical)
+        except Exception as exc:
+            self.after(0, lambda: self._on_autotune_failure(exc))
+            return
+
+        self.after(
+            0,
+            lambda: self._on_autotune_success(
+                target_freq=target_freq,
+                start_freq=start_freq,
+                source_config=source_config,
+                source_temp=source_temp,
+            ),
+        )
+
+    def _perform_frequency_ramp(self, target_freq: float, config_canonical: str):
+        start_freq = (
+            self.wavegen_controller.last_applied_freq
+            or self.wavegen_controller.last_confirmed_freq
+            or self.frequency_var.get()
+        )
+
+        live_freq = self._read_current_wavegen_frequency()
+        if live_freq is not None:
+            start_freq = live_freq
+
+        start_freq = float(start_freq)
+        target_freq = float(target_freq)
+
+        if abs(start_freq - target_freq) <= 1:
+            self._apply_wavegen_frequency(target_freq, config_canonical)
+            return start_freq
+
+        step = AUTOTUNE_STEP_HZ if target_freq > start_freq else -AUTOTUNE_STEP_HZ
+        current_freq = start_freq
+
+        while True:
+            next_freq = current_freq + step
+            if (step > 0 and next_freq >= target_freq) or (step < 0 and next_freq <= target_freq):
+                next_freq = target_freq
+
+            self._apply_wavegen_frequency(next_freq, config_canonical)
+
+            if next_freq == target_freq:
+                break
+
+            current_freq = next_freq
+            time.sleep(AUTOTUNE_STEP_DELAY)
+        return start_freq
+
+    def _apply_wavegen_frequency(self, freq_hz: float, config_canonical: str):
+        freq_value = int(round(freq_hz))
+        query_scpi("SDG6022X", f"C1:BSWV FRQ,{freq_value}")
+        if config_canonical == "Dual Conduction":
+            query_scpi("SDG6022X", f"C2:BSWV FRQ,{freq_value}")
+
+    def _read_current_wavegen_frequency(self) -> Optional[float]:
+        try:
+            raw = get_wavegen_frequency()
+            if raw is None:
+                return None
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _suggest_voltage_increase(self, start_freq: float, target_freq: float) -> str:
+        current_voltage = self.voltage_var.get()
+        voltage_values = sorted([value for value, _ in self.param_options.get("voltages", [])])
+        next_voltage = next((value for value in voltage_values if value > current_voltage), None)
+        if next_voltage is not None:
+            return (
+                f"The switching frequency increased from {int(start_freq)} Hz to {int(target_freq)} Hz.\n\n"
+                f"Please raise the DC supply from {current_voltage} V to at least {next_voltage} V "
+                "to maintain peak voltage levels."
+            )
+        return (
+            f"The switching frequency increased from {int(start_freq)} Hz to {int(target_freq)} Hz.\n\n"
+            "Please raise the DC supply voltage if possible to compensate for the reduced peak voltage."
+        )
+
+    def _on_autotune_success(self, target_freq: float, start_freq: Optional[float], source_config: str, source_temp: float):
+        self._autotune_running = False
+        self.wavegen_controller.last_applied_freq = target_freq
+        message = f"Tuned frequency {int(target_freq)} Hz applied from {source_config} @ {int(source_temp)}°C"
+        self.status_bar.set_message(message)
+        NotificationManager.show_temporary_popup(
+            self,
+            f"Tuned frequency {int(target_freq)} Hz applied\n({source_config} @ {int(source_temp)}°C)",
+            duration_ms=2000,
+        )
+        if start_freq is not None and target_freq > start_freq:
+            suggestion = self._suggest_voltage_increase(start_freq, target_freq)
+            messagebox.showinfo(
+                "Increase DC Voltage",
+                suggestion,
+            )
+            self.status_bar.set_message("Please increase the DC voltage before proceeding.")
+            self._autotune_voltage_prompt_pending = True
+        else:
+            self._autotune_voltage_prompt_pending = False
+        self._update_confirm_button_color()
+
+    def _on_autotune_failure(self, error: Exception):
+        self._autotune_running = False
+        self.wavegen_controller.last_applied_freq = None
+        messagebox.showerror("Autotune Error", f"Autotune failed: {error}")
+        self.status_bar.set_message("Autotune failed.")
+        self._update_confirm_button_color()
+
+    def _toggle_auto_sequence(self):
+        if self._auto_sequence_active:
+            self._auto_sequence_cancel.set()
+            self.auto_sequence_button.config(text="Stopping...", state="disabled")
+            self.status_bar.set_message("Stopping auto sequence...")
+            return
+
+        if self.experiment_runner.state != ExperimentState.IDLE:
+            messagebox.showinfo("Auto Sequence", "Please wait for the current experiment to finish before starting the auto sequence.")
+            return
+
+        params = self._build_params_from_ui()
+        if params is None:
+            return
+
+        plan = self._build_auto_sequence_plan()
+        if not plan:
+            messagebox.showwarning("Auto Sequence", "No parameter combinations are available for the auto sequence.")
+            return
+
+        proceed = messagebox.askyesno(
+            "Start Auto Sequence",
+            f"This will run {len(plan)} tests across configurations, duties, voltages, and temperatures.\n\n"
+            "You will be prompted to adjust the DC voltage and temperature between tests.\n\n"
+            "Continue?",
+        )
+        if not proceed:
+            return
+
+        self._auto_sequence_duration = params.duration_minutes
+        self._auto_sequence_cancel = threading.Event()
+        self._auto_sequence_active = True
+        self.auto_sequence_button.config(text="Stop Auto Sequence", state="normal")
+        self.status_bar.set_message("Auto sequence starting...")
+
+        self._auto_sequence_thread = threading.Thread(
+            target=self._run_auto_sequence,
+            args=(plan,),
+            daemon=True,
+        )
+        self._auto_sequence_thread.start()
+
+    def _build_auto_sequence_plan(self) -> List[Tuple[str, int, int, int]]:
+        configs = [value for value, _ in self.param_options.get("configurations", [])]
+        duties = [value for value, _ in self.param_options.get("duties", [])]
+        voltages = [value for value, _ in self.param_options.get("voltages", [])]
+        temperatures = [value for value, _ in self.param_options.get("temperatures", [])]
+
+        plan: List[Tuple[str, int, int, int]] = []
+        for temp in temperatures:
+            for config in configs:
+                for duty in duties:
+                    for voltage in voltages:
+                        if not self._test_already_completed(config, self.frequency_var.get(), duty, voltage, temp):
+                            plan.append((config, duty, voltage, temp))
+        return plan
+
+    def _test_already_completed(self, config: str, freq: int, duty: int, voltage: int, temp: int) -> bool:
+        device = self.device_name_var.get().strip()
+        if not device:
+            return False
+        safe_device = "".join(c for c in device if c.isalnum() or c in (' ', '_', '-')).rstrip()
+        freq_str = freq_label(freq)
+        duty_folder = DEVICE_DATA_ROOT / safe_device / freq_str / str(duty)
+        filename = f"{safe_device}_{config}_{int(temp)}C_{freq_str}_{int(voltage)}V_{duty}duty.csv"
+        file_path = duty_folder / filename
+        return file_path.is_file()
+
+    def _run_auto_sequence(self, plan: List[Tuple[str, int, int, int]]):
+        previous_temp: Optional[int] = None
+        previous_voltage: Optional[int] = None
+        total = len(plan)
+        completed = 0
+        success = True
+
+        try:
+            for index, (config, duty, voltage, temp) in enumerate(plan, start=1):
+                if self._auto_sequence_cancel.is_set():
+                    success = False
+                    break
+
+                self._call_on_ui_thread(lambda: self._select_sequence_parameters(config, duty, voltage, temp))
+                self._call_on_ui_thread(
+                    lambda idx=index, tot=total, cfg=config, d=duty, v=voltage, t=temp: self.status_bar.set_message(
+                        f"Auto sequence step {idx}/{tot}: {cfg}, {d}% duty, {v}V, {t}°C"
+                    )
+                )
+
+                if previous_temp is None or temp != previous_temp:
+                    temp_message = (
+                        f"Set the chamber temperature to {temp}°C."
+                        if previous_temp is None
+                        else (
+                            f"Raise the chamber temperature from {previous_temp}°C to {temp}°C."
+                            if temp > previous_temp
+                            else f"Lower the chamber temperature from {previous_temp}°C to {temp}°C."
+                        )
+                    )
+                    if not self._prompt_user_adjustment("Temperature Adjustment", temp_message):
+                        success = False
+                        break
+                    previous_temp = temp
+                    if self._auto_sequence_cancel.is_set():
+                        success = False
+                        break
+
+                need_voltage_prompt = False
+                voltage_message = ""
+                if previous_voltage is None or voltage != previous_voltage:
+                    need_voltage_prompt = True
+                    voltage_message = (
+                        f"Set the DC supply to {voltage} V."
+                        if previous_voltage is None
+                        else (
+                            f"Raise the DC supply from {previous_voltage} V to {voltage} V."
+                            if voltage > previous_voltage
+                            else f"Lower the DC supply from {previous_voltage} V to {voltage} V."
+                        )
+                    )
+
+                candidate = self._call_on_ui_thread(self._get_tuning_candidate)
+
+                if not self._call_on_ui_thread(lambda: self._confirm_wavegen_changes(apply_tuned_immediately=False)):
+                    success = False
+                    break
+
+                if candidate and not self._auto_sequence_cancel.is_set():
+                    target_freq, _, _, _ = candidate
+                    config_canonical = self._call_on_ui_thread(lambda: self._canonical_config(self.config_var.get()))
+                    self._perform_frequency_ramp(target_freq, config_canonical)
+                    self._call_on_ui_thread(
+                        lambda tf=target_freq: setattr(self.wavegen_controller, "last_applied_freq", tf)
+                    )
+                    self._call_on_ui_thread(self._update_confirm_button_color)
+
+                if need_voltage_prompt:
+                    if not self._prompt_user_adjustment("Voltage Adjustment", voltage_message):
+                        success = False
+                        break
+                    previous_voltage = voltage
+                    if self._auto_sequence_cancel.is_set():
+                        success = False
+                        break
+
+                params = self._call_on_ui_thread(
+                    lambda: ExperimentParams(
+                        device_name=self.device_name_var.get().strip(),
+                        config=self.config_var.get(),
+                        frequency=self.frequency_var.get(),
+                        duty=self.duty_var.get(),
+                        temperature=self.temperature_var.get(),
+                        voltage=self.voltage_var.get(),
+                        duration_minutes=self._auto_sequence_duration,
+                    )
+                )
+
+                self._call_on_ui_thread(lambda p=params: self._launch_experiment(p))
+
+                if not self._wait_for_experiment_completion():
+                    success = False
+                    break
+
+                completed += 1
+                self._call_on_ui_thread(
+                    lambda done=completed, tot=total: self.status_bar.set_message(
+                        f"Auto sequence progress: {done}/{tot} tests complete."
+                    )
+                )
+
+                if self._auto_sequence_cancel.is_set():
+                    success = False
+                    break
+
+        except Exception as exc:
+            success = False
+            self._call_on_ui_thread(lambda: messagebox.showerror("Auto Sequence Error", str(exc)))
+        finally:
+            if self._auto_sequence_cancel.is_set():
+                self._call_on_ui_thread(lambda: self.status_bar.set_message("Auto sequence cancelled."))
+            elif success:
+                self._call_on_ui_thread(lambda: self.status_bar.set_message("Auto sequence complete."))
+            else:
+                self._call_on_ui_thread(lambda: self.status_bar.set_message("Auto sequence stopped."))
+            self.after(0, self._finish_auto_sequence_ui)
+
+    def _finish_auto_sequence_ui(self):
+        self._auto_sequence_active = False
+        self.auto_sequence_button.config(text="Start Auto Sequence", state="normal")
+        self._auto_sequence_thread = None
+        self._auto_sequence_cancel.clear()
+
+    def _select_sequence_parameters(self, config: str, duty: int, voltage: int, temp: int):
+        self.config_var.set(config)
+        self.duty_var.set(duty)
+        self.voltage_var.set(voltage)
+        self.temperature_var.set(temp)
+        self._force_visual_update()
+
+    def _prompt_user_adjustment(self, title: str, instructions: str) -> bool:
+        def _prompt():
+            return messagebox.askokcancel(
+                title,
+                f"{instructions}\n\nClick OK when ready or Cancel to stop the auto sequence.",
+            )
+
+        response = self._call_on_ui_thread(_prompt)
+        if not response:
+            self._auto_sequence_cancel.set()
+        return bool(response)
+
+    def _wait_for_experiment_completion(self) -> bool:
+        while True:
+            if self._auto_sequence_cancel.is_set():
+                self._call_on_ui_thread(self.experiment_runner.cancel_experiment)
+            thread = self.experiment_runner.experiment_thread
+            state = self.experiment_runner.state
+            if state == ExperimentState.IDLE and (thread is None or not thread.is_alive()):
+                return not self._auto_sequence_cancel.is_set()
+            time.sleep(0.2)
+
+    def _call_on_ui_thread(self, func: Callable[[], Any]):
+        if threading.current_thread() is threading.main_thread():
+            return func()
+
+        result: Dict[str, Any] = {}
+        done = threading.Event()
+
+        def _wrapper():
+            try:
+                result["value"] = func()
+            finally:
+                done.set()
+
+        self.after(0, _wrapper)
+        done.wait()
+        return result.get("value")
 
     def _force_visual_update(self):
         """Force visual update of all parameter groups"""
@@ -1841,39 +2376,43 @@ class GaNExperimentGUI(tk.Tk):
         # Force GUI refresh
         self.update_idletasks()
 
-    def _start_experiment(self):
-        """Start experiment"""
+    def _build_params_from_ui(self) -> Optional[ExperimentParams]:
+        device_name = self.device_name_var.get().strip()
         if not self.device_name_var.get().strip():
             messagebox.showerror("Input Error", "Please enter a device name.")
-            return
+            return None
 
-        device_name = self.device_name_var.get().strip()
         if not self._ensure_drive_setup(device_name, notify_on_success=False):
-            return
+            return None
 
         try:
             duration_minutes = float(self.duration_entry.get())
         except ValueError:
             messagebox.showerror("Input Error", "Please enter a valid duration.")
-            return
+            return None
 
-        # Create experiment parameters
-        params = ExperimentParams(
+        return ExperimentParams(
             device_name=device_name,
             config=self.config_var.get(),
             frequency=self.frequency_var.get(),
             duty=self.duty_var.get(),
             temperature=self.temperature_var.get(),
             voltage=self.voltage_var.get(),
-            duration_minutes=duration_minutes
+            duration_minutes=duration_minutes,
         )
-        
-        # Update UI state
+
+    def _launch_experiment(self, params: ExperimentParams):
         self._set_experiment_ui_state(running=True)
         self.status_bar.set_message("Experiment running...")
-        
-        # Start experiment
         self.experiment_runner.start_experiment(params)
+
+    def _start_experiment(self):
+        """Start experiment"""
+        params = self._build_params_from_ui()
+        if params is None:
+            return
+
+        self._launch_experiment(params)
     
     def _toggle_pause(self):
         """Toggle experiment pause state"""

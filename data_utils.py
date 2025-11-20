@@ -1,20 +1,23 @@
 # data_utils.py
 import os
 import csv
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+DEVICE_DATA_ROOT = BASE_DIR / "Device Data"
 
 def freq_label(freq_val):
     return f"{int(freq_val/1e6)}MHz"
 
 def generate_filename(device_name, temp, freq, volt, config, duty, ensure_dirs=True):
     safe_device = "".join(c for c in device_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
-    base_folder = "Device Data"
-    device_folder = os.path.join(base_folder, safe_device)
-    freq_folder = os.path.join(device_folder, freq_label(freq))
-    duty_folder = os.path.join(freq_folder, str(duty))
+    device_folder = DEVICE_DATA_ROOT / safe_device
+    freq_folder = device_folder / freq_label(freq)
+    duty_folder = freq_folder / str(duty)
     if ensure_dirs:
-        os.makedirs(duty_folder, exist_ok=True)
+        duty_folder.mkdir(parents=True, exist_ok=True)
     filename = f"{safe_device}_{config}_{int(temp)}C_{freq_label(freq)}_{int(volt)}V_{duty}duty.csv"
-    return os.path.join(duty_folder, filename)
+    return os.fspath(duty_folder / filename)
 
 def log_data_to_csv(filename, data, header=None):
     file_exists = os.path.isfile(filename)
