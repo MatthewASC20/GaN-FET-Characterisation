@@ -1,9 +1,9 @@
 {
   "device_name": "GS66504B",
-  "config": "Dual Conduction",
+  "config": "Single Device",
   "frequency": 6000000,
-  "duty": 25,
+  "duty": 50,
   "temperature": 25,
-  "voltage": 400,
+  "voltage": 200,
   "duration": "1"
 }

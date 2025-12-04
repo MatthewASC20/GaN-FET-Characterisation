@@ -14,7 +14,7 @@ from collections import deque
 import threading
 import os
 import json
-from sheet_utils import log_final_results_to_sheet
+from sheet_utils import log_final_results_to_sheet, log_timeseries_sample_to_sheet
 from typing import Callable, Optional, Dict, Any, List, Tuple
 import copy
 from dataclasses import dataclass
@@ -35,6 +35,7 @@ AUTOTUNE_STEP_HZ = 100_000  # 0.1 MHz
 AUTOTUNE_STEP_DELAY = 0.5   # seconds between steps
 AUTOTUNE_BUTTON_WIDTH = 160
 AUTOTUNE_BUTTON_HEIGHT = 36
+TIME_SERIES_LOG_INTERVAL = 10  # seconds between sheet time-series uploads
 
 
 def sanitize_device_name(raw_name: str) -> str:
@@ -642,6 +643,8 @@ class ExperimentRunner:
         self.serial_connection = None
         self.state = ExperimentState.IDLE
         self.experiment_thread = None
+        self._rms_current_samples: List[float] = []
+        self._last_timeseries_sheet_log = 0.0
     
     def start_experiment(self, params: ExperimentParams):
         """Start experiment in separate thread"""
@@ -701,6 +704,9 @@ class ExperimentRunner:
             params.device_name, params.temperature, params.frequency,
             params.voltage, params.config, params.duty
         )
+
+        # Clear per-run RMS snapshots
+        self._rms_current_samples = []
         
         # Check for file overwrite
         if not self._check_file_overwrite(filename):
@@ -739,6 +745,10 @@ class ExperimentRunner:
             # Measure current
             current = measure_dc_current(self.serial_connection)
             if current is not None:
+                rms_sample = self._safe_read_rms_current()
+                if rms_sample is not None:
+                    self._rms_current_samples.append(rms_sample)
+
                 timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
                 
                 # Log data
@@ -747,6 +757,14 @@ class ExperimentRunner:
                     params.frequency, params.voltage, params.config,
                     params.duty, current
                 ], header=header)
+
+                # Periodically log RMS/DC voltage snapshots to Google Sheets
+                self._maybe_log_timeseries_to_sheet(
+                    params=params,
+                    timestamp=timestamp,
+                    dc_current=current,
+                    rms_snapshot=rms_sample,
+                )
                 
                 # Update UI
                 self.gui.after(0, lambda c=current: self.gui._update_current_display(c))
@@ -757,6 +775,87 @@ class ExperimentRunner:
             self._capture_final_readings(filename, params)
         
         return True
+
+    def _safe_read_rms_current(self) -> Optional[float]:
+        """Read RMS current safely for per-run averaging."""
+        raw_value = None
+        try:
+            raw_value = get_oscilloscope_rms_current()
+            if raw_value is None:
+                return None
+            return float(raw_value)
+        except (TypeError, ValueError):
+            print(f"Warning: RMS current reading invalid: {raw_value}")
+        except Exception as exc:
+            print(f"Warning: RMS current read failed: {exc}")
+        return None
+
+    def _safe_read_isw_rms(self) -> Optional[float]:
+        """Read Isw RMS current safely."""
+        raw_value = None
+        try:
+            raw_value = get_oscilloscope_isw_rms()
+            if raw_value is None:
+                return None
+            return float(raw_value)
+        except (TypeError, ValueError):
+            print(f"Warning: Isw RMS reading invalid: {raw_value}")
+        except Exception as exc:
+            print(f"Warning: Isw RMS read failed: {exc}")
+        return None
+
+    def _safe_read_dc_voltage(self) -> Optional[float]:
+        """Read DC voltage safely."""
+        raw_value = None
+        try:
+            raw_value = get_multimeter_voltage()
+            if raw_value is None:
+                return None
+            return float(raw_value)
+        except (TypeError, ValueError):
+            print(f"Warning: DC voltage reading invalid: {raw_value}")
+        except Exception as exc:
+            print(f"Warning: DC voltage read failed: {exc}")
+        return None
+
+    def _maybe_log_timeseries_to_sheet(
+        self,
+        params: ExperimentParams,
+        timestamp: str,
+        dc_current: Optional[float],
+        rms_snapshot: Optional[float],
+    ) -> None:
+        """Append periodic RMS/DC voltage snapshots to the Google Sheet."""
+        now = time.time()
+        if now - self._last_timeseries_sheet_log < TIME_SERIES_LOG_INTERVAL:
+            return
+
+        try:
+            dc_voltage = self._safe_read_dc_voltage()
+            rms_current = rms_snapshot if rms_snapshot is not None else self._safe_read_rms_current()
+            isw_rms = self._safe_read_isw_rms()
+
+            success, error_message = log_timeseries_sample_to_sheet(
+                device_name=params.device_name,
+                freq=params.frequency,
+                temp=params.temperature,
+                config=params.config,
+                duty=params.duty,
+                voltage=params.voltage,
+                timestamp=timestamp,
+                dc_voltage=dc_voltage,
+                rms_current=rms_current,
+                isw_rms=isw_rms,
+                dc_current=dc_current,
+            )
+
+            if not success:
+                detail = f": {error_message}" if error_message else "."
+                print(f"Failed to log time-series sample to Google Sheet{detail}")
+        except Exception as exc:
+            print(f"Warning: time-series sheet logging failed: {exc}")
+        finally:
+            self._last_timeseries_sheet_log = now
     
     def _check_file_overwrite(self, filename: str) -> bool:
         """Check if file exists and confirm overwrite"""
@@ -781,8 +880,18 @@ class ExperimentRunner:
     
     def _validate_peak_voltage(self, expected_voltage: int) -> bool:
         """Validate that peak voltage matches expected value"""
+        def _read_peak() -> float:
+            raw = get_oscilloscope_peak_voltage()
+            return float(raw)
+
         try:
-            peak_voltage = float(get_oscilloscope_peak_voltage())
+            peak_voltage = _read_peak()
+
+            # If the first read looks stale (often showing last test), retry once after a short delay.
+            if abs(peak_voltage - expected_voltage) > VOLTAGE_TOLERANCE:
+                time.sleep(0.3)
+                peak_voltage = _read_peak()
+
             if abs(peak_voltage - expected_voltage) > VOLTAGE_TOLERANCE:
                 result = messagebox.askyesno(
                     "Validation Error",
@@ -801,24 +910,53 @@ class ExperimentRunner:
     def _capture_final_readings(self, filename: str, params: ExperimentParams):
         """Capture and log final instrument readings"""
         try:
-            def _get_float_reading(fetcher, label: str) -> float:
-                """Safely convert instrument readings to float"""
-                raw_value = fetcher()
-                if raw_value is None:
-                    raise ValueError(f"{label} reading unavailable")
-                try:
-                    return float(raw_value)
-                except (TypeError, ValueError):
-                    raise ValueError(f"{label} reading invalid: {raw_value}")
+            def _get_float_reading_with_retries(
+                fetcher,
+                label: str,
+                *,
+                retries: int = 2,
+                delay_s: float = 0.2,
+                allow_none: bool = False,
+            ) -> Optional[float]:
+                """Safely convert instrument readings to float with simple retries."""
+                last_error: Optional[Exception] = None
+                for attempt in range(retries + 1):
+                    raw_value = fetcher()
+                    if raw_value is None:
+                        last_error = ValueError(f"{label} reading unavailable")
+                    else:
+                        try:
+                            return float(raw_value)
+                        except (TypeError, ValueError):
+                            last_error = ValueError(f"{label} reading invalid: {raw_value}")
+                    if attempt < retries:
+                        time.sleep(delay_s)
+                if allow_none:
+                    print(f"Warning: {label} unavailable after retries: {last_error}")
+                    return None
+                raise last_error if last_error else ValueError(f"{label} reading failed")
 
-            dc_voltage = _get_float_reading(get_multimeter_voltage, "DC voltage")
-            rms_current = _get_float_reading(get_oscilloscope_rms_current, "RMS current")
-            isw_rms = _get_float_reading(get_oscilloscope_isw_rms, "Isw RMS current")
-            vds_pk = _get_float_reading(get_oscilloscope_peak_voltage, "Vds peak voltage")
+            def _average_rms_current() -> float:
+                """Use runtime average if available, otherwise take a fresh reading."""
+                samples = [val for val in self._rms_current_samples if val is not None]
+                if samples:
+                    return sum(samples) / len(samples)
+                return _get_float_reading_with_retries(get_oscilloscope_rms_current, "RMS current")
+
+            dc_voltage = _get_float_reading_with_retries(get_multimeter_voltage, "DC voltage")
+            rms_current = _average_rms_current()
+            isw_rms = _get_float_reading_with_retries(get_oscilloscope_isw_rms, "Isw RMS current")
+            vds_pk = _get_float_reading_with_retries(
+                get_oscilloscope_peak_voltage,
+                "Vds peak voltage",
+                retries=3,
+                delay_s=0.3,
+                allow_none=True,
+            )
             dc_current = self.gui.last_current_value
             if dc_current is None:
                 raise ValueError("DC current reading unavailable")
-            measured_freq = _get_float_reading(get_wavegen_frequency, "Wavegen frequency")
+            measured_freq = _get_float_reading_with_retries(get_wavegen_frequency, "Wavegen frequency")
 
             # Log to CSV
             log_data_to_csv(filename, [
@@ -847,7 +985,7 @@ class ExperimentRunner:
             print(f"RMS Current: {rms_current} A")
             print(f"DC Current: {dc_current} A")
             print(f"Frequency: {measured_freq} Hz")
-            print(f"Vds Peak: {vds_pk} V")
+            print(f"Vds Peak: {vds_pk if vds_pk is not None else 'N/A'} V")
 
             if params.config == "Dual Conduction":
                 print(f"Isw RMS Current: {isw_rms} A")
@@ -961,6 +1099,7 @@ class GaNExperimentGUI(tk.Tk):
         self._auto_sequence_cancel = threading.Event()
         self._auto_sequence_thread: Optional[threading.Thread] = None
         self._auto_sequence_duration = 0.0
+        self.auto_sequence_button = None
         self._autotune_voltage_prompt_pending = False
         self._last_confirmed_voltage: Optional[int] = None
 
@@ -1397,13 +1536,6 @@ class GaNExperimentGUI(tk.Tk):
             command=self._cancel_experiment, state="disabled"
         )
         self.cancel_button.pack(side="left")
-
-        self.auto_sequence_button = ttk.Button(
-            self.button_frame,
-            text="Start Auto Sequence",
-            command=self._toggle_auto_sequence,
-        )
-        self.auto_sequence_button.pack(side="left", padx=(20, 0))
     
     def _build_plot_frame(self):
         """Build plot frame"""
@@ -1823,6 +1955,16 @@ class GaNExperimentGUI(tk.Tk):
     def _tuning_available(self):
         return self._get_tuning_candidate() is not None
 
+    def _format_frequency_display(self, freq_hz: float) -> str:
+        """Return a human-friendly frequency label for UI elements."""
+        freq = float(freq_hz)
+        abs_freq = abs(freq)
+        if abs_freq >= 1_000_000:
+            return f"{freq / 1_000_000:.2f} MHz".rstrip("0").rstrip(".")
+        if abs_freq >= 1_000:
+            return f"{freq / 1_000:.1f} kHz".rstrip("0").rstrip(".")
+        return f"{freq:.0f} Hz"
+
     def _update_confirm_button_color(self):
         """Update confirm button color based on state"""
         # First check if there are unconfirmed changes
@@ -1844,9 +1986,13 @@ class GaNExperimentGUI(tk.Tk):
         if getattr(self, "_autotune_running", False):
             return
 
-        if self._tuning_available():
+        candidate = self._get_tuning_candidate()
+        if candidate:
+            freq_val, source_config, source_temp, _ = candidate
+            freq_lbl = self._format_frequency_display(freq_val)
+            text = f"Autotun: {freq_lbl}"
             self._set_autotune_button_style(
-                text="Autotune Available",
+                text=text,
                 state="normal",
                 bg="#43a047",
                 fg="white",
@@ -1894,8 +2040,6 @@ class GaNExperimentGUI(tk.Tk):
         if previous_voltage is not None and new_voltage != previous_voltage:
             if previous_voltage >= 400 and new_voltage <= 200:
                 warnings.append(f"Voltage drop from {previous_voltage} V to {new_voltage} V.")
-            elif abs(new_voltage - previous_voltage) >= 100:
-                warnings.append(f"Voltage change from {previous_voltage} V to {new_voltage} V.")
 
         previous_duty = self.wavegen_controller.last_confirmed_duty
         if previous_duty is not None and new_duty != previous_duty:
@@ -2127,9 +2271,11 @@ class GaNExperimentGUI(tk.Tk):
         self._update_confirm_button_color()
 
     def _toggle_auto_sequence(self):
+        button = getattr(self, "auto_sequence_button", None)
         if self._auto_sequence_active:
             self._auto_sequence_cancel.set()
-            self.auto_sequence_button.config(text="Stopping...", state="disabled")
+            if button:
+                button.config(text="Stopping...", state="disabled")
             self.status_bar.set_message("Stopping auto sequence...")
             return
 
@@ -2158,7 +2304,8 @@ class GaNExperimentGUI(tk.Tk):
         self._auto_sequence_duration = params.duration_minutes
         self._auto_sequence_cancel = threading.Event()
         self._auto_sequence_active = True
-        self.auto_sequence_button.config(text="Stop Auto Sequence", state="normal")
+        if button:
+            button.config(text="Stop Auto Sequence", state="normal")
         self.status_bar.set_message("Auto sequence starting...")
 
         self._auto_sequence_thread = threading.Thread(
@@ -2312,8 +2459,10 @@ class GaNExperimentGUI(tk.Tk):
             self.after(0, self._finish_auto_sequence_ui)
 
     def _finish_auto_sequence_ui(self):
+        button = getattr(self, "auto_sequence_button", None)
         self._auto_sequence_active = False
-        self.auto_sequence_button.config(text="Start Auto Sequence", state="normal")
+        if button:
+            button.config(text="Start Auto Sequence", state="normal")
         self._auto_sequence_thread = None
         self._auto_sequence_cancel.clear()
 

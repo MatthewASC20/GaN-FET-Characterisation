@@ -3,7 +3,54 @@ import json
 from openpyxl.utils import get_column_letter
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from typing import Optional, Tuple
 from config import *
+
+TIME_SERIES_SHEET_TITLE = "Time Series"
+_SHEET_EXISTENCE_CACHE = set()
+
+def _ensure_sheet_exists(service, spreadsheet_id: str, sheet_title: str) -> bool:
+    """Create the target sheet if it's missing (cached to avoid repeat lookups)."""
+    cache_key = (spreadsheet_id, sheet_title)
+    if cache_key in _SHEET_EXISTENCE_CACHE:
+        return True
+    try:
+        meta = service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets.properties.title"
+        ).execute()
+        titles = {s["properties"]["title"] for s in meta.get("sheets", [])}
+        if sheet_title not in titles:
+            body = {"requests": [{"addSheet": {"properties": {"title": sheet_title}}}]}
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body=body
+            ).execute()
+            # Seed header row for readability
+            header = [[
+                "Timestamp",
+                "Temperature (°C)",
+                "Frequency (Hz)",
+                "Voltage (V)",
+                "Configuration",
+                "Duty (%)",
+                "DC Voltage (V)",
+                "DC Current (A)",
+                "LRMS (A)",
+                "Isw RMS (A)",
+            ]]
+            service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{sheet_title}!A1",
+                valueInputOption="RAW",
+                body={"values": header}
+            ).execute()
+        _SHEET_EXISTENCE_CACHE.add(cache_key)
+        return True
+    except Exception as exc:
+        print(f"Could not ensure sheet '{sheet_title}' exists: {exc}")
+        return False
 
 def _resolve_row(duty, voltage):
     """Return the row for the duty/voltage pair, falling back to the first row."""
@@ -149,6 +196,83 @@ def log_final_results_to_sheet(
     except Exception as exc:
         error_message = (
             f"Google Sheets logging error for {key} at {temp}°C ({config}, {voltage}V, {duty} duty): {exc}"
+        )
+        print(error_message)
+        return False, error_message
+
+
+def log_timeseries_sample_to_sheet(
+    device_name: str,
+    freq: float,
+    temp: int,
+    config: str,
+    duty: int,
+    voltage: int,
+    timestamp: str,
+    dc_voltage: Optional[float],
+    rms_current: Optional[float],
+    isw_rms: Optional[float],
+    dc_current: Optional[float] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Append a timestamped sample (voltage + RMS currents) to the Time Series sheet.
+    """
+    from data_utils import freq_label
+
+    frequency_label = freq_label(freq)
+    key = f"{device_name}_{frequency_label}"
+
+    try:
+        mappings = load_mappings()
+        spreadsheet_id = mappings.get(key)
+        if not spreadsheet_id:
+            error_message = (
+                f"Spreadsheet for {key} not found in mapping file '{MAPPING_FILE}'."
+            )
+            print(error_message)
+            return False, error_message
+
+        creds = Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES
+        )
+        service = build('sheets', 'v4', credentials=creds)
+
+        if not _ensure_sheet_exists(service, spreadsheet_id, TIME_SERIES_SHEET_TITLE):
+            return False, f"Could not ensure sheet '{TIME_SERIES_SHEET_TITLE}' exists."
+
+        values = [[
+            timestamp,
+            temp,
+            freq,
+            voltage,
+            config,
+            duty,
+            dc_voltage,
+            dc_current,
+            rms_current,
+            isw_rms,
+        ]]
+
+        service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"{TIME_SERIES_SHEET_TITLE}!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": values},
+        ).execute()
+
+        return True, None
+    except HttpError as exc:
+        error_message = (
+            f"Google Sheets time-series append failed for {key} at {temp}°C "
+            f"({config}, {voltage}V, {duty}%): {exc}"
+        )
+        print(error_message)
+        return False, error_message
+    except Exception as exc:
+        error_message = (
+            f"Unexpected Sheets error for {key} at {temp}°C "
+            f"({config}, {voltage}V, {duty}%): {exc}"
         )
         print(error_message)
         return False, error_message
