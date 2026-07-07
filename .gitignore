@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.DS_Store
+.mplconfig/
+
+# Secrets — never commit the Google service-account key
+credentials.json
+
+# Runtime state
+settings.json
+gan_fet.db
+gan_fet.db-wal
+gan_fet.db-shm
+screenshots/
+reports/
+exports/
