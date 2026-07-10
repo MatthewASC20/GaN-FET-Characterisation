@@ -22,6 +22,9 @@ sheets = [
 macos = [
     "tkmacosx>=1.0.5",
 ]
+dev = [
+    "pytest>=7.4",
+]
 
 [project.scripts]
 gan-fet = "gan_fet.app:main"
