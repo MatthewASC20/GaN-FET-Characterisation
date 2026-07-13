@@ -11,9 +11,15 @@ from __future__ import annotations
 import logging
 import socket
 import threading
+import time
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+# After a failed connect, don't re-attempt for this long. Without it, every
+# command sent to an unreachable instrument blocks for a full connect
+# timeout — which freezes whatever thread is doing the sending.
+RETRY_COOLDOWN_S = 10.0
 
 
 class ScpiTcpClient:
@@ -24,6 +30,7 @@ class ScpiTcpClient:
         self.timeout = timeout
         self._sock: Optional[socket.socket] = None
         self._lock = threading.RLock()
+        self._next_attempt = 0.0
 
     # -- connection ----------------------------------------------------
 
@@ -31,16 +38,20 @@ class ScpiTcpClient:
         with self._lock:
             if self._sock is not None:
                 return True
+            if time.monotonic() < self._next_attempt:
+                return False  # still in cooldown from the last failure
             try:
                 self._sock = socket.create_connection(
                     (self.host, self.port), timeout=self.timeout
                 )
                 self._sock.settimeout(self.timeout)
+                self._next_attempt = 0.0
                 return True
             except OSError as exc:
-                log.warning("%s: connect to %s:%s failed: %s",
-                            self.name, self.host, self.port, exc)
+                log.warning("%s: connect to %s:%s failed: %s (retry in %.0fs)",
+                            self.name, self.host, self.port, exc, RETRY_COOLDOWN_S)
                 self._sock = None
+                self._next_attempt = time.monotonic() + RETRY_COOLDOWN_S
                 return False
 
     def close(self) -> None:

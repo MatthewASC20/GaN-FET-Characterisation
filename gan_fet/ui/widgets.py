@@ -81,7 +81,10 @@ def show_temporary_popup(root: tk.Misc, message: str, duration_ms: int = 1500) -
     tk.Label(popup, text=message, font=("TkDefaultFont", 13)).pack(
         expand=True, fill="both", padx=10, pady=10
     )
-    popup.after(duration_ms, popup.destroy)
+    # Cancel the auto-close callback if the popup dies first (e.g. app
+    # shutdown), otherwise Tk logs 'invalid command name "...destroy"'.
+    after_id = popup.after(duration_ms, popup.destroy)
+    popup.bind("<Destroy>", lambda _e: popup.after_cancel(after_id))
 
 
 class ParamButtonGroup(tk.Frame):

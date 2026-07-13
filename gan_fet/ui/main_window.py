@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Any, Dict, List, Optional, Tuple
@@ -957,11 +958,42 @@ class MainWindow(tk.Tk):
     # ------------------------------------------------------------------
 
     def _on_closing(self) -> None:
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+
         device = self.device_name_var.get().strip()
         if device:
             self._persist_device_options(device)
         self._save_last_params()
+
+        was_busy = self.engine.is_busy() or self.sequence.active
         self.sequence.cancel()
         self.engine.cancel()
-        self.smu.emergency_off()
-        self.after(300, self.destroy)
+
+        # Hardware shutdown happens off the UI thread: with an unreachable
+        # instrument every SCPI write blocks on a connect timeout, which
+        # must never freeze the close.
+        def shutdown_hardware():
+            try:
+                if self.smu.output_is_on:
+                    self.smu.emergency_off()
+            except Exception:
+                pass
+
+        worker = threading.Thread(target=shutdown_hardware, daemon=True)
+        worker.start()
+
+        # Give a running experiment time to ramp the bus down; close almost
+        # immediately when the rig was idle.
+        deadline = time.monotonic() + (10.0 if was_busy else 1.0)
+        self.status_bar.set_message("Shutting down...")
+
+        def poll_shutdown():
+            engine_done = not self.engine.is_busy()
+            if (engine_done and not worker.is_alive()) or time.monotonic() > deadline:
+                self.destroy()
+            else:
+                self.after(50, poll_shutdown)
+
+        poll_shutdown()
