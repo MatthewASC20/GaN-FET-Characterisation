@@ -600,11 +600,15 @@ class MainWindow(tk.Tk):
 
         if candidate and not self._tuner_busy:
             freq_mhz = candidate[0] / 1e6
-            self.autotune_button.config(text=f"Autotune: {freq_mhz:.2f} MHz", state="normal")
-            self.autotune_button.set_style(bg=COLOR_OK, fg="white", active_bg="#388e3c")
+            self.autotune_button.set_style(
+                bg=COLOR_OK, fg="white", active_bg="#388e3c",
+                text=f"Autotune: {freq_mhz:.2f} MHz", state="normal",
+            )
         elif not self._tuner_busy:
-            self.autotune_button.config(text="Autotune Unavailable", state="disabled")
-            self.autotune_button.set_style(bg="#bdbdbd", fg="white")
+            self.autotune_button.set_style(
+                bg="#bdbdbd", fg="white",
+                text="Autotune Unavailable", state="disabled",
+            )
 
     def _confirm_high_risk(self) -> bool:
         warnings = []
@@ -655,8 +659,9 @@ class MainWindow(tk.Tk):
 
         target, src_config, src_temp = candidate
         self._tuner_busy = True
-        self.autotune_button.config(text="Autotuning...", state="disabled")
-        self.autotune_button.set_style(bg="#1976D2", fg="white")
+        self.autotune_button.set_style(
+            bg="#1976D2", fg="white", text="Autotuning...", state="disabled"
+        )
 
         config = self.config_var.get()
 

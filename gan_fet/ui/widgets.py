@@ -30,16 +30,35 @@ class ColorButton(_ColorButtonBase):
             # size in characters — drop them and let geometry management win.
             kwargs.pop("width", None)
             kwargs.pop("height", None)
+        # tkmacosx.Button recomputes its canvas size on every config() and
+        # accumulates its highlight border, so the widget grows a little on
+        # each restyle. Pin the constructed pixel size and re-assert it on
+        # every style change.
+        self._pinned_size = (
+            {k: kwargs[k] for k in ("width", "height") if k in kwargs}
+            if _HAVE_TKMACOSX else {}
+        )
         super().__init__(master, **kwargs)
 
     def set_style(self, *, bg: str, fg: str, active_bg: Optional[str] = None,
                   active_fg: Optional[str] = None, **extra):
-        self.config(
-            bg=bg, fg=fg,
-            activebackground=active_bg or bg,
-            activeforeground=active_fg or fg,
+        options: Dict[str, Any] = {
+            "bg": bg,
+            "fg": fg,
+            "activebackground": active_bg or bg,
+            "activeforeground": active_fg or fg,
             **extra,
-        )
+        }
+        # Skip no-op updates: restyling fires on every parameter click, and
+        # each config() call makes tkmacosx redraw (and re-grow) the button.
+        try:
+            unchanged = all(str(self.cget(k)) == str(v) for k, v in options.items())
+        except tk.TclError:
+            unchanged = False
+        if unchanged:
+            return
+        options.update(self._pinned_size)
+        self.config(**options)
 
 
 class StatusBar(tk.Frame):
