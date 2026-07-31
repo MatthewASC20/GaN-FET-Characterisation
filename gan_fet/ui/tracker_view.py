@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import messagebox, ttk
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from gan_fet.core.models import MatrixPoint, freq_label
 from gan_fet.storage.db import Database

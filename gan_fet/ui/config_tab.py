@@ -3,10 +3,12 @@ SMU/safety limits."""
 
 from __future__ import annotations
 
+import functools
 import tkinter as tk
 from tkinter import messagebox, ttk
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from gan_fet.core import param_options
 from gan_fet.settings import Settings
 
 
@@ -210,3 +212,80 @@ class SmuLimitsEditor(ttk.LabelFrame):
             setattr(getattr(self.settings, section), attr, value)
         self.settings.save()
         self.on_applied()
+
+
+EDITOR_TITLES = {
+    "configurations": "Configurations",
+    "frequencies": "Frequencies (Hz)",
+    "duties": "Duty Cycles (%)",
+    "temperatures": "Temperatures (°C)",
+    "voltages": "Voltages (V)",
+}
+
+
+class ConfigurationTab(ttk.Frame):
+    """The whole Configuration tab: one option editor per parameter key plus
+    the global instrument/limit editors."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        settings: Settings,
+        options: Mapping[str, Sequence[param_options.Option]],
+        defaults: Mapping[str, Sequence[param_options.Option]],
+        on_options_changed: Callable[
+            [str, List[param_options.Option]], Optional[List[param_options.Option]]
+        ],
+        on_settings_applied: Callable[[], None],
+    ):
+        super().__init__(master)
+        self.editors: Dict[str, ParameterListEditor] = {}
+
+        ttk.Label(
+            self,
+            text=(
+                "Per-device parameter options (stored in the database) and global "
+                "instrument/safety settings (stored in settings.json)."
+            ),
+            wraplength=800,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 5))
+
+        editors_frame = ttk.Frame(self)
+        editors_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        for col in range(2):
+            editors_frame.grid_columnconfigure(col, weight=1, uniform="cfg")
+
+        for idx, key in enumerate(param_options.OPTION_KEYS):
+            editor = ParameterListEditor(
+                editors_frame,
+                EDITOR_TITLES[key],
+                list(options[key]),
+                on_change=functools.partial(self._changed, key, on_options_changed),
+                value_parser=functools.partial(param_options.parse_value, key),
+                default_label_factory=functools.partial(param_options.default_label, key),
+                default_options=list(defaults[key]),
+            )
+            editor.grid(row=idx // 2, column=idx % 2, sticky="nsew", padx=10, pady=10)
+            self.editors[key] = editor
+
+        side = ttk.Frame(self)
+        side.grid(row=1, column=1, sticky="nsew", padx=10, pady=(0, 10))
+        InstrumentConfigEditor(side, settings, on_settings_applied).pack(
+            fill="x", pady=(0, 10)
+        )
+        SmuLimitsEditor(side, settings, on_settings_applied).pack(fill="x")
+
+        self.grid_columnconfigure(0, weight=3)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+    @staticmethod
+    def _changed(key, handler, options):
+        return handler(key, list(options))
+
+    def set_options(self, options: Mapping[str, Sequence[param_options.Option]]) -> None:
+        for key, editor in self.editors.items():
+            if key in options:
+                editor.set_options(list(options[key]))

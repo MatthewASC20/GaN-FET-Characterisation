@@ -7,9 +7,12 @@ platforms where colours work natively.
 
 from __future__ import annotations
 
+import logging
 import tkinter as tk
 from tkinter import ttk
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+log = logging.getLogger(__name__)
 
 try:
     from tkmacosx import Button as _ColorButtonBase  # type: ignore
@@ -181,8 +184,18 @@ class ParamButtonGroup(tk.Frame):
         self.after(10, self._highlight)
 
 
-def call_on_ui_thread(root: tk.Misc, func: Callable[[], Any]) -> Any:
+def call_on_ui_thread(
+    root: tk.Misc,
+    func: Callable[[], Any],
+    *,
+    timeout: float = 300.0,
+    default: Any = None,
+) -> Any:
     """Run func on the Tk main thread and return its result (blocking).
+
+    Returns `default` if the Tk loop is gone or `timeout` elapses, so a
+    worker thread can never be wedged by a window that closed while it was
+    waiting for an answer.
 
     Safe to call from worker threads; runs func directly when already on
     the main thread.
@@ -201,6 +214,16 @@ def call_on_ui_thread(root: tk.Misc, func: Callable[[], Any]) -> Any:
         finally:
             done.set()
 
-    root.after(0, wrapper)
-    done.wait()
-    return result.get("value")
+    try:
+        root.after(0, wrapper)
+    except RuntimeError:
+        # The Tk loop is already gone; nothing will ever run the callback.
+        return default
+
+    # Never wait unboundedly: if the window closes while an engine or
+    # sequence thread is waiting on a prompt, the callback is never
+    # serviced and an unbounded wait would wedge that thread for good.
+    if not done.wait(timeout):
+        log.warning("UI call timed out after %.0fs; assuming %r", timeout, default)
+        return default
+    return result.get("value", default)
