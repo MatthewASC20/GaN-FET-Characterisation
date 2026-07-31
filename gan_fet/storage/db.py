@@ -64,33 +64,52 @@ CREATE TABLE IF NOT EXISTS safety_events (
 );
 """
 
+# Selected by name, mapped by name: adding a column to `runs` cannot silently
+# shift what `_row_to_run` reads.
 _RUN_COLUMNS = (
-    "r.id, d.name, r.config, r.frequency_hz, r.duty_pct, r.temperature_c, "
-    "r.voltage_v, r.duration_minutes, r.started_at, r.completed_at, r.status, "
-    "r.bus_voltage_v, r.v_zvs, r.vin, r.iin, r.fsw_hz, r.irms, r.vds_pk, "
-    "r.isw_rms, r.screenshot_path"
+    "r.id, d.name AS device_name, r.config, r.frequency_hz, r.duty_pct, "
+    "r.temperature_c, r.voltage_v, r.duration_minutes, r.started_at, "
+    "r.completed_at, r.status, r.bus_voltage_v, r.v_zvs, r.vin, r.iin, "
+    "r.fsw_hz, r.irms, r.vds_pk, r.isw_rms, r.screenshot_path"
+)
+
+_RUN_SELECT = (
+    f"SELECT {_RUN_COLUMNS} FROM runs r JOIN devices d ON d.id = r.device_id"
+)
+
+#: The matrix-point columns, in the order the UNIQUE constraint uses them.
+_POINT_FIELDS = (
+    "config", "frequency_hz", "duty_pct", "temperature_c", "voltage_v",
 )
 
 
-def _row_to_run(row: sqlite3.Row | tuple) -> RunRecord:
+def _row_to_run(row: sqlite3.Row) -> RunRecord:
     return RunRecord(
-        id=row[0],
+        id=row["id"],
         point=MatrixPoint(
-            device_name=row[1], config=row[2], frequency_hz=row[3],
-            duty_pct=row[4], temperature_c=row[5], voltage_v=row[6],
+            device_name=row["device_name"],
+            config=row["config"],
+            frequency_hz=row["frequency_hz"],
+            duty_pct=row["duty_pct"],
+            temperature_c=row["temperature_c"],
+            voltage_v=row["voltage_v"],
         ),
-        duration_minutes=row[7],
-        started_at=row[8],
-        completed_at=row[9],
-        status=row[10],
-        bus_voltage_v=row[11],
-        v_zvs=row[12],
+        duration_minutes=row["duration_minutes"],
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+        status=row["status"],
+        bus_voltage_v=row["bus_voltage_v"],
+        v_zvs=row["v_zvs"],
         readings=FinalReadings(
-            vin=row[13], iin=row[14], fsw_hz=row[15],
-            irms=row[16], vds_pk=row[17], isw_rms=row[18],
+            vin=row["vin"], iin=row["iin"], fsw_hz=row["fsw_hz"],
+            irms=row["irms"], vds_pk=row["vds_pk"], isw_rms=row["isw_rms"],
         ),
-        screenshot_path=row[19],
+        screenshot_path=row["screenshot_path"],
     )
+
+
+def _point_values(point: MatrixPoint) -> tuple:
+    return tuple(getattr(point, field) for field in _POINT_FIELDS)
 
 
 class Database:
@@ -99,6 +118,7 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row  # name-based column access
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         with self._lock, self._conn:
@@ -159,11 +179,9 @@ class Database:
     def find_run(self, point: MatrixPoint) -> Optional[RunRecord]:
         with self._lock:
             row = self._conn.execute(
-                f"SELECT {_RUN_COLUMNS} FROM runs r JOIN devices d ON d.id = r.device_id"
-                " WHERE d.name=? AND r.config=? AND r.frequency_hz=? AND r.duty_pct=?"
-                " AND r.temperature_c=? AND r.voltage_v=?",
-                (point.device_name, point.config, point.frequency_hz,
-                 point.duty_pct, point.temperature_c, point.voltage_v),
+                f"{_RUN_SELECT} WHERE d.name=? AND r.config=? AND r.frequency_hz=?"
+                " AND r.duty_pct=? AND r.temperature_c=? AND r.voltage_v=?",
+                (point.device_name, *_point_values(point)),
             ).fetchone()
         return _row_to_run(row) if row else None
 
@@ -182,8 +200,7 @@ class Database:
                 self._conn.execute(
                     "DELETE FROM runs WHERE device_id=? AND config=? AND frequency_hz=?"
                     " AND duty_pct=? AND temperature_c=? AND voltage_v=?",
-                    (device_id, point.config, point.frequency_hz,
-                     point.duty_pct, point.temperature_c, point.voltage_v),
+                    (device_id, *_point_values(point)),
                 )
             cur = self._conn.execute(
                 "INSERT INTO runs(device_id, config, frequency_hz, duty_pct,"
@@ -228,18 +245,15 @@ class Database:
     def get_run(self, run_id: int) -> Optional[RunRecord]:
         with self._lock:
             row = self._conn.execute(
-                f"SELECT {_RUN_COLUMNS} FROM runs r JOIN devices d ON d.id=r.device_id"
-                " WHERE r.id=?",
-                (run_id,),
+                f"{_RUN_SELECT} WHERE r.id=?", (run_id,)
             ).fetchone()
         return _row_to_run(row) if row else None
 
     def runs_for_device(self, device_name: str) -> list[RunRecord]:
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT {_RUN_COLUMNS} FROM runs r JOIN devices d ON d.id=r.device_id"
-                " WHERE d.name=? ORDER BY r.frequency_hz, r.temperature_c,"
-                " r.config, r.duty_pct, r.voltage_v",
+                f"{_RUN_SELECT} WHERE d.name=? ORDER BY r.frequency_hz,"
+                " r.temperature_c, r.config, r.duty_pct, r.voltage_v",
                 (device_name,),
             ).fetchall()
         return [_row_to_run(r) for r in rows]
@@ -326,3 +340,17 @@ class Database:
             "INSERT INTO safety_events(run_id, kind, detail) VALUES (?,?,?)",
             (run_id, kind, detail),
         )
+
+    def safety_events(
+        self, run_id: Optional[int] = None
+    ) -> list[tuple[str, str, str]]:
+        """(timestamp, kind, detail) newest first, optionally for one run."""
+        sql = "SELECT ts, kind, detail FROM safety_events"
+        args: tuple = ()
+        if run_id is not None:
+            sql += " WHERE run_id=?"
+            args = (run_id,)
+        sql += " ORDER BY id DESC"
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [(r["ts"], r["kind"], r["detail"]) for r in rows]

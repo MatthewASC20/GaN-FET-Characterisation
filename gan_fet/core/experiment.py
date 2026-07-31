@@ -140,55 +140,25 @@ class ExperimentEngine:
     # -- run -------------------------------------------------------------
 
     def _run(self, params: ExperimentParams) -> None:
+        """Phases: confirm → energise → sample → finalise, with the bus
+        always brought back down in `finally` whatever happens."""
         point = params.point
         run_id: Optional[int] = None
         success = False
         message = ""
         try:
-            existing = self.db.find_run(point)
-            if existing is not None and not self.callbacks.confirm_overwrite(
-                point.describe()
-            ):
+            if not self._confirm_overwrite_if_needed(point):
                 message = "Cancelled: existing result kept."
                 return
 
-            # -- bring the bus up -----------------------------------------
-            self.callbacks.on_status("Starting SMU (soft start from 0 V)...")
-            if not self.smu.output_on():
-                raise ConnectionError("Could not enable the SMU output")
-
-            self.callbacks.on_status(
-                f"Peak control: seeking Vds peak {point.voltage_v} V..."
-            )
-            bus_voltage = self.peak_controller.achieve_peak(
-                float(point.voltage_v),
-                cancel_check=self._cancelled,
-                status=self.callbacks.on_status,
-            )
-
-            v_zvs: Optional[float] = None
-            if params.find_zvs:
-                self.callbacks.on_status("Searching for ZVS point...")
-                result = self.zvs_tuner.find_minimum(
-                    cancel_check=self._cancelled, status=self.callbacks.on_status
-                )
-                if result is not None:
-                    v_zvs = result.v_zvs
-                    bus_voltage = result.v_zvs
-                    self.callbacks.on_status(
-                        f"ZVS point: {result.v_zvs:.1f} V "
-                        f"({result.i_min * 1000:.2f} mA)"
-                    )
-
+            bus_voltage, v_zvs = self._energise_bus(params)
             if self._cancelled():
                 message = "Cancelled before sampling started."
                 return
 
-            # -- sampling loop ---------------------------------------------
             run_id = self.db.create_run(point, params.duration_minutes)
             self.safety.active_run_id = run_id
             self.callbacks.on_status(f"Running: {point.describe()}")
-
             rms_samples = self._sampling_loop(run_id, params)
 
             if self._cancelled():
@@ -196,24 +166,9 @@ class ExperimentEngine:
                 message = "Experiment cancelled."
                 return
 
-            # -- final readings ---------------------------------------------
-            self.callbacks.on_status("Capturing final readings...")
-            readings = self._capture_final_readings(rms_samples)
-            screenshot = self._capture_screenshot(run_id, point)
-            self.db.complete_run(
-                run_id,
-                readings,
-                bus_voltage_v=bus_voltage,
-                v_zvs=v_zvs,
-                screenshot_path=str(screenshot) if screenshot else None,
-            )
+            self._finalise_run(run_id, point, rms_samples, bus_voltage, v_zvs)
             success = True
             message = "Experiment complete."
-
-            if self.on_run_completed is not None:
-                record = self.db.get_run(run_id)
-                if record is not None:
-                    self.on_run_completed(record)
 
         except SafetyTrip as trip:
             message = f"SAFETY TRIP — {trip}"
@@ -235,6 +190,69 @@ class ExperimentEngine:
             self.safety.active_run_id = None
             self._set_state(ExperimentState.IDLE)
             self.callbacks.on_finished(success, message)
+
+    def _confirm_overwrite_if_needed(self, point) -> bool:
+        """One stored result per matrix point: ask before replacing one."""
+        if self.db.find_run(point) is None:
+            return True
+        return bool(self.callbacks.confirm_overwrite(point.describe()))
+
+    def _energise_bus(self, params: ExperimentParams) -> tuple[float, Optional[float]]:
+        """Soft-start the SMU, drive the scope-measured Vds peak to the
+        selected target, then optionally settle on the ZVS point.
+
+        Returns (bus_voltage, v_zvs) where v_zvs is None unless a search ran.
+        """
+        point = params.point
+        self.callbacks.on_status("Starting SMU (soft start from 0 V)...")
+        if not self.smu.output_on():
+            raise ConnectionError("Could not enable the SMU output")
+
+        self.callbacks.on_status(
+            f"Peak control: seeking Vds peak {point.voltage_v} V..."
+        )
+        bus_voltage = self.peak_controller.achieve_peak(
+            float(point.voltage_v),
+            cancel_check=self._cancelled,
+            status=self.callbacks.on_status,
+        )
+
+        v_zvs: Optional[float] = None
+        if params.find_zvs and not self._cancelled():
+            self.callbacks.on_status("Searching for ZVS point...")
+            result = self.zvs_tuner.find_minimum(
+                cancel_check=self._cancelled, status=self.callbacks.on_status
+            )
+            if result is not None:
+                v_zvs = bus_voltage = result.v_zvs
+                self.callbacks.on_status(
+                    f"ZVS point: {result.v_zvs:.1f} V ({result.i_min * 1000:.2f} mA)"
+                )
+        return bus_voltage, v_zvs
+
+    def _finalise_run(
+        self,
+        run_id: int,
+        point,
+        rms_samples: list[float],
+        bus_voltage: float,
+        v_zvs: Optional[float],
+    ) -> None:
+        """Capture end-of-run instrument readings, screenshot and store them."""
+        self.callbacks.on_status("Capturing final readings...")
+        readings = self._capture_final_readings(rms_samples)
+        screenshot = self._capture_screenshot(run_id, point)
+        self.db.complete_run(
+            run_id,
+            readings,
+            bus_voltage_v=bus_voltage,
+            v_zvs=v_zvs,
+            screenshot_path=str(screenshot) if screenshot else None,
+        )
+        if self.on_run_completed is not None:
+            record = self.db.get_run(run_id)
+            if record is not None:
+                self.on_run_completed(record)
 
     def _sampling_loop(self, run_id: int, params: ExperimentParams) -> list[float]:
         duration_s = params.duration_minutes * 60.0

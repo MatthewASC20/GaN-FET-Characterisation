@@ -6,7 +6,7 @@ import dataclasses
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, get_type_hints
 
 APP_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_SETTINGS_PATH = APP_DIR / "settings.json"
@@ -141,29 +141,40 @@ class Settings:
 
     @classmethod
     def _from_dict(cls, raw: dict[str, Any]) -> "Settings":
+        """Rebuild from JSON, keeping the default for any malformed section.
+
+        Nested sections are rebuilt from their declared dataclass type, so a
+        new section needs no changes here — only a typed field above. Unknown
+        keys inside a section are ignored rather than raising, so a settings
+        file written by a newer version still loads.
+        """
         settings = cls()
-        for f in dataclasses.fields(cls):
-            if f.name not in raw:
+        # `from __future__ import annotations` makes field.type a string, so
+        # resolve the real classes before testing for nested dataclasses.
+        hints = get_type_hints(cls)
+        for spec in dataclasses.fields(cls):
+            if spec.name not in raw:
                 continue
-            value = raw[f.name]
+            value = raw[spec.name]
+            declared = hints.get(spec.name)
             try:
-                if f.name == "instruments":
+                if spec.name == "instruments":
                     settings.instruments = {
                         name: InstrumentAddress(str(v["ip"]), int(v["port"]))
                         for name, v in value.items()
                     }
-                elif f.name == "smu":
-                    settings.smu = SmuSettings(**value)
-                elif f.name == "zvs":
-                    settings.zvs = ZvsSettings(**value)
-                elif f.name == "peak_control":
-                    settings.peak_control = PeakControlSettings(**value)
-                elif f.name == "safety":
-                    settings.safety = SafetySettings(**value)
-                elif f.name == "google":
-                    settings.google = GoogleSettings(**value)
+                elif dataclasses.is_dataclass(declared):
+                    if not isinstance(value, dict):
+                        continue  # malformed section: keep the default
+                    setattr(settings, spec.name, _build_section(declared, value))
                 else:
-                    setattr(settings, f.name, value)
-            except (TypeError, KeyError, ValueError):
-                pass  # keep the default for malformed sections
+                    setattr(settings, spec.name, value)
+            except (TypeError, KeyError, ValueError, AttributeError):
+                pass  # malformed section: keep the default
         return settings
+
+
+def _build_section(section_type: type, value: dict[str, Any]):
+    """Instantiate a settings section, dropping keys it does not declare."""
+    known = {f.name for f in dataclasses.fields(section_type)}
+    return section_type(**{k: v for k, v in value.items() if k in known})

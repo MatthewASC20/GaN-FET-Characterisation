@@ -72,8 +72,8 @@ def test_compliance_trip_shuts_everything_down(rig):
     time.sleep(SETTLE)
     assert rig.state.smu_output is False
     assert "C1:OUTP OFF" in rig.state.commands["wavegen"]
-    events = rig.db._execute("SELECT kind FROM safety_events").fetchall()
-    assert ("compliance",) in events
+    kinds = [kind for _ts, kind, _detail in rig.db.safety_events()]
+    assert "compliance" in kinds
 
 
 def test_engine_full_run(rig):
