@@ -27,7 +27,7 @@ class MatrixPoint:
 
     def describe(self) -> str:
         return (
-            f"{self.device_name}: {self.config}, {self.frequency_hz / 1e6:.0f} MHz, "
+            f"{self.device_name}: {self.config}, {freq_label(self.frequency_hz)}, "
             f"{self.duty_pct}% duty, {self.voltage_v} V, {self.temperature_c} °C"
         )
 
@@ -57,6 +57,7 @@ class RunRecord:
     started_at: Optional[str]
     completed_at: Optional[str]
     status: str
+    attempt_no: int = 1
     bus_voltage_v: Optional[float] = None
     v_zvs: Optional[float] = None
     readings: FinalReadings = field(default_factory=FinalReadings)
@@ -64,8 +65,11 @@ class RunRecord:
 
 
 def freq_label(freq_hz: float) -> str:
-    """Human label used throughout the app and the legacy file tree, e.g. 13MHz."""
-    return f"{int(freq_hz / 1e6)}MHz"
+    """Return an exact, compact MHz label without truncating fractional MHz."""
+    frequency = float(freq_hz)
+    decimal_places = 6 if frequency.is_integer() else 9
+    mhz = f"{frequency / 1_000_000:.{decimal_places}f}".rstrip("0").rstrip(".")
+    return f"{mhz}MHz"
 
 
 def sanitize_device_name(raw_name: str) -> str:

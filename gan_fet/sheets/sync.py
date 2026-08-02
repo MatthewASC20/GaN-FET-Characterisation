@@ -15,10 +15,11 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from gan_fet.core.models import MatrixPoint, RunRecord, freq_label
+from gan_fet.core.models import MatrixPoint, RunRecord
 from gan_fet.settings import GoogleSettings
 from gan_fet.sheets import drive
 
@@ -39,6 +40,12 @@ DUTY_ROW_MAP: dict[int, dict[int, int]] = {
     25: {200: 4, 300: 5, 400: 6},
     50: {200: 11, 300: 12, 400: 13},
 }
+SYNC_RETRY_DELAYS_S = (0.25, 1.0)
+_STOP = None
+
+
+class UnmappedSheetPoint(ValueError):
+    """The fixed spreadsheet template has no cell for a matrix point."""
 
 
 def column_letter(index: int) -> str:
@@ -57,7 +64,7 @@ def _cell(sheet: str, config: str, duty: int, voltage: int, key: str) -> Optiona
         return None
     row = rows.get(voltage)
     if row is None:
-        row = next(iter(rows.values()))
+        return None
     return f"{sheet}!{column_letter(columns[key])}{row}"
 
 
@@ -71,8 +78,10 @@ class SheetsSync:
         self.settings = settings
         self.frequencies_hz = frequencies_hz
         self.status = status
-        self._queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        self._queue: "queue.Queue[tuple[str, object] | None]" = queue.Queue()
         self._worker: Optional[threading.Thread] = None
+        self._state_lock = threading.Lock()
+        self._closed = False
         self._sheets_service = None
         self._drive_service = None
 
@@ -106,12 +115,55 @@ class SheetsSync:
             self._submit(("clear", point))
 
     def _submit(self, item: tuple[str, object]) -> None:
-        self._queue.put(item)
-        if self._worker is None or not self._worker.is_alive():
-            self._worker = threading.Thread(
-                target=self._drain, daemon=True, name="sheets-sync"
-            )
-            self._worker.start()
+        closed = False
+        with self._state_lock:
+            if self._closed:
+                closed = True
+            else:
+                self._queue.put(item)
+                if self._worker is None:
+                    self._worker = threading.Thread(
+                        target=self._drain, daemon=True, name="sheets-sync"
+                    )
+                    self._worker.start()
+        if closed:
+            self._notify("Sheets sync is closed; update was not queued.")
+
+    def close(self, *, flush: bool = True, timeout: float | None = None) -> bool:
+        """Stop the worker, optionally draining all queued operations first.
+
+        Returns ``True`` when the worker stopped within ``timeout``. The method
+        is idempotent and enqueues exactly one sentinel.
+        """
+        with self._state_lock:
+            if not self._closed:
+                self._closed = True
+                if not flush:
+                    while True:
+                        try:
+                            pending = self._queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        else:
+                            self._queue.task_done()
+                            if pending is _STOP:
+                                break
+                if self._worker is not None:
+                    self._queue.put(_STOP)
+            worker = self._worker
+        if worker is None:
+            return True
+        worker.join(timeout=timeout)
+        return not worker.is_alive()
+
+    def join(self, timeout: float | None = None) -> bool:
+        """Wait for the current worker; useful for coordinated application exit."""
+        with self._state_lock:
+            worker = self._worker
+        if worker is None:
+            return True
+        worker.join(timeout=timeout)
+        return not worker.is_alive()
 
     # -- worker ----------------------------------------------------------
 
@@ -129,11 +181,11 @@ class SheetsSync:
 
     def _drain(self) -> None:
         while True:
+            item = self._queue.get()
             try:
-                kind, payload = self._queue.get(timeout=5)
-            except queue.Empty:
-                return
-            try:
+                if item is _STOP:
+                    return
+                kind, payload = item  # type: ignore[misc]
                 if kind == "run":
                     self._sync_run(payload)          # type: ignore[arg-type]
                 elif kind == "device":
@@ -142,17 +194,39 @@ class SheetsSync:
                     self._clear_point(payload)       # type: ignore[arg-type]
             except Exception as exc:
                 log.warning("Sheets sync (%s) failed: %s", kind, exc)
-                self.status(f"Sheets sync failed: {exc}")
+                self._notify(f"Sheets sync failed: {exc}")
             finally:
                 self._queue.task_done()
 
+    def _notify(self, message: str) -> None:
+        try:
+            self.status(message)
+        except Exception:
+            log.exception("Sheets status callback failed")
+
+    @staticmethod
+    def _execute_with_retry(operation, description: str):
+        last_error: Exception | None = None
+        for attempt in range(len(SYNC_RETRY_DELAYS_S) + 1):
+            try:
+                return operation().execute()
+            except Exception as exc:
+                last_error = exc
+                if attempt >= len(SYNC_RETRY_DELAYS_S):
+                    break
+                time.sleep(SYNC_RETRY_DELAYS_S[attempt])
+        assert last_error is not None
+        raise RuntimeError(
+            f"{description} failed after {len(SYNC_RETRY_DELAYS_S) + 1} attempts"
+        ) from last_error
+
     def _spreadsheet_id(self, device_name: str, frequency_hz: int) -> Optional[str]:
-        key = f"{device_name}_{freq_label(frequency_hz)}"
+        key = drive.mapping_key(device_name, frequency_hz)
         mappings = drive.load_mappings(self.settings)
         if key not in mappings:
             _, drive_service = self._services()
             mappings = drive.ensure_device_setup(
-                drive_service, self.settings, device_name, self.frequencies_hz
+                drive_service, self.settings, device_name, [frequency_hz]
             )
         return mappings.get(key)
 
@@ -161,17 +235,45 @@ class SheetsSync:
         drive.ensure_device_setup(
             drive_service, self.settings, device_name, self.frequencies_hz
         )
-        self.status(f"Drive setup complete for {device_name}.")
+        self._notify(f"Drive setup complete for {device_name}.")
+
+    @staticmethod
+    def _cells_for_point(point: MatrixPoint) -> dict[str, str]:
+        columns = SHEET_MAPPINGS.get(point.config)
+        if not columns:
+            raise UnmappedSheetPoint(
+                f"configuration {point.config!r} is not present in the Sheet template"
+            )
+        rows = DUTY_ROW_MAP.get(point.duty_pct)
+        if rows is None:
+            raise UnmappedSheetPoint(
+                f"duty {point.duty_pct}% is not present in the Sheet template"
+            )
+        if point.voltage_v not in rows:
+            raise UnmappedSheetPoint(
+                f"voltage {point.voltage_v} V is not present in the Sheet template"
+            )
+
+        sheet = f"{point.temperature_c}°C"
+        cells = {
+            key: _cell(
+                sheet, point.config, point.duty_pct, point.voltage_v, key
+            )
+            for key in columns
+        }
+        if any(cell is None for cell in cells.values()):
+            raise UnmappedSheetPoint(f"no complete Sheet mapping for {point.describe()}")
+        return {key: cell for key, cell in cells.items() if cell is not None}
 
     def _sync_run(self, record: RunRecord) -> None:
         point = record.point
         spreadsheet_id = self._spreadsheet_id(point.device_name, point.frequency_hz)
         if not spreadsheet_id:
-            self.status(f"No spreadsheet mapping for {point.device_name}.")
+            self._notify(f"No spreadsheet mapping for {point.device_name}.")
             return
 
         sheets_service, _ = self._services()
-        sheet = f"{point.temperature_c}°C"
+        cells = self._cells_for_point(point)
         r = record.readings
         values = {
             "vin": r.vin,
@@ -179,21 +281,24 @@ class SheetsSync:
             "fsw": r.fsw_hz / 1e6 if r.fsw_hz is not None else None,
             "irms": r.irms,
             "vds_pk": r.vds_pk,
+            "isw": r.isw_rms,
         }
-        if point.config == "Dual Conduction":
-            values["isw"] = r.isw_rms
-
-        data = []
-        for key, value in values.items():
-            cell = _cell(sheet, point.config, point.duty_pct, point.voltage_v, key)
-            if cell is not None and value is not None:
-                data.append({"range": cell, "values": [[value]]})
-        if not data:
-            return
-        sheets_service.spreadsheets().values().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"valueInputOption": "RAW", "data": data},
-        ).execute()
+        data = [
+            {
+                "range": cell,
+                # Empty string deliberately replaces stale values from a prior
+                # successful attempt when the new reading is unavailable.
+                "values": [[values.get(key) if values.get(key) is not None else ""]],
+            }
+            for key, cell in cells.items()
+        ]
+        self._execute_with_retry(
+            lambda: sheets_service.spreadsheets().values().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"valueInputOption": "RAW", "data": data},
+            ),
+            f"Sheet update for {point.describe()}",
+        )
         log.info("Synced run %s to Google Sheets", point.describe())
 
     def _clear_point(self, point: MatrixPoint) -> None:
@@ -201,11 +306,12 @@ class SheetsSync:
         if not spreadsheet_id:
             return
         sheets_service, _ = self._services()
-        sheet = f"{point.temperature_c}°C"
-        for key in ("vin", "iin", "fsw", "irms", "vds_pk", "isw"):
-            cell = _cell(sheet, point.config, point.duty_pct, point.voltage_v, key)
-            if cell is not None:
-                sheets_service.spreadsheets().values().clear(
-                    spreadsheetId=spreadsheet_id, range=cell, body={}
-                ).execute()
+        ranges = list(self._cells_for_point(point).values())
+        self._execute_with_retry(
+            lambda: sheets_service.spreadsheets().values().batchClear(
+                spreadsheetId=spreadsheet_id,
+                body={"ranges": ranges},
+            ),
+            f"Sheet clear for {point.describe()}",
+        )
         log.info("Cleared sheet cells for %s", point.describe())

@@ -1,7 +1,7 @@
 """Experiment engine: drives one characterisation run in a worker thread.
 
 Flow per run:
-  1. overwrite check against the database (one result per matrix point)
+  1. append a new auditable attempt (a prior successful attempt remains intact)
   2. SMU on (soft start from 0 V) and closed-loop ramp until the scope's
      Vds peak equals the selected test voltage (replaces the manual bench
      supply + validation dialog of v1)
@@ -17,30 +17,55 @@ EngineCallbacks, and the UI is responsible for marshalling to its thread.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
+from gan_fet.core.events import (
+    ErrorReportedEvent,
+    RunCompletedEvent,
+    SampleAcquiredEvent,
+    StateChangedEvent,
+    StatusUpdatedEvent,
+    bus,
+)
 from gan_fet.core.models import (
     ExperimentParams,
     ExperimentState,
     FinalReadings,
     RunRecord,
+    freq_label,
+    sanitize_device_name,
 )
 from gan_fet.core.safety import SafetyMonitor, SafetyTrip
 from gan_fet.core.voltage_control import PeakControlError, PeakVoltageController
-from gan_fet.core.zvs import ZvsTuner
-from gan_fet.instruments.multimeter import Sdm3055
-from gan_fet.instruments.oscilloscope import Mso44
-from gan_fet.instruments.smu import Keithley2400, SmuLimitError
-from gan_fet.instruments.wavegen import Sdg6022x
+from gan_fet.core.zvs import ZvsMeasurementError, ZvsTuner
+from gan_fet.instruments.base import (
+    MultimeterInterface,
+    OscilloscopeInterface,
+    SmuInterface,
+    WavegenInterface,
+)
+from gan_fet.instruments.smu import SmuLimitError
 from gan_fet.settings import Settings
 from gan_fet.storage.db import Database
 
 log = logging.getLogger(__name__)
 
 TIME_SERIES_INTERVAL_S = 10.0   # cadence for the slower DMM / Isw readings
+SCREENSHOT_SAFETY_POLL_MAX_S = 0.25
+
+
+def _utc_timestamp_ms() -> str:
+    """Return an unambiguous UTC wall-clock timestamp with millisecond precision."""
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def _noop(*_args, **_kwargs):
@@ -59,15 +84,34 @@ class EngineCallbacks:
     report_error: Callable[[str, str], None] = _noop           # (title, message)
 
 
+@dataclass(frozen=True)
+class RunOutcome:
+    """Terminal result of one engine invocation."""
+
+    success: bool
+    status: str
+    message: str
+    run_id: Optional[int] = None
+    record: Optional[RunRecord] = None
+
+
+class FinalReadingsError(RuntimeError):
+    """One or more mandatory final measurements could not be captured."""
+
+
+class ExperimentCancelled(RuntimeError):
+    """Internal control-flow signal for a requested cancellation."""
+
+
 class ExperimentEngine:
     def __init__(
         self,
         db: Database,
         settings: Settings,
-        smu: Keithley2400,
-        scope: Mso44,
-        dmm: Sdm3055,
-        wavegen: Sdg6022x,
+        smu: SmuInterface,
+        scope: OscilloscopeInterface,
+        dmm: Optional[MultimeterInterface],
+        wavegen: WavegenInterface,
         safety: SafetyMonitor,
         callbacks: Optional[EngineCallbacks] = None,
         on_run_completed: Optional[Callable[[RunRecord], None]] = None,
@@ -85,11 +129,20 @@ class ExperimentEngine:
         self.peak_controller = PeakVoltageController(
             smu, scope, settings.peak_control, safety
         )
-        self.zvs_tuner = ZvsTuner(smu, settings.zvs, safety)
+        self.zvs_tuner = ZvsTuner(smu, settings.zvs, safety, scope=scope)
 
         self._state = ExperimentState.IDLE
         self._state_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._outcome_event = threading.Event()
+        self._cancel_event = threading.Event()
+        self._emergency_stop_requested = threading.Event()
+        self._run_association_event = threading.Event()
+        self._run_generation = 0
+        self._run_id_for_audit: Optional[int] = None
+        self._safety_event_watermark = 0
+        self._sampling_active = threading.Event()
+        self._last_outcome: Optional[RunOutcome] = None
         self.last_current: Optional[float] = None
 
     # -- state ---------------------------------------------------------
@@ -101,257 +154,990 @@ class ExperimentEngine:
 
     def _set_state(self, state: ExperimentState) -> None:
         with self._state_lock:
+            old_state = self._state
             self._state = state
-        self.callbacks.on_state(state)
+        if old_state == state:
+            return
+        try:
+            self.callbacks.on_state(state)
+        except Exception:
+            log.exception("Engine state callback failed")
+        bus.publish(StateChangedEvent(old_state=old_state, new_state=state))
+
+    def _update_status(self, msg: str) -> None:
+        try:
+            self.callbacks.on_status(msg)
+        except Exception:
+            log.exception("Engine status callback failed")
+        bus.publish(StatusUpdatedEvent(message=msg))
+
+    def _report_error(self, title: str, message: str) -> None:
+        try:
+            self.callbacks.report_error(title, message)
+        except Exception:
+            log.exception("Engine error callback failed")
+        bus.publish(ErrorReportedEvent(title=title, message=message))
 
     def _cancelled(self) -> bool:
-        return self.state == ExperimentState.CANCELLED
+        return self._cancel_event.is_set()
 
     def is_busy(self) -> bool:
-        return self.state != ExperimentState.IDLE
+        with self._state_lock:
+            return self._state != ExperimentState.IDLE or (
+                self._thread is not None and self._thread.is_alive()
+            )
 
     def start(self, params: ExperimentParams) -> bool:
-        if self.is_busy():
-            return False
-        self._set_state(ExperimentState.RUNNING)
-        self._thread = threading.Thread(
-            target=self._run, args=(params,), daemon=True, name="experiment"
+        with self._state_lock:
+            if self._state != ExperimentState.IDLE or (
+                self._thread is not None and self._thread.is_alive()
+            ):
+                return False
+            safety_event_watermark = self.db.latest_safety_event_id()
+            old_state = self._state
+            self._state = ExperimentState.RUNNING
+            self._last_outcome = None
+            self._outcome_event.clear()
+            self._cancel_event.clear()
+            self._emergency_stop_requested.clear()
+            self._run_generation += 1
+            self._run_association_event = threading.Event()
+            self._run_id_for_audit = None
+            self._safety_event_watermark = safety_event_watermark
+            self._sampling_active.clear()
+            thread = threading.Thread(
+                target=self._run, args=(params,), daemon=False, name="experiment"
+            )
+            self._thread = thread
+        try:
+            self.callbacks.on_state(ExperimentState.RUNNING)
+        except Exception:
+            log.exception("Engine state callback failed")
+        bus.publish(
+            StateChangedEvent(
+                old_state=old_state,
+                new_state=ExperimentState.RUNNING,
+            )
         )
-        self._thread.start()
+        try:
+            thread.start()
+        except Exception:
+            with self._state_lock:
+                self._state = ExperimentState.IDLE
+                self._thread = None
+                self._run_association_event.set()
+            try:
+                self.callbacks.on_state(ExperimentState.IDLE)
+            except Exception:
+                log.exception("Engine state callback failed")
+            bus.publish(
+                StateChangedEvent(
+                    old_state=ExperimentState.RUNNING,
+                    new_state=ExperimentState.IDLE,
+                )
+            )
+            raise
         return True
 
-    def toggle_pause(self) -> None:
+    @property
+    def last_outcome(self) -> Optional[RunOutcome]:
         with self._state_lock:
-            if self._state == ExperimentState.RUNNING:
+            return self._last_outcome
+
+    def toggle_pause(self) -> None:
+        pause_unavailable = False
+        with self._state_lock:
+            old_state = self._state
+            if (
+                self._state == ExperimentState.RUNNING
+                and self._sampling_active.is_set()
+            ):
                 self._state = ExperimentState.PAUSED
+            elif self._state == ExperimentState.RUNNING:
+                pause_unavailable = True
             elif self._state == ExperimentState.PAUSED:
                 self._state = ExperimentState.RUNNING
-        self.callbacks.on_state(self.state)
+            new_state = self._state
+        if pause_unavailable:
+            self._update_status(
+                "Pause is available only during the timed sampling phase."
+            )
+        if old_state != new_state:
+            try:
+                self.callbacks.on_state(new_state)
+            except Exception:
+                log.exception("Engine state callback failed")
+            bus.publish(
+                StateChangedEvent(old_state=old_state, new_state=new_state)
+            )
 
     def cancel(self) -> None:
+        cancelled = False
         with self._state_lock:
+            old_state = self._state
             if self._state in (ExperimentState.RUNNING, ExperimentState.PAUSED):
                 self._state = ExperimentState.CANCELLED
+                cancelled = True
+            new_state = self._state
+        if cancelled:
+            self._cancel_event.set()
+        if old_state != new_state:
+            try:
+                self.callbacks.on_state(new_state)
+            except Exception:
+                log.exception("Engine state callback failed")
+            bus.publish(
+                StateChangedEvent(old_state=old_state, new_state=new_state)
+            )
 
-    def wait_until_idle(self, poll_s: float = 0.2) -> None:
-        while self.is_busy() or (self._thread and self._thread.is_alive()):
-            time.sleep(poll_s)
+    def wait_until_idle(
+        self,
+        timeout: Optional[float] = None,
+        poll_s: float = 0.2,
+    ) -> Optional[RunOutcome]:
+        """Wait for the current worker and return its terminal outcome.
+
+        ``None`` means the timeout expired before the worker terminated.
+        ``poll_s`` is retained for API compatibility; joining the worker avoids
+        active polling.
+        """
+        del poll_s
+        with self._state_lock:
+            thread = self._thread
+            outcome = self._last_outcome
+        if thread is None:
+            return outcome
+        thread.join(timeout)
+        if thread.is_alive():
+            return None
+        self._outcome_event.wait(0.1)
+        return self.last_outcome
+
+    def join(self, timeout: Optional[float] = None) -> Optional[RunOutcome]:
+        return self.wait_until_idle(timeout=timeout)
+
+    def cancel_and_join(
+        self, timeout: Optional[float] = None
+    ) -> Optional[RunOutcome]:
+        self.cancel()
+        return self.join(timeout)
+
+    def request_emergency_stop(self) -> threading.Thread:
+        """Latch E-stop, cancel the run, and shut hardware down off-thread.
+
+        The worker signals as soon as the safety latch is set.  Waiting for
+        that in-memory transition (not for transport I/O) prevents the run
+        from racing to a normal ``cancelled`` outcome before the E-stop is
+        auditable as a safety trip.  If the worker has not created its run row
+        yet, the shutdown worker backfills the just-created standalone audit
+        event after the run association becomes available.
+        """
+        self._emergency_stop_requested.set()
+        with self._state_lock:
+            # Once IDLE is published the terminal outcome is already fixed;
+            # an E-stop after that point is a standalone bench event, even if
+            # the worker is still returning from its final callback.
+            associate_with_run = self._state != ExperimentState.IDLE
+            run_generation = self._run_generation
+            association_event = self._run_association_event
+            safety_event_watermark = self._safety_event_watermark
+        latched = threading.Event()
+
+        def shutdown_and_associate() -> None:
+            try:
+                self.safety.emergency_stop(latched_event=latched)
+            finally:
+                if associate_with_run:
+                    association_event.wait()
+                    with self._state_lock:
+                        run_id = (
+                            self._run_id_for_audit
+                            if self._run_generation == run_generation
+                            else None
+                        )
+                    if run_id is not None:
+                        try:
+                            self.db.associate_latest_unassigned_safety_event(
+                                run_id,
+                                "estop",
+                                after_id=safety_event_watermark,
+                            )
+                        except Exception:
+                            log.exception(
+                                "Could not associate immediate E-stop audit "
+                                "with run %s",
+                                run_id,
+                            )
+
+        shutdown_thread = threading.Thread(
+            target=shutdown_and_associate,
+            daemon=False,
+            name="emergency-shutdown",
+        )
+        shutdown_thread.start()
+        if not latched.wait(timeout=1.0):
+            log.critical("Emergency-stop worker did not confirm the safety latch")
+        self.cancel()
+        return shutdown_thread
 
     # -- run -------------------------------------------------------------
 
     def _run(self, params: ExperimentParams) -> None:
-        """Phases: confirm → energise → sample → finalise, with the bus
-        always brought back down in `finally` whatever happens."""
+        with self._state_lock:
+            run_generation = self._run_generation
+            association_event = self._run_association_event
         point = params.point
         run_id: Optional[int] = None
         success = False
+        terminal_status = "failed"
         message = ""
+        record: Optional[RunRecord] = None
+        self.last_current = None
         try:
-            if not self._confirm_overwrite_if_needed(point):
+            self._validate_params(params)
+            existing = self.db.find_run(point)
+            if (
+                existing is not None
+                and existing.status == "completed"
+                and not self.callbacks.confirm_overwrite(point.describe())
+            ):
+                terminal_status = "cancelled"
                 message = "Cancelled: existing result kept."
                 return
 
-            bus_voltage, v_zvs = self._energise_bus(params)
+            # Create the auditable attempt before any gate or bus output is
+            # armed.  Safety events during setup can now reference this run.
+            run_id = self.db.create_run(point, params.duration_minutes)
+            self.safety.active_run_id = run_id
+            with self._state_lock:
+                if self._run_generation == run_generation:
+                    self._run_id_for_audit = run_id
+            association_event.set()
+
             if self._cancelled():
+                terminal_status = "cancelled"
+                message = "Cancelled before outputs were armed."
+                return
+
+            reason = self.safety.trip_reason
+            if reason is not None:
+                raise SafetyTrip(*reason)
+
+            # The oscilloscope participates in both closed-loop voltage
+            # control and the live over-voltage interlock.  Confirm the exact
+            # HDO4054 identity on every run before either gate or bus output
+            # can be energized; accepting another command dialect here could
+            # turn a plausible-looking value into an unsafe control input.
+            self._update_status("Verifying LeCroy HDO4054 identity...")
+            scope_identity = self.scope.verify_identity()
+            log.info("Verified oscilloscope identity: %s", scope_identity)
+            if self._cancelled():
+                terminal_status = "cancelled"
+                message = "Cancelled after scope verification."
+                return
+            reason = self.safety.trip_reason
+            if reason is not None:
+                raise SafetyTrip(*reason)
+
+            self._update_status("Arming verified wavegen outputs...")
+            if not self.safety.arm_wavegen(point.config):
+                raise ConnectionError("Could not arm the wavegen outputs")
+            if self._cancelled():
+                terminal_status = "cancelled"
+                message = "Cancelled after gate arming and before bus enable."
+                return
+            reason = self.safety.trip_reason
+            if reason is not None:
+                raise SafetyTrip(*reason)
+
+            # -- bring the bus up -----------------------------------------
+            self._update_status("Starting SMU (soft start from 0 V)...")
+            if not self.safety.enable_bus():
+                raise ConnectionError("Could not enable the SMU output")
+
+            self._update_status(
+                f"Peak control: seeking Vds peak {point.voltage_v} V..."
+            )
+            bus_voltage = self.peak_controller.achieve_peak(
+                float(point.voltage_v),
+                cancel_check=self._cancelled,
+                status=self._update_status,
+            )
+
+            v_zvs: Optional[float] = None
+            if params.find_zvs:
+                self._update_status("Searching for ZVS point...")
+                result = self.zvs_tuner.find_minimum(
+                    cancel_check=self._cancelled, status=self._update_status
+                )
+                if result is None:
+                    if self._cancelled():
+                        raise ExperimentCancelled(
+                            "Experiment cancelled during ZVS search."
+                        )
+                    raise ZvsMeasurementError(
+                        "Requested ZVS search returned no measurement result"
+                    )
+                v_zvs = result.v_zvs
+                bus_voltage = result.v_zvs
+                self._update_status(
+                    f"ZVS point: {result.v_zvs:.1f} V "
+                    f"({result.i_min * 1000:.2f} mA)"
+                )
+
+            if self._cancelled():
+                terminal_status = "cancelled"
                 message = "Cancelled before sampling started."
                 return
 
-            run_id = self.db.create_run(point, params.duration_minutes)
-            self.safety.active_run_id = run_id
-            self.callbacks.on_status(f"Running: {point.describe()}")
-            rms_samples = self._sampling_loop(run_id, params)
+            # -- sampling loop ---------------------------------------------
+            self._update_status(f"Running: {point.describe()}")
+            self._sampling_active.set()
+            try:
+                rms_samples = self._sampling_loop(run_id, params)
+            finally:
+                self._sampling_active.clear()
 
             if self._cancelled():
-                self.db.set_run_status(run_id, "cancelled")
+                terminal_status = "cancelled"
                 message = "Experiment cancelled."
                 return
 
-            self._finalise_run(run_id, point, rms_samples, bus_voltage, v_zvs)
+            # -- final readings ---------------------------------------------
+            self._update_status("Capturing final readings...")
+            self._poll_energized_safety("before final readings")
+            readings = self._capture_final_readings(rms_samples, point.config)
+            self._raise_if_cancelled(
+                "Experiment cancelled during final readings."
+            )
+            self._validate_final_readings(
+                readings,
+                point.config,
+                # A requested ZVS search deliberately moves the bus away from
+                # the pre-ZVS peak target.  The target is a safe search seed in
+                # that mode; the final point must remain finite and within all
+                # safety ceilings, but is not forced back to the seed.
+                target_vds=(
+                    None if v_zvs is not None else float(point.voltage_v)
+                ),
+            )
+            self._poll_energized_safety("before screenshot capture")
+            screenshot = self._capture_screenshot_with_safety_monitoring(
+                run_id, point
+            )
+            self._poll_energized_safety("after screenshot capture")
+            self.db.complete_run(
+                run_id,
+                readings,
+                bus_voltage_v=bus_voltage,
+                v_zvs=v_zvs,
+                screenshot_path=str(screenshot) if screenshot else None,
+            )
             success = True
+            terminal_status = "completed"
             message = "Experiment complete."
 
-        except SafetyTrip as trip:
-            message = f"SAFETY TRIP — {trip}"
-            if run_id is not None:
-                self.db.set_run_status(run_id, "tripped")
-        except (PeakControlError, SmuLimitError, ConnectionError) as exc:
+        except ExperimentCancelled as exc:
+            terminal_status = "cancelled"
             message = str(exc)
-            self.callbacks.report_error("Experiment failed", message)
-            if run_id is not None:
-                self.db.set_run_status(run_id, "failed")
+        except SafetyTrip as trip:
+            terminal_status = "tripped"
+            message = f"SAFETY TRIP — {trip}"
+        except PeakControlError as exc:
+            if self._cancelled() or str(exc).strip().lower() == "cancelled":
+                terminal_status = "cancelled"
+                message = "Experiment cancelled during peak control."
+            else:
+                terminal_status = "failed"
+                message = str(exc)
+                self._report_error("Experiment failed", message)
+        except (
+            FinalReadingsError,
+            SmuLimitError,
+            ConnectionError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            terminal_status = "failed"
+            message = str(exc)
+            self._report_error("Experiment failed", message)
         except Exception as exc:
+            terminal_status = "failed"
             log.exception("experiment failed")
             message = f"Unexpected error: {exc}"
-            self.callbacks.report_error("Experiment failed", message)
-            if run_id is not None:
-                self.db.set_run_status(run_id, "failed")
+            self._report_error("Experiment failed", message)
         finally:
-            self._safe_shutdown()
-            self.safety.active_run_id = None
-            self._set_state(ExperimentState.IDLE)
-            self.callbacks.on_finished(success, message)
-
-    def _confirm_overwrite_if_needed(self, point) -> bool:
-        """One stored result per matrix point: ask before replacing one."""
-        if self.db.find_run(point) is None:
-            return True
-        return bool(self.callbacks.confirm_overwrite(point.describe()))
-
-    def _energise_bus(self, params: ExperimentParams) -> tuple[float, Optional[float]]:
-        """Soft-start the SMU, drive the scope-measured Vds peak to the
-        selected target, then optionally settle on the ZVS point.
-
-        Returns (bus_voltage, v_zvs) where v_zvs is None unless a search ran.
-        """
-        point = params.point
-        self.callbacks.on_status("Starting SMU (soft start from 0 V)...")
-        if not self.smu.output_on():
-            raise ConnectionError("Could not enable the SMU output")
-
-        self.callbacks.on_status(
-            f"Peak control: seeking Vds peak {point.voltage_v} V..."
-        )
-        bus_voltage = self.peak_controller.achieve_peak(
-            float(point.voltage_v),
-            cancel_check=self._cancelled,
-            status=self.callbacks.on_status,
-        )
-
-        v_zvs: Optional[float] = None
-        if params.find_zvs and not self._cancelled():
-            self.callbacks.on_status("Searching for ZVS point...")
-            result = self.zvs_tuner.find_minimum(
-                cancel_check=self._cancelled, status=self.callbacks.on_status
-            )
-            if result is not None:
-                v_zvs = bus_voltage = result.v_zvs
-                self.callbacks.on_status(
-                    f"ZVS point: {result.v_zvs:.1f} V ({result.i_min * 1000:.2f} mA)"
+            # Also releases an E-stop audit worker when validation or overwrite
+            # rejection ends this invocation before a run row exists.
+            association_event.set()
+            self._sampling_active.clear()
+            shutdown_ok = self._safe_shutdown()
+            if not shutdown_ok and success:
+                success = False
+                terminal_status = "failed"
+                message = (
+                    "Experiment measurements completed, but output shutdown "
+                    "could not be confirmed."
                 )
-        return bus_voltage, v_zvs
 
-    def _finalise_run(
-        self,
-        run_id: int,
-        point,
-        rms_samples: list[float],
-        bus_voltage: float,
-        v_zvs: Optional[float],
-    ) -> None:
-        """Capture end-of-run instrument readings, screenshot and store them."""
-        self.callbacks.on_status("Capturing final readings...")
-        readings = self._capture_final_readings(rms_samples)
-        screenshot = self._capture_screenshot(run_id, point)
-        self.db.complete_run(
-            run_id,
-            readings,
-            bus_voltage_v=bus_voltage,
-            v_zvs=v_zvs,
-            screenshot_path=str(screenshot) if screenshot else None,
-        )
-        if self.on_run_completed is not None:
-            record = self.db.get_run(run_id)
-            if record is not None:
-                self.on_run_completed(record)
+            # A latched interlock always outranks ordinary cancellation or a
+            # nominally completed measurement.  In particular, the E-stop API
+            # sets its latch before making cancellation visible to this worker.
+            trip_reason = self.safety.trip_reason
+            if trip_reason is not None:
+                success = False
+                terminal_status = "tripped"
+                kind, detail = trip_reason
+                message = f"SAFETY TRIP — {kind}: {detail}"
+
+            if run_id is not None and not success:
+                try:
+                    self.db.set_run_status(run_id, terminal_status)
+                except Exception:
+                    log.exception(
+                        "Could not set run %s status to %s",
+                        run_id,
+                        terminal_status,
+                    )
+
+            self.safety.active_run_id = None
+            if run_id is not None:
+                try:
+                    record = self.db.get_run(run_id)
+                except Exception:
+                    log.exception("Could not load terminal run record %s", run_id)
+
+            outcome = RunOutcome(
+                success=success,
+                status=terminal_status,
+                message=message,
+                run_id=run_id,
+                record=record,
+            )
+            with self._state_lock:
+                self._last_outcome = outcome
+            self._outcome_event.set()
+
+            try:
+                self._set_state(ExperimentState.IDLE)
+            except Exception:
+                log.exception("Engine state callback failed during shutdown")
+
+            if success and record is not None and self.on_run_completed is not None:
+                try:
+                    self.on_run_completed(record)
+                except Exception:
+                    log.exception("Run-completed callback failed")
+
+            try:
+                self.callbacks.on_finished(success, message)
+            except Exception:
+                log.exception("Engine finished callback failed")
+            bus.publish(
+                RunCompletedEvent(
+                    success=success,
+                    message=message,
+                    record=record,
+                )
+            )
 
     def _sampling_loop(self, run_id: int, params: ExperimentParams) -> list[float]:
         duration_s = params.duration_minutes * 60.0
         interval = self.settings.smu.sample_interval_s
-        start = time.time()
+        start = time.monotonic()
+        paused_since: Optional[float] = None
+        paused_total_s = 0.0
         last_slow_read = 0.0
         rms_samples: list[float] = []
+        try:
+            measured_frequency = self.wavegen.read_frequency()
+        except Exception:
+            log.exception("Wavegen frequency read raised at sampling start")
+            measured_frequency = None
+        if (
+            self._is_valid_reading(measured_frequency)
+            and measured_frequency is not None
+            and float(measured_frequency) > 0
+        ):
+            actual_frequency_hz: Optional[float] = float(measured_frequency)
+            self.safety.record_read_success("wavegen frequency (run)")
+        else:
+            actual_frequency_hz = None
+            self.safety.record_read_failure("wavegen frequency (run)")
 
-        while (time.time() - start) < duration_s:
+        while True:
             if self._cancelled():
                 break
-            while self.state == ExperimentState.PAUSED:
-                time.sleep(0.1)
-                if self._cancelled():
-                    return rms_samples
 
-            tick = time.time()
+            tick = time.monotonic()
+            paused = self.state == ExperimentState.PAUSED
+            if paused:
+                if paused_since is None:
+                    paused_since = tick
+                current_pause_s = tick - paused_since
+            else:
+                if paused_since is not None:
+                    paused_total_s += tick - paused_since
+                    paused_since = None
+                current_pause_s = 0.0
+
+            elapsed = tick - start - paused_total_s - current_pause_s
+            if elapsed >= duration_s:
+                break
+
+            # Vds and compliance are safety-critical and remain independent of
+            # whether the primary SMU telemetry read succeeds or the run is
+            # paused. Outputs remain energized during pause, so these checks
+            # must continue at the normal sampling cadence.
+            vds_peak = self.scope.peak_voltage()
+            if self._is_valid_reading(vds_peak):
+                self.safety.record_read_success("scope peak voltage (run)")
+                self.safety.check_sample(vds_peak=vds_peak)
+            else:
+                vds_peak = None
+                self.safety.record_read_failure("scope peak voltage (run)")
+            self.safety.check_compliance()
 
             reading = self.smu.read()
-            if reading is None:
+            if (
+                reading is None
+                or not self._is_valid_reading(reading[0])
+                or not self._is_valid_reading(reading[1])
+            ):
                 self.safety.record_read_failure("SMU read")
-                time.sleep(interval)
+                remaining = interval - (time.monotonic() - tick)
+                if remaining > 0:
+                    self._cancel_event.wait(remaining)
                 continue
-            self.safety.record_read_success()
+            self.safety.record_read_success("SMU read")
             smu_volts, amps = reading
             self.safety.check_sample(dc_current=amps)
-            self.safety.check_compliance()
             self.last_current = amps
 
+            if paused:
+                remaining = interval - (time.monotonic() - tick)
+                if remaining > 0:
+                    self._cancel_event.wait(remaining)
+                continue
+
             rms = self.scope.rms_current()
-            if rms is not None:
-                rms_samples.append(rms)
+            if self._is_valid_reading(rms):
+                self.safety.record_read_success("scope RMS current")
+                assert rms is not None
+                rms_samples.append(float(rms))
+            else:
+                rms = None
+                self.safety.record_read_failure("scope RMS current")
 
             # Slower cross-checks on a relaxed cadence.
             dc_voltage = isw = None
             if tick - last_slow_read >= TIME_SERIES_INTERVAL_S:
-                dc_voltage = self.dmm.dc_voltage()
+                if self.dmm is not None:
+                    dc_voltage = self.dmm.dc_voltage()
+                    if self._is_valid_reading(dc_voltage):
+                        self.safety.record_read_success("DMM DC voltage")
+                    else:
+                        dc_voltage = None
+                        self.safety.record_read_failure("DMM DC voltage")
+                else:
+                    smu_read = self.smu.read()
+                    dc_voltage = smu_read[0] if smu_read else None
+
                 isw = self.scope.isw_rms()
+                if self._is_valid_reading(isw):
+                    self.safety.record_read_success("scope switch RMS")
+                else:
+                    isw = None
+                    self.safety.record_read_failure("scope switch RMS")
                 last_slow_read = tick
 
-            elapsed = tick - start
             self.db.add_sample(
                 run_id,
-                time.strftime("%Y-%m-%d %H:%M:%S"),
+                _utc_timestamp_ms(),
                 amps,
                 smu_voltage=smu_volts,
                 dc_voltage=dc_voltage,
                 rms_current=rms,
                 isw_rms=isw,
+                elapsed_s=elapsed,
             )
-            self.callbacks.on_sample(elapsed, amps)
+            try:
+                self.callbacks.on_sample(elapsed, amps)
+            except Exception:
+                log.exception("Engine sample callback failed")
+            bus.publish(
+                SampleAcquiredEvent(
+                    elapsed_s=elapsed,
+                    amps=amps,
+                    smu_voltage=smu_volts,
+                    dc_voltage=dc_voltage,
+                    rms_current=rms,
+                    isw_rms=isw,
+                    vds_peak=vds_peak,
+                    frequency_hz=actual_frequency_hz,
+                )
+            )
 
-            remaining = interval - (time.time() - tick)
+            remaining = interval - (time.monotonic() - tick)
             if remaining > 0:
-                time.sleep(remaining)
+                self._cancel_event.wait(remaining)
 
         return rms_samples
 
-    def _capture_final_readings(self, rms_samples: list[float]) -> FinalReadings:
-        def with_retries(fetch, retries=2, delay=0.2):
+    @staticmethod
+    def _is_valid_reading(value: Optional[float]) -> bool:
+        if value is None:
+            return False
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
+
+    def _validate_params(self, params: ExperimentParams) -> None:
+        point = params.point
+        safe_device_name = sanitize_device_name(point.device_name)
+        if not safe_device_name or safe_device_name != point.device_name:
+            raise ValueError(
+                "Device name must be non-empty and contain only letters, "
+                "numbers, spaces, underscores, or hyphens"
+            )
+        if point.config not in (
+            "Dual Conduction",
+            "Single Conduction",
+            "Single Device",
+        ):
+            raise ValueError(f"Unknown hardware configuration: {point.config}")
+        if not math.isfinite(params.duration_minutes) or params.duration_minutes <= 0:
+            raise ValueError("Experiment duration must be a finite positive number")
+        if (
+            not math.isfinite(float(point.frequency_hz))
+            or point.frequency_hz <= 0
+        ):
+            raise ValueError("Wavegen frequency must be positive")
+        if (
+            not math.isfinite(float(point.duty_pct))
+            or not (0.1 <= point.duty_pct <= 99.9)
+        ):
+            raise ValueError("Duty cycle must be between 0.1% and 99.9%")
+        if (
+            not math.isfinite(float(point.voltage_v))
+            or point.voltage_v <= 0
+        ):
+            raise ValueError("Vds target must be positive")
+        if point.voltage_v > self.settings.safety.max_vds_peak_v:
+            raise ValueError(
+                f"Vds target {point.voltage_v} V exceeds configured safety limit "
+                f"{self.settings.safety.max_vds_peak_v:.1f} V"
+            )
+
+    def _poll_energized_safety(
+        self,
+        phase: str,
+        *,
+        include_scope: bool = True,
+    ) -> None:
+        """Poll live limits around energized final operations.
+
+        ``include_scope=False`` is used while the scope is capturing a screen.
+        Scope drivers and their VISA/SCPI sessions are not required to support
+        concurrent conversations, so the capture worker owns that instrument
+        until it returns.  SMU current and compliance remain independently
+        monitored in the caller's thread.
+        """
+        try:
+            current = self.smu.measure_dc_current()
+        except Exception:
+            log.exception("SMU current read raised %s", phase)
+            current = None
+        current_source = f"SMU current ({phase})"
+        if self._is_valid_reading(current):
+            assert current is not None
+            current_value = float(current)
+            self.safety.record_read_success(current_source)
+            self.safety.check_sample(dc_current=current_value)
+            self.last_current = current_value
+        else:
+            self.safety.record_read_failure(current_source)
+
+        if include_scope:
+            try:
+                peak = self.scope.peak_voltage()
+            except Exception:
+                log.exception("Scope peak-voltage read raised %s", phase)
+                peak = None
+            peak_source = f"scope peak voltage ({phase})"
+            if self._is_valid_reading(peak):
+                assert peak is not None
+                self.safety.record_read_success(peak_source)
+                self.safety.check_sample(vds_peak=float(peak))
+            else:
+                self.safety.record_read_failure(peak_source)
+
+        self.safety.check_compliance()
+
+    def _capture_final_readings(
+        self,
+        rms_samples: list[float],
+        config: str,
+    ) -> FinalReadings:
+        def with_retries(
+            fetch,
+            source: str,
+            retries=2,
+            delay=0.2,
+            *,
+            safety_value: Optional[str] = None,
+        ):
             for attempt in range(retries + 1):
-                value = fetch()
-                if value is not None:
-                    return value
+                self._raise_if_cancelled(
+                    "Experiment cancelled during final readings."
+                )
+                try:
+                    value = fetch()
+                except Exception:
+                    log.exception("Final %s read raised", source)
+                    value = None
+                self._raise_if_cancelled(
+                    "Experiment cancelled during final readings."
+                )
+                if self._is_valid_reading(value):
+                    self.safety.record_read_success(source)
+                    numeric = float(value)
+                    if safety_value == "dc_current":
+                        self.safety.check_sample(dc_current=numeric)
+                    elif safety_value == "vds_peak":
+                        self.safety.check_sample(vds_peak=numeric)
+                    self.safety.check_compliance()
+                    return numeric
+                self.safety.record_read_failure(source)
+                self.safety.check_compliance()
                 if attempt < retries:
-                    time.sleep(delay)
+                    if self._cancel_event.wait(delay):
+                        self._raise_if_cancelled(
+                            "Experiment cancelled during final readings."
+                        )
             return None
 
         irms = (
             sum(rms_samples) / len(rms_samples)
             if rms_samples
-            else with_retries(self.scope.rms_current)
+            else with_retries(self.scope.rms_current, "scope RMS current (final)")
+        )
+        last_current = self.last_current
+        if self._is_valid_reading(last_current):
+            assert last_current is not None
+            iin = float(last_current)
+            self.safety.record_read_success("SMU current (final)")
+            self.safety.check_sample(dc_current=iin)
+            self.safety.check_compliance()
+        else:
+            iin = with_retries(
+                self.smu.measure_dc_current,
+                "SMU current (final)",
+                safety_value="dc_current",
+            )
+        isw_rms = (
+            with_retries(
+                self.scope.isw_rms,
+                "scope switch RMS (final)",
+            )
+            if config == "Dual Conduction"
+            else None
+        )
+        vin_getter = (
+            self.dmm.dc_voltage
+            if self.dmm is not None
+            else (lambda: (self.smu.read() or (None, None))[0])
         )
         return FinalReadings(
-            vin=with_retries(self.dmm.dc_voltage),
-            iin=self.last_current,
-            fsw_hz=with_retries(self.wavegen.read_frequency),
+            vin=with_retries(vin_getter, "DC voltage (final)"),
+            iin=iin,
+            fsw_hz=with_retries(
+                self.wavegen.read_frequency,
+                "wavegen frequency (final)",
+            ),
             irms=irms,
-            vds_pk=with_retries(self.scope.peak_voltage, retries=3, delay=0.3),
-            isw_rms=with_retries(self.scope.isw_rms),
+            vds_pk=with_retries(
+                self.scope.peak_voltage,
+                "scope peak voltage (final)",
+                retries=3,
+                delay=0.3,
+                safety_value="vds_peak",
+            ),
+            isw_rms=isw_rms,
         )
 
+    def _raise_if_cancelled(self, message: str) -> None:
+        if self._cancelled():
+            raise ExperimentCancelled(message)
+
+    def _validate_final_readings(
+        self,
+        readings: FinalReadings,
+        config: str,
+        *,
+        target_vds: Optional[float],
+    ) -> None:
+        required = {
+            "DC input voltage": readings.vin,
+            "DC input current": readings.iin,
+            "switching frequency": readings.fsw_hz,
+            "RMS current": readings.irms,
+            "Vds peak": readings.vds_pk,
+        }
+        if config == "Dual Conduction":
+            required["switch-current RMS"] = readings.isw_rms
+        missing = [
+            name
+            for name, value in required.items()
+            if not self._is_valid_reading(value)
+        ]
+        if missing:
+            raise FinalReadingsError(
+                "Required final readings unavailable or invalid: "
+                + ", ".join(missing)
+            )
+        self.safety.check_sample(
+            dc_current=readings.iin,
+            vds_peak=readings.vds_pk,
+        )
+        self.safety.check_compliance()
+        assert readings.vds_pk is not None
+        tolerance = float(self.settings.peak_control.tolerance_v)
+        if (
+            target_vds is not None
+            and abs(float(readings.vds_pk) - target_vds) > tolerance
+        ):
+            raise FinalReadingsError(
+                f"Final Vds peak {readings.vds_pk:.1f} V is outside "
+                f"target {target_vds:.1f} V ± {tolerance:.1f} V"
+            )
+
     def _capture_screenshot(self, run_id: int, point) -> Optional[object]:
+        frequency = freq_label(point.frequency_hz).replace(".", "p")
         dest = (
             self.settings.screenshots_dir
             / point.device_name
             / (
                 f"run{run_id}_{point.config.replace(' ', '')}_"
-                f"{point.temperature_c}C_{point.frequency_hz // 1_000_000}MHz_"
+                f"{point.temperature_c}C_{frequency}_"
                 f"{point.voltage_v}V_{point.duty_pct}duty.png"
             )
         )
         return self.scope.screenshot(dest)
 
-    def _safe_shutdown(self) -> None:
-        """End of every run: bus back to 0 V, output off."""
+    def _capture_screenshot_with_safety_monitoring(
+        self,
+        run_id: int,
+        point,
+    ) -> Optional[object]:
+        """Capture a scope screen without suspending independent interlocks.
+
+        Screenshot APIs are synchronous and can spend seconds waiting for a
+        binary transfer.  The scope call therefore runs in one owned worker
+        while this experiment thread polls the SMU.  The scope itself is not
+        queried concurrently: many VISA/SCPI sessions serialize poorly (or
+        not at all) across threads.
+
+        Python cannot safely terminate a thread blocked inside a vendor I/O
+        call.  The worker is consequently non-daemon and always joined before
+        this method returns or raises.  Production scope transports have their
+        own I/O timeout; once the call unwinds, a pending cancellation, safety
+        trip, or capture exception is propagated in that priority order.
+        """
+        finished = threading.Event()
+        results: list[Optional[object]] = []
+        errors: list[BaseException] = []
+
+        def capture() -> None:
+            try:
+                results.append(self._capture_screenshot(run_id, point))
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        capture_thread = threading.Thread(
+            target=capture,
+            daemon=False,
+            name=f"scope-screenshot-{run_id}",
+        )
+        capture_thread.start()
+
+        pending_cancel: Optional[ExperimentCancelled] = None
+        pending_error: Optional[BaseException] = None
+        poll_interval = min(
+            SCREENSHOT_SAFETY_POLL_MAX_S,
+            max(0.01, float(self.settings.smu.sample_interval_s)),
+        )
+        try:
+            while not finished.wait(poll_interval):
+                reason = self.safety.trip_reason
+                if reason is not None:
+                    # A trip has already removed power.  Avoid racing its
+                    # shutdown traffic with more SMU queries while the scope
+                    # worker finishes its bounded I/O operation.
+                    if not isinstance(pending_error, SafetyTrip):
+                        pending_error = SafetyTrip(*reason)
+                    continue
+
+                if self._cancelled() and pending_cancel is None:
+                    pending_cancel = ExperimentCancelled(
+                        "Experiment cancelled during final capture."
+                    )
+
+                try:
+                    self._poll_energized_safety(
+                        "during screenshot capture",
+                        include_scope=False,
+                    )
+                except SafetyTrip as trip:
+                    pending_error = trip
+                except BaseException as exc:
+                    pending_error = exc
+        finally:
+            capture_thread.join()
+
+        reason = self.safety.trip_reason
+        if reason is not None:
+            raise SafetyTrip(*reason)
+        if pending_error is not None:
+            raise pending_error
+        if self._cancelled():
+            raise pending_cancel or ExperimentCancelled(
+                "Experiment cancelled during final capture."
+            )
+        if errors:
+            raise errors[0]
+        return results[0] if results else None
+
+    def _safe_shutdown(self) -> bool:
+        """End every run with the bus and gate outputs confirmed off."""
+        smu_ok = True
+        wavegen_ok = True
         try:
             if self.smu.output_is_on:
                 self.smu.ramp_to(0.0)
-                self.smu.output_off()
+            if not self.smu.output_off():
+                raise ConnectionError("SMU output-off command was not acknowledged")
         except Exception:
-            self.smu.emergency_off()
+            log.exception("Controlled SMU shutdown failed; using emergency-off")
+            try:
+                smu_ok = bool(self.smu.emergency_off())
+            except Exception:
+                smu_ok = False
+                log.exception("SMU emergency-off raised")
+
+        try:
+            self.wavegen.outputs_off()
+        except Exception:
+            wavegen_ok = False
+            log.exception("Wavegen outputs could not be confirmed off")
+
+        if not (smu_ok and wavegen_ok):
+            log.critical(
+                "Experiment shutdown was not confirmed (smu=%s, wavegen=%s)",
+                smu_ok,
+                wavegen_ok,
+            )
+        return smu_ok and wavegen_ok

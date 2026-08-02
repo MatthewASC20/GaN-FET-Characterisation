@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
+import threading
 from pathlib import Path
 
 from gan_fet.core.models import freq_label
@@ -19,22 +22,68 @@ log = logging.getLogger(__name__)
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 SPREADSHEET_MIME = "application/vnd.google-apps.spreadsheet"
+_MAPPINGS_LOCK = threading.RLock()
+
+
+def mapping_key(device_name: str, frequency_hz: int) -> str:
+    """Collision-free mapping key; JSON encoding keeps device boundaries exact."""
+    return json.dumps(
+        [device_name, int(frequency_hz)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def frequency_title(frequency_hz: int) -> str:
+    """Human title which remains exact for non-integer-MHz frequencies."""
+    frequency_hz = int(frequency_hz)
+    if frequency_hz % 1_000_000 == 0:
+        return f"{frequency_hz // 1_000_000}MHz"
+    return f"{frequency_hz}Hz"
 
 
 def load_mappings(settings: GoogleSettings) -> dict[str, str]:
     path = Path(settings.mapping_file)
     if path.is_file():
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            log.warning("Mapping file %s is corrupt; starting empty", path)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in payload.items()
+            ):
+                raise ValueError("expected an object containing string IDs")
+            return payload
+        except (json.JSONDecodeError, ValueError) as exc:
+            log.warning("Mapping file %s is invalid; starting empty: %s", path, exc)
     return {}
 
 
 def save_mappings(settings: GoogleSettings, mappings: dict[str, str]) -> None:
-    Path(settings.mapping_file).write_text(
-        json.dumps(mappings, indent=4), encoding="utf-8"
+    if not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in mappings.items()
+    ):
+        raise ValueError("mapping keys and spreadsheet IDs must be strings")
+    path = Path(settings.mapping_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        delete=False,
+        encoding="utf-8",
     )
+    temp_path = Path(handle.name)
+    try:
+        with handle:
+            json.dump(mappings, handle, indent=4, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def _escape(name: str) -> str:
@@ -88,23 +137,36 @@ def ensure_device_setup(
     frequencies_hz: list[int],
 ) -> dict[str, str]:
     """Ensure folder + per-frequency spreadsheets exist; returns updated mappings."""
-    mappings = load_mappings(settings)
+    with _MAPPINGS_LOCK:
+        mappings = load_mappings(settings)
 
-    folder_id = _find(drive_service, device_name, settings.project_folder_id, FOLDER_MIME)
-    if not folder_id:
-        folder_id = _create_folder(drive_service, device_name, settings.project_folder_id)
-        log.info("Created Drive folder '%s' (%s)", device_name, folder_id)
-
-    changed = False
-    for freq in frequencies_hz:
-        label = freq_label(freq)
-        key = f"{device_name}_{label}"
-        if key not in mappings:
-            mappings[key] = _copy_master_spreadsheet(
-                drive_service, settings, f"{device_name} {label}", folder_id
+        folder_id = _find(
+            drive_service, device_name, settings.project_folder_id, FOLDER_MIME
+        )
+        if not folder_id:
+            folder_id = _create_folder(
+                drive_service, device_name, settings.project_folder_id
             )
+            log.info("Created Drive folder '%s' (%s)", device_name, folder_id)
+
+        changed = False
+        for freq in dict.fromkeys(int(value) for value in frequencies_hz):
+            key = mapping_key(device_name, freq)
+            if key in mappings:
+                continue
+
+            # Promote the legacy whole-MHz mapping without provisioning a
+            # duplicate workbook. Never use it for fractional-MHz frequencies.
+            legacy_key = f"{device_name}_{freq_label(freq)}"
+            if freq % 1_000_000 == 0 and legacy_key in mappings:
+                mappings[key] = mappings[legacy_key]
+            else:
+                label = frequency_title(freq)
+                mappings[key] = _copy_master_spreadsheet(
+                    drive_service, settings, f"{device_name} {label}", folder_id
+                )
             changed = True
 
-    if changed:
-        save_mappings(settings, mappings)
-    return mappings
+        if changed:
+            save_mappings(settings, mappings)
+        return mappings

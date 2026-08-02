@@ -36,6 +36,30 @@ class SequenceCallbacks:
     prompt_operator: Callable[[str, str], bool] = field(default=lambda _t, _m: True)
 
 
+@dataclass
+class PlannedTestPoint:
+    point: MatrixPoint
+    is_completed: bool
+
+
+@dataclass
+class PlanSummary:
+    points: list[PlannedTestPoint]
+    total_count: int
+    completed_count: int
+    pending_count: int
+    estimated_duration_minutes: float
+    temperature_changes: int
+
+    @property
+    def pending_points(self) -> list[MatrixPoint]:
+        return [p.point for p in self.points if not p.is_completed]
+
+    @property
+    def all_points(self) -> list[MatrixPoint]:
+        return [p.point for p in self.points]
+
+
 def build_plan(
     db: Database,
     device_name: str,
@@ -47,19 +71,85 @@ def build_plan(
 ) -> list[MatrixPoint]:
     """All (temp, config, duty, voltage) combinations without a completed run,
     grouped by temperature so the chamber is adjusted as rarely as possible."""
-    done = db.completed_points(device_name, frequency_hz)
-    plan: list[MatrixPoint] = []
+    return build_matrix_plan(
+        db,
+        device_name=device_name,
+        frequencies_hz=[frequency_hz],
+        configs=configs,
+        duties=duties,
+        voltages=voltages,
+        temperatures=temperatures,
+        include_completed=False,
+    ).pending_points
+
+
+def build_matrix_plan(
+    db: Database,
+    device_name: str,
+    frequencies_hz: list[int],
+    configs: list[str],
+    duties: list[int],
+    voltages: list[int],
+    temperatures: list[int],
+    include_completed: bool = False,
+    duration_minutes_per_point: float = 1.0,
+) -> PlanSummary:
+    """Build a custom test plan matrix across multiple frequencies and parameters.
+    Points are grouped by temperature so the chamber is adjusted as rarely as possible.
+    """
+    completed_set = set()
+    for freq in frequencies_hz:
+        done_tuple_set = db.completed_points(device_name, freq)
+        for (config, duty, voltage, temp) in done_tuple_set:
+            completed_set.add((freq, config, duty, voltage, temp))
+
+    planned_points: list[PlannedTestPoint] = []
+    total_count = 0
+    completed_count = 0
+    pending_count = 0
+
     for temp in temperatures:
-        for config in configs:
-            for duty in duties:
-                for voltage in voltages:
-                    if (config, duty, voltage, temp) not in done:
-                        plan.append(MatrixPoint(
-                            device_name=device_name, config=config,
-                            frequency_hz=frequency_hz, duty_pct=duty,
-                            temperature_c=temp, voltage_v=voltage,
-                        ))
-    return plan
+        for freq in frequencies_hz:
+            for config in configs:
+                for duty in duties:
+                    for voltage in voltages:
+                        key = (freq, config, duty, voltage, temp)
+                        is_done = key in completed_set
+                        total_count += 1
+                        if is_done:
+                            completed_count += 1
+                        else:
+                            pending_count += 1
+
+                        if not is_done or include_completed:
+                            mp = MatrixPoint(
+                                device_name=device_name,
+                                config=config,
+                                frequency_hz=freq,
+                                duty_pct=duty,
+                                temperature_c=temp,
+                                voltage_v=voltage,
+                            )
+                            planned_points.append(PlannedTestPoint(point=mp, is_completed=is_done))
+
+    temp_changes = 0
+    prev_temp = None
+    for item in planned_points:
+        if prev_temp is None or item.point.temperature_c != prev_temp:
+            temp_changes += 1
+            prev_temp = item.point.temperature_c
+
+    est_duration = len(planned_points) * duration_minutes_per_point
+
+    return PlanSummary(
+        points=planned_points,
+        total_count=total_count,
+        completed_count=completed_count,
+        pending_count=pending_count,
+        estimated_duration_minutes=est_duration,
+        temperature_changes=temp_changes,
+    )
+
 
 
 class AutoSequence:
@@ -77,6 +167,7 @@ class AutoSequence:
         self.all_configs = all_configs
         self.callbacks = callbacks or SequenceCallbacks()
         self._cancel = threading.Event()
+        self._lifecycle_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
 
     @property
@@ -86,21 +177,40 @@ class AutoSequence:
     def start(
         self, plan: list[MatrixPoint], duration_minutes: float, find_zvs: bool
     ) -> bool:
-        if self.active or self.engine.is_busy() or not plan:
-            return False
-        self._cancel.clear()
-        self._thread = threading.Thread(
-            target=self._run,
-            args=(plan, duration_minutes, find_zvs),
-            daemon=True,
-            name="auto-sequence",
-        )
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self.active or self.engine.is_busy() or not plan:
+                return False
+            self._cancel.clear()
+            thread = threading.Thread(
+                target=self._run,
+                args=(plan, duration_minutes, find_zvs),
+                daemon=False,
+                name="auto-sequence",
+            )
+            self._thread = thread
+            thread.start()
         return True
 
     def cancel(self) -> None:
         self._cancel.set()
         self.engine.cancel()
+
+    def join(self, timeout: Optional[float] = None) -> bool:
+        """Bounded wait for the sequence worker; returns whether it stopped."""
+        with self._lifecycle_lock:
+            thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
+    def cancel_and_join(self, timeout: Optional[float] = None) -> bool:
+        self.cancel()
+        return self.join(timeout)
+
+    def request_emergency_stop(self) -> threading.Thread:
+        self._cancel.set()
+        return self.engine.request_emergency_stop()
 
     def _cancelled(self) -> bool:
         return self._cancel.is_set()
@@ -115,6 +225,13 @@ class AutoSequence:
             for index, point in enumerate(plan, start=1):
                 if self._cancelled():
                     success = False
+                    break
+                if self.engine.safety.is_tripped:
+                    success = False
+                    cb.on_status(
+                        "Auto sequence stopped: safety trip is latched; "
+                        "operator reset is required."
+                    )
                     break
 
                 cb.on_step(index, total, point)
@@ -134,7 +251,11 @@ class AutoSequence:
                 # Gate drive: apply selection, then ramp to a previously
                 # measured tuned frequency when one exists.
                 self.wavegen_controller.apply(
-                    point.config, point.frequency_hz, point.duty_pct
+                    point.config,
+                    point.frequency_hz,
+                    point.duty_pct,
+                    cancel_check=self._cancelled,
+                    status=cb.on_status,
                 )
                 prior = find_prior_tuned_frequency(self.db, point, self.all_configs)
                 if prior is not None and not self._cancelled():
@@ -161,10 +282,21 @@ class AutoSequence:
                 ):
                     success = False
                     break
-                self.engine.wait_until_idle()
+                outcome = self.engine.wait_until_idle()
 
                 if self._cancelled():
                     success = False
+                    break
+                if outcome is None or not outcome.success:
+                    success = False
+                    detail = (
+                        outcome.message
+                        if outcome is not None
+                        else "engine did not return a terminal outcome"
+                    )
+                    cb.on_status(
+                        f"Auto sequence stopped after {index}/{total}: {detail}"
+                    )
                     break
                 completed += 1
                 cb.on_status(f"Auto sequence progress: {completed}/{total} complete.")
@@ -173,6 +305,10 @@ class AutoSequence:
             success = False
             cb.on_status(f"Auto sequence error: {exc}")
         finally:
+            try:
+                self.wavegen_controller.disarm_outputs()
+            except Exception:
+                log.exception("Could not confirm wavegen disarmed at sequence end")
             if self._cancelled():
                 cb.on_finished(False, f"Auto sequence cancelled ({completed}/{total} done).")
             elif success:

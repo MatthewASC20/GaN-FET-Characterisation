@@ -11,18 +11,14 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from typing import Callable, Optional
 
 from gan_fet.core.models import MatrixPoint
-from gan_fet.instruments.wavegen import Sdg6022x
+from gan_fet.instruments.base import WavegenInterface
+from gan_fet.settings import WavegenSettings
 from gan_fet.storage.db import Database
 
 log = logging.getLogger(__name__)
-
-AUTOTUNE_STEP_HZ = 100_000       # 0.1 MHz per step
-AUTOTUNE_STEP_DELAY_S = 0.5
-
 
 def tuned_frequency_search_order(
     temperature_c: int, config: str, all_configs: list[str]
@@ -49,16 +45,25 @@ class WavegenController:
     """Tracks what has actually been applied to the SDG6022X so the UI can
     show pending-change state, and performs gradual frequency ramps."""
 
-    def __init__(self, wavegen: Sdg6022x):
+    def __init__(
+        self,
+        wavegen: WavegenInterface,
+        settings: Optional[WavegenSettings] = None,
+    ):
         self.wavegen = wavegen
-        self._lock = threading.Lock()
+        self.settings = settings or WavegenSettings()
+        # State reads are short and never encompass transport I/O.  The
+        # operation lock serializes compound hardware changes without causing
+        # the nested state-lock deadlocks that the previous implementation had.
+        self._state_lock = threading.Lock()
+        self._operation_lock = threading.RLock()
         self.applied_config: Optional[str] = None
         self.applied_freq_hz: Optional[float] = None   # nominal selection
-        self.applied_duty: Optional[int] = None
+        self.applied_duty: Optional[float] = None
         self.tuned_freq_hz: Optional[float] = None     # actual (possibly tuned)
 
     def has_pending_changes(self, config: str, freq_hz: int, duty: int) -> bool:
-        with self._lock:
+        with self._state_lock:
             if self.applied_config is None:
                 return True
             return (
@@ -68,60 +73,182 @@ class WavegenController:
             )
 
     def invalidate_tuning(self) -> None:
-        with self._lock:
+        with self._state_lock:
             self.tuned_freq_hz = None
 
-    def apply(self, config: str, freq_hz: int, duty: int) -> None:
+    @property
+    def outputs_armed(self) -> bool:
+        return self.wavegen.outputs_armed
+
+    def arm_outputs(self, config: Optional[str] = None) -> bool:
+        """Arm the channel set for ``config`` after configuration is complete."""
+        with self._operation_lock:
+            if config is None:
+                with self._state_lock:
+                    config = self.applied_config
+            if config is None:
+                raise RuntimeError("Cannot arm wavegen before a configuration is applied")
+            return self.wavegen.arm_outputs(config)
+
+    def disarm_outputs(self) -> None:
+        """Synchronously turn off both gate outputs."""
+        with self._operation_lock:
+            self.wavegen.outputs_off()
+
+    def apply(
+        self,
+        config: str,
+        freq_hz: int,
+        duty: int,
+        duty_rate_pct_s: Optional[float] = None,
+        freq_rate_khz_s: Optional[float] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        status: Optional[Callable[[str], None]] = None,
+    ) -> None:
         """Apply selection to the instrument (full reconfigure on config
-        change, minimal updates otherwise — v1 semantics)."""
-        with self._lock:
+        change, rate-dependent gradual ramping for parameter adjustments)."""
+        with self._operation_lock:
+            if cancel_check is not None and cancel_check():
+                return
+            with self._state_lock:
+                applied_config = self.applied_config
+                applied_duty = self.applied_duty
+                cached_actual_freq = (
+                    self.tuned_freq_hz
+                    if self.tuned_freq_hz is not None
+                    else self.applied_freq_hz
+                )
+
             dual = self.wavegen.is_dual(config)
-            if config != self.applied_config:
+            if config != applied_config:
                 self.wavegen.configure(config, freq_hz, duty)
+                with self._state_lock:
+                    self.applied_config = config
+                    self.applied_freq_hz = float(freq_hz)
+                    self.applied_duty = float(duty)
+                    self.tuned_freq_hz = float(freq_hz)
+                return
+
+            # Autotune deliberately moves away from the nominal selection.
+            # Read the instrument before every same-config apply so the next
+            # sequence point is restored to nominal even when its selected
+            # frequency did not change.
+            actual_before = self.wavegen.read_frequency()
+            if actual_before is None:
+                actual_before = cached_actual_freq
+            if actual_before is None or abs(freq_hz - actual_before) >= 1.0:
+                actual_freq = self.wavegen.ramp_to_frequency(
+                    freq_hz,
+                    dual,
+                    rate_khz_s=(
+                        freq_rate_khz_s
+                        if freq_rate_khz_s is not None
+                        else self.settings.freq_ramp_rate_khz_s
+                    ),
+                    cancel_check=cancel_check,
+                )
+                with self._state_lock:
+                    self.applied_freq_hz = (
+                        float(freq_hz)
+                        if abs(actual_freq - freq_hz) < 1.0
+                        else None
+                    )
+                    self.tuned_freq_hz = actual_freq
+                if status is not None:
+                    status(f"Frequency Ramp: {actual_freq / 1e6:.3f} MHz")
             else:
-                if freq_hz != self.applied_freq_hz:
-                    self.wavegen.set_frequency(freq_hz, dual)
-                if duty != self.applied_duty:
-                    self.wavegen.set_duty(duty, dual)
-            self.applied_config = config
-            self.applied_freq_hz = freq_hz
-            self.applied_duty = duty
-            self.tuned_freq_hz = float(freq_hz)
+                with self._state_lock:
+                    self.applied_freq_hz = float(freq_hz)
+                    self.tuned_freq_hz = float(actual_before)
+
+            if cancel_check is not None and cancel_check():
+                return
+
+            if duty != applied_duty:
+                actual_duty = self.wavegen.ramp_to_duty(
+                    duty,
+                    dual,
+                    rate_pct_s=(
+                        duty_rate_pct_s
+                        if duty_rate_pct_s is not None
+                        else self.settings.duty_ramp_rate_pct_s
+                    ),
+                    cancel_check=cancel_check,
+                )
+                with self._state_lock:
+                    self.applied_duty = actual_duty
+                if status is not None:
+                    status(f"Duty Ramp: {actual_duty:.1f}%")
+
+    def ramp_to_duty(
+        self,
+        target_duty: float,
+        config: str,
+        *,
+        rate_pct_s: Optional[float] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        status: Optional[Callable[[str], None]] = None,
+    ) -> float:
+        """Step duty cycle gradually and return the last applied value."""
+        with self._operation_lock:
+            dual = self.wavegen.is_dual(config)
+            with self._state_lock:
+                start = float(
+                    self.applied_duty
+                    if self.applied_duty is not None
+                    else target_duty
+                )
+            actual = self.wavegen.ramp_to_duty(
+                target_duty,
+                dual,
+                rate_pct_s=(
+                    rate_pct_s
+                    if rate_pct_s is not None
+                    else self.settings.duty_ramp_rate_pct_s
+                ),
+                cancel_check=cancel_check,
+            )
+            with self._state_lock:
+                self.applied_duty = actual
+            if status is not None:
+                status(f"Duty Ramp: {actual:.1f}%")
+            log.info("Duty ramp complete: %.1f%% → %.1f%%", start, actual)
+            return actual
 
     def ramp_to_frequency(
         self,
         target_hz: float,
         config: str,
         *,
+        rate_khz_s: Optional[float] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         status: Optional[Callable[[str], None]] = None,
     ) -> float:
         """Step the output frequency gradually to target_hz (resonant rigs
         dislike jumps). Returns the start frequency."""
-        dual = self.wavegen.is_dual(config)
+        with self._operation_lock:
+            dual = self.wavegen.is_dual(config)
 
-        start = self.wavegen.read_frequency()
-        if start is None:
-            with self._lock:
-                start = self.tuned_freq_hz or self.applied_freq_hz
-        if start is None:
-            raise RuntimeError("Cannot determine current wavegen frequency")
+            start = self.wavegen.read_frequency()
+            if start is None:
+                with self._state_lock:
+                    start = self.tuned_freq_hz or self.applied_freq_hz
+            if start is None:
+                raise RuntimeError("Cannot determine current wavegen frequency")
 
-        current = float(start)
-        target = float(target_hz)
-        step = AUTOTUNE_STEP_HZ if target > current else -AUTOTUNE_STEP_HZ
-
-        while abs(target - current) > 1:
-            if cancel_check is not None and cancel_check():
-                break
-            current = target if abs(target - current) <= abs(step) else current + step
-            self.wavegen.set_frequency(current, dual)
+            actual = self.wavegen.ramp_to_frequency(
+                target_hz,
+                dual,
+                rate_khz_s=(
+                    rate_khz_s
+                    if rate_khz_s is not None
+                    else self.settings.freq_ramp_rate_khz_s
+                ),
+                cancel_check=cancel_check,
+            )
+            with self._state_lock:
+                self.tuned_freq_hz = actual
             if status is not None:
-                status(f"Autotune: {current / 1e6:.2f} MHz")
-            if current != target:
-                time.sleep(AUTOTUNE_STEP_DELAY_S)
-
-        with self._lock:
-            self.tuned_freq_hz = target
-        log.info("Autotune ramp complete: %.0f Hz → %.0f Hz", start, target)
-        return float(start)
+                status(f"Autotune: {actual / 1e6:.2f} MHz")
+            log.info("Autotune ramp complete: %.0f Hz → %.0f Hz", start, actual)
+            return float(start)
