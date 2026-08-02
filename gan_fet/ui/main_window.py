@@ -22,6 +22,18 @@ from gan_fet.core.autotune import (
     find_prior_tuned_frequency,
 )
 from gan_fet.ui.command_log_view import CommandLogConsole
+from gan_fet.ui.run_request import (
+    InputRejected,
+    build_experiment_params,
+    build_matrix_point,
+    require_populated_options,
+    tuning_candidate,
+)
+from gan_fet.ui.param_options import (
+    OPTION_KEYS as _OPTION_KEYS,
+    default_label,
+    normalize_options,
+)
 from gan_fet.core.events import (
     SampleAcquiredEvent,
     StatusUpdatedEvent,
@@ -32,14 +44,12 @@ from gan_fet.core.models import (
     ExperimentParams,
     ExperimentState,
     MatrixPoint,
-    freq_label,
     sanitize_device_name,
 )
 from gan_fet.core.safety import SafetyMonitor, SafetyTrip
 from gan_fet.core.sequence import AutoSequence, SequenceCallbacks, build_plan
 from gan_fet.instruments.base import SmuInterface
 from gan_fet.settings import SIMULATION_DEFAULT_DEVICE_NAME, Settings
-from gan_fet.settings import DEFAULT_CONFIGURATIONS
 from gan_fet.sheets.sync import SheetsSync
 from gan_fet.storage import export as export_mod
 from gan_fet.storage import reports as reports_mod
@@ -55,6 +65,7 @@ from gan_fet.ui.planner_tab import PlannerTab
 from gan_fet.ui.plot import LivePlot
 from gan_fet.ui.tracker_view import UpNextView
 from gan_fet.ui.widgets import (
+    resolve_confirm_presentation,
     ColorButton,
     OperationCoordinator,
     OperationToken,
@@ -72,7 +83,9 @@ log = logging.getLogger(__name__)
 DEFAULT_GEOMETRY = "1700x950"
 SIMULATION_VALIDATION_DURATION_MINUTES = 0.1
 
-OPTION_KEYS = ("configurations", "frequencies", "duties", "temperatures", "voltages")
+# Re-exported: tests and sibling modules import these from here, and the
+# behaviour now lives in ui/param_options.py where it can be tested headlessly.
+OPTION_KEYS = _OPTION_KEYS
 
 EXPERIMENT_CONTROL_COLUMNS = 3
 EXPERIMENT_PLOT_COLUMN = EXPERIMENT_CONTROL_COLUMNS
@@ -109,17 +122,19 @@ COLOR_PENDING = "#e53935"    # red — selection differs from what's on the wave
 COLOR_TUNING = "#FBC02D"     # yellow — a better (tuned) frequency is available
 COLOR_OK = "#43a047"         # green — instrument matches the selection
 
+#: Confirm-button appearance for each state resolve_confirm_presentation can
+#: return. Keeping the mapping beside the colours means adding a state fails
+#: here rather than silently falling through to a default.
+CONFIRM_STYLES: dict[str, dict[str, str]] = {
+    "pending": {"bg": COLOR_PENDING, "fg": "white"},
+    "tuning": {"bg": COLOR_TUNING, "fg": "black"},
+    "ready": {"bg": COLOR_OK, "fg": "white"},
+}
+
 
 def _default_label(key: str, value: Any) -> str:
-    if key == "frequencies":
-        return freq_label(value)
-    if key == "duties":
-        return f"{value}%"
-    if key == "temperatures":
-        return f"{value}°C"
-    if key == "voltages":
-        return f"{value}V"
-    return str(value)
+    """Kept as a module-level name: it is bound into partials at build time."""
+    return default_label(key, value)
 
 
 def mode_banner_presentation(is_simulated: bool) -> tuple[str, str]:
@@ -1334,46 +1349,10 @@ class MainWindow(tk.Tk):
         self._apply_options_to_ui()
 
     def _normalize_options(self, key: str, raw: Optional[list]) -> List[Tuple[Any, str]]:
-        if not raw:
-            return []
-        cleaned: List[Tuple[Any, str]] = []
-        seen = set()
-        for entry in raw:
-            if isinstance(entry, dict):
-                value, label = entry.get("value"), str(entry.get("label", ""))
-            elif isinstance(entry, (list, tuple)) and entry:
-                value = entry[0]
-                label = str(entry[1]) if len(entry) > 1 else ""
-            else:
-                value, label = entry, ""
-            if key == "configurations":
-                value = str(value).strip()
-                if (
-                    value not in DEFAULT_CONFIGURATIONS
-                    or value in seen
-                ):
-                    continue
-            else:
-                try:
-                    if value is None:
-                        continue
-                    value = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if key == "frequencies" and not 1 <= value <= 500_000_000:
-                    continue
-                if key == "duties" and not 1 <= value <= 99:
-                    continue
-                if key == "voltages" and not (
-                    0 < value <= self.settings.safety.max_vds_peak_v
-                ):
-                    continue
-                if value in seen:
-                    continue
-            seen.add(value)
-            cleaned.append((value, label.strip() or _default_label(key, value)))
-        cleaned.sort(key=(lambda e: e[1].lower()) if key == "configurations" else (lambda e: e[0]))
-        return cleaned
+        """Clean one stored option set against the current safety ceiling."""
+        return normalize_options(
+            key, raw, max_vds_peak_v=self.settings.safety.max_vds_peak_v
+        )
 
     def _apply_options_to_ui(self) -> None:
         if not self._ui_ready:
@@ -1501,76 +1480,85 @@ class MainWindow(tk.Tk):
     # wavegen apply / autotune
     # ------------------------------------------------------------------
 
+    def _read_selection(self) -> dict:
+        """Current widget values, before any validation."""
+        return {
+            "device_name": self.device_name_var.get(),
+            "config": self.config_var.get(),
+            "frequency_hz": self.frequency_var.get(),
+            "duty_pct": self.duty_var.get(),
+            "temperature_c": self.temperature_var.get(),
+            "voltage_v": self.voltage_var.get(),
+        }
+
     def _current_point(self) -> Optional[MatrixPoint]:
-        device = self.device_name_var.get().strip()
-        if not device:
-            return None
+        """The selected point, or ``None`` when the selection is unusable.
+
+        Silent: used to refresh button states on every keystroke, where a
+        half-typed field is normal rather than an error worth reporting.
+        """
         try:
-            return MatrixPoint(
-                device_name=sanitize_device_name(device),
-                config=self.config_var.get(),
-                frequency_hz=int(self.frequency_var.get()),
-                duty_pct=int(self.duty_var.get()),
-                temperature_c=int(self.temperature_var.get()),
-                voltage_v=int(self.voltage_var.get()),
-            )
-        except (ValueError, tk.TclError):
+            return build_matrix_point(**self._read_selection())
+        except (InputRejected, tk.TclError):
             return None
 
     def _tuning_candidate(self) -> Optional[Tuple[float, str, int]]:
         point = self._current_point()
         if point is None:
             return None
-        prior = find_prior_tuned_frequency(self.db, point, self._values("configurations"))
-        if prior is None:
-            return None
-        applied = self.wavegen_controller.tuned_freq_hz
-        if applied is not None and abs(applied - prior[0]) <= 1:
-            return None  # already there
-        return prior
+        return tuning_candidate(
+            find_prior_tuned_frequency(
+                self.db, point, self._values("configurations")
+            ),
+            self.wavegen_controller.tuned_freq_hz,
+        )
 
     def _refresh_confirm_state(self) -> None:
+        """Apply the resolved confirm/autotune presentation to the widgets."""
         if not self._ui_ready or self._closing:
             return
         try:
             pending = self.wavegen_controller.has_pending_changes(
-                self.config_var.get(), int(self.frequency_var.get()), int(self.duty_var.get())
+                self.config_var.get(),
+                int(self.frequency_var.get()),
+                int(self.duty_var.get()),
             )
         except (ValueError, tk.TclError):
+            # Unreadable inputs cannot be confirmed as applied, so treat the
+            # wavegen as out of date rather than assume it matches.
             pending = True
+
         candidate = self._tuning_candidate()
-
-        if pending:
-            self.confirm_button.set_style(bg=COLOR_PENDING, fg="white")
-        elif candidate:
-            self.confirm_button.set_style(bg=COLOR_TUNING, fg="black")
-        else:
-            self.confirm_button.set_style(bg=COLOR_OK, fg="white")
-
         controls = self._control_state()
-        if candidate and not self._tuner_busy and controls.frequency_actions:
-            freq_mhz = candidate[0] / 1e6
-            self.autotune_button.set_style(
-                bg=COLOR_OK, fg="white", active_bg="#388e3c",
-                text=f"Autotune: {freq_mhz:.2f} MHz", state="normal",
-            )
-        elif not self._tuner_busy:
-            # Say *why* it is unavailable: a live bus is an operator-fixable
-            # condition, unlike having no prior run to tune towards.
-            reason = (
-                "Autotune: Bus On"
-                if controls.hardware_actions and not controls.frequency_actions
-                else "Autotune Unavailable"
-            )
-            self.autotune_button.set_style(
-                bg="#bdbdbd", fg="white",
-                text=reason, state="disabled",
-            )
-        self.confirm_button.config(
-            state="normal" if controls.hardware_actions else "disabled"
+        presentation = resolve_confirm_presentation(
+            wavegen_pending=pending,
+            tuning_candidate_hz=candidate[0] if candidate else None,
+            tuner_busy=self._tuner_busy,
+            hardware_actions=controls.hardware_actions,
+            frequency_actions=controls.frequency_actions,
         )
-        if not controls.frequency_actions:
-            self.autotune_button.config(state="disabled")
+
+        self.confirm_button.set_style(**CONFIRM_STYLES[presentation.confirm_state])
+        self.confirm_button.config(
+            state="normal" if presentation.confirm_enabled else "disabled"
+        )
+
+        if not self._tuner_busy:
+            if presentation.autotune_enabled:
+                self.autotune_button.set_style(
+                    bg=COLOR_OK,
+                    fg="white",
+                    active_bg="#388e3c",
+                    text=presentation.autotune_text,
+                    state="normal",
+                )
+            else:
+                self.autotune_button.set_style(
+                    bg="#bdbdbd",
+                    fg="white",
+                    text=presentation.autotune_text,
+                    state="disabled",
+                )
 
     def _confirm_high_risk(self) -> bool:
         warnings = []
@@ -2100,59 +2088,44 @@ class MainWindow(tk.Tk):
     # ------------------------------------------------------------------
 
     def _validated_current_point(self) -> Optional[MatrixPoint]:
-        """Validate shared matrix inputs without imposing a run duration."""
-        raw_device = self.device_name_var.get().strip()
-        device = sanitize_device_name(raw_device)
-        if not device or device != raw_device:
-            messagebox.showerror(
-                "Input Error",
-                "Enter a device name using only letters, numbers, spaces, '_' or '-'.",
-                parent=self,
+        """Validate shared matrix inputs without imposing a run duration.
+
+        Reports why, unlike ``_current_point``: this runs when the operator has
+        asked for something, so silence would leave them with a dead button and
+        no explanation.
+        """
+        try:
+            require_populated_options(
+                {key: self._values(key) for key in OPTION_KEYS}, OPTION_KEYS
+            )
+            return build_matrix_point(**self._read_selection())
+        except InputRejected as rejected:
+            self._show_rejection(rejected)
+            return None
+        except tk.TclError:
+            self._show_rejection(
+                InputRejected("Input Error", "Invalid parameter selection.")
             )
             return None
-        empty_params = [key for key in OPTION_KEYS if not self._values(key)]
-        if empty_params:
-            param_labels = {
-                "configurations": "Configuration",
-                "frequencies": "Frequency",
-                "duties": "Duty Cycle",
-                "temperatures": "Temperature",
-                "voltages": "Voltage",
-            }
-            missing = ", ".join(param_labels.get(k, k) for k in empty_params)
-            messagebox.showerror(
-                "Missing Parameters",
-                f"Cannot proceed. The following parameter(s) have no options defined: {missing}",
-                parent=self,
-            )
-            return None
-        point = self._current_point()
-        if point is None:
-            messagebox.showerror(
-                "Input Error", "Invalid parameter selection.", parent=self
-            )
-            return None
-        return point
+
+    def _show_rejection(self, rejected: InputRejected) -> None:
+        """Single place the validation reasons become dialogs."""
+        messagebox.showerror(rejected.title, rejected.message, parent=self)
 
     def _build_params(self) -> Optional[ExperimentParams]:
         point = self._validated_current_point()
         if point is None:
             return None
         try:
-            duration = parse_positive_duration(self.duration_entry.get())
-        except (TypeError, ValueError) as exc:
-            messagebox.showerror(
-                "Input Error",
-                f"Please enter a finite, positive duration.\n\n{exc}",
-                parent=self,
+            return build_experiment_params(
+                point,
+                self.duration_entry.get(),
+                find_zvs=bool(self.find_zvs_var.get()),
+                tune_frequency=bool(self.tune_frequency_var.get()),
             )
+        except InputRejected as rejected:
+            self._show_rejection(rejected)
             return None
-        return ExperimentParams(
-            point=point,
-            duration_minutes=duration,
-            find_zvs=bool(self.find_zvs_var.get()),
-            tune_frequency=bool(self.tune_frequency_var.get()),
-        )
 
     def _start_experiment(self) -> None:
         if not self._ensure_hardware_online(

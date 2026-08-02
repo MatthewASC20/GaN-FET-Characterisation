@@ -8,7 +8,6 @@ platforms where colours work natively.
 from __future__ import annotations
 
 import logging
-import math
 import queue
 import threading
 import time
@@ -18,6 +17,10 @@ from dataclasses import dataclass, field
 from functools import partial
 from tkinter import ttk
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+
+from gan_fet.ui.run_request import (
+    parse_positive_duration as _parse_positive_duration,
+)
 
 try:
     from tkmacosx import Button as _ColorButtonBase  # type: ignore
@@ -204,6 +207,57 @@ class OperationCoordinator:
 
 
 @dataclass(frozen=True)
+class ConfirmPresentation:
+    """How the confirm and autotune buttons should currently read.
+
+    Kept separate from the widgets so the reasoning — which is the part that
+    has been got wrong before — can be checked without a display. The window
+    only applies colours and text.
+    """
+
+    confirm_state: Literal["pending", "tuning", "ready"]
+    confirm_enabled: bool
+    autotune_enabled: bool
+    autotune_text: str
+
+
+def resolve_confirm_presentation(
+    *,
+    wavegen_pending: bool,
+    tuning_candidate_hz: Optional[float],
+    tuner_busy: bool,
+    hardware_actions: bool,
+    frequency_actions: bool,
+) -> ConfirmPresentation:
+    """Resolve the confirm/autotune presentation for one state snapshot."""
+    if wavegen_pending:
+        confirm_state: Literal["pending", "tuning", "ready"] = "pending"
+    elif tuning_candidate_hz is not None:
+        confirm_state = "tuning"
+    else:
+        confirm_state = "ready"
+
+    autotune_enabled = (
+        tuning_candidate_hz is not None and not tuner_busy and frequency_actions
+    )
+    if autotune_enabled and tuning_candidate_hz is not None:
+        autotune_text = f"Autotune: {tuning_candidate_hz / 1e6:.2f} MHz"
+    elif hardware_actions and not frequency_actions:
+        # Name the cause: a live bus is something the operator can fix, unlike
+        # simply having no prior run to tune towards.
+        autotune_text = "Autotune: Bus On"
+    else:
+        autotune_text = "Autotune Unavailable"
+
+    return ConfirmPresentation(
+        confirm_state=confirm_state,
+        confirm_enabled=hardware_actions,
+        autotune_enabled=autotune_enabled,
+        autotune_text=autotune_text,
+    )
+
+
+@dataclass(frozen=True)
 class RigControlState:
     """Resolved UI permissions for one snapshot of rig/application state.
 
@@ -266,14 +320,9 @@ def resolve_rig_control_state(
     )
 
 
-def parse_positive_duration(raw: str, *, maximum_minutes: float = 24 * 60) -> float:
-    """Parse one finite, positive experiment duration."""
-    value = float(raw)
-    if not math.isfinite(value) or value <= 0 or value > maximum_minutes:
-        raise ValueError(
-            f"duration must be finite and between 0 and {maximum_minutes:g} minutes"
-        )
-    return value
+# Re-exported so existing importers keep working. The parsing itself is pure
+# and lives in ui/run_request.py, which does not import tkinter.
+parse_positive_duration = _parse_positive_duration
 
 
 class ColorButton(_ColorButtonBase):

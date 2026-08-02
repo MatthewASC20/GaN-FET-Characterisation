@@ -29,7 +29,11 @@ from gan_fet.ui.main_window import (
     mode_banner_presentation,
 )
 from gan_fet.ui.tracker_view import format_run_details
-from gan_fet.ui.widgets import OperationCoordinator, resolve_rig_control_state
+from gan_fet.ui.widgets import (
+    OperationCoordinator,
+    resolve_confirm_presentation,
+    resolve_rig_control_state,
+)
 
 
 class _FakeWidget:
@@ -692,3 +696,58 @@ def test_ramp_apply_persists_one_normalized_update() -> None:
     assert applied == [True]
     assert not editor._dirty
     assert editor.apply_button.options["state"] == "disabled"
+
+
+# -- confirm/autotune presentation -------------------------------------------
+
+def _presentation(**overrides):
+    kwargs = dict(
+        wavegen_pending=False,
+        tuning_candidate_hz=None,
+        tuner_busy=False,
+        hardware_actions=True,
+        frequency_actions=True,
+    )
+    kwargs.update(overrides)
+    return resolve_confirm_presentation(**kwargs)
+
+
+def test_pending_wavegen_outranks_an_available_tune():
+    """An unapplied selection is the more urgent thing to say."""
+    result = _presentation(wavegen_pending=True, tuning_candidate_hz=6_400_000.0)
+    assert result.confirm_state == "pending"
+
+
+def test_confirm_states_follow_the_selection():
+    assert _presentation().confirm_state == "ready"
+    assert _presentation(tuning_candidate_hz=6.4e6).confirm_state == "tuning"
+    assert _presentation(wavegen_pending=True).confirm_state == "pending"
+
+
+def test_autotune_names_a_live_bus_as_the_reason():
+    result = _presentation(
+        tuning_candidate_hz=6.4e6, hardware_actions=True, frequency_actions=False
+    )
+    assert result.autotune_enabled is False
+    assert result.autotune_text == "Autotune: Bus On"
+
+
+def test_autotune_is_generically_unavailable_without_a_candidate():
+    result = _presentation(tuning_candidate_hz=None)
+    assert result.autotune_enabled is False
+    assert result.autotune_text == "Autotune Unavailable"
+
+
+def test_autotune_shows_the_frequency_it_would_move_to():
+    result = _presentation(tuning_candidate_hz=6_432_100.0)
+    assert result.autotune_enabled is True
+    assert result.autotune_text == "Autotune: 6.43 MHz"
+
+
+def test_a_busy_tuner_blocks_a_second_autotune():
+    assert _presentation(tuning_candidate_hz=6.4e6, tuner_busy=True).autotune_enabled is False
+
+
+def test_confirm_follows_hardware_availability():
+    assert _presentation(hardware_actions=False).confirm_enabled is False
+    assert _presentation(hardware_actions=True).confirm_enabled is True
