@@ -474,17 +474,20 @@ class Database:
         tuned_frequency_hz: Optional[float] = None,
         tuned_input_power_w: Optional[float] = None,
         sweep_direction: Optional[str] = None,
+        zvs_dwell_fraction: Optional[float] = None,
     ) -> None:
         self._execute(
             "UPDATE runs SET status='completed', completed_at=?, bus_voltage_v=?,"
             " v_zvs=?, vin=?, iin=?, fsw_hz=?, irms=?, vds_pk=?, isw_rms=?,"
             " screenshot_path=COALESCE(?, screenshot_path),"
-            " tuned_frequency_hz=?, tuned_input_power_w=?, sweep_direction=?"
+            " tuned_frequency_hz=?, tuned_input_power_w=?, sweep_direction=?,"
+            " zvs_dwell_fraction=?"
             " WHERE id=?",
             (completed_at or time.strftime("%Y-%m-%d %H:%M:%S"), bus_voltage_v,
              v_zvs, readings.vin, readings.iin, readings.fsw_hz, readings.irms,
              readings.vds_pk, readings.isw_rms, screenshot_path,
-             tuned_frequency_hz, tuned_input_power_w, sweep_direction, run_id),
+             tuned_frequency_hz, tuned_input_power_w, sweep_direction,
+             zvs_dwell_fraction, run_id),
         )
 
     def set_run_status(self, run_id: int, status: str) -> None:

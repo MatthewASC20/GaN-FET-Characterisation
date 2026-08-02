@@ -449,6 +449,11 @@ class ExperimentEngine:
             if reason is not None:
                 raise SafetyTrip(*reason)
 
+            # Scale the ZVS dwell threshold to this point's target peak.
+            # Best effort: the dwell is diagnostic, so losing it must never
+            # stop a characterisation run.
+            self._apply_zvs_threshold(float(point.voltage_v))
+
             self._update_status("Arming verified wavegen outputs...")
             if not self.safety.arm_wavegen(point.config):
                 raise ConnectionError("Could not arm the wavegen outputs")
@@ -542,6 +547,7 @@ class ExperimentEngine:
             self._update_status("Capturing final readings...")
             self._poll_energized_safety("before final readings")
             readings = self._capture_final_readings(rms_samples, point.config)
+            zvs_dwell = self._read_zvs_dwell()
             self._raise_if_cancelled(
                 "Experiment cancelled during final readings."
             )
@@ -576,6 +582,7 @@ class ExperimentEngine:
                 sweep_direction=(
                     None if tune_result is None else tune_result.direction
                 ),
+                zvs_dwell_fraction=zvs_dwell,
             )
             success = True
             terminal_status = "completed"
@@ -684,6 +691,50 @@ class ExperimentEngine:
                     record=record,
                 )
             )
+
+    def _apply_zvs_threshold(self, target_peak_v: float) -> None:
+        """Scale the scope's ZVS dwell threshold to this point's target peak.
+
+        The only measurement setting the software writes. A fixed level would
+        mean a different fraction of the swing at each matrix voltage, and
+        expecting the operator to retune it at every point invites silently
+        wrong data. Failure is logged, never raised: the dwell is diagnostic
+        and must not be able to stop a characterisation run.
+        """
+        fraction = self.settings.frequency_tune.zvs_threshold_frac
+        level = max(0.0, target_peak_v * fraction)
+        if level <= 0.0:
+            return
+        try:
+            if self.scope.set_zvs_threshold(level):
+                log.info(
+                    "ZVS dwell threshold set to %.2f V (%.1f%% of %.0f V)",
+                    level,
+                    fraction * 100.0,
+                    target_peak_v,
+                )
+        except Exception:
+            log.warning("could not set the ZVS dwell threshold", exc_info=True)
+
+    def _read_zvs_dwell(self) -> Optional[float]:
+        """Read the ZVS dwell fraction, or ``None`` if it is unavailable.
+
+        Deliberately not defaulted to zero: "no dwell" means hard switching,
+        while "no measurement" means the scope is not configured for it. They
+        are opposite conclusions and must stay distinguishable in the data.
+        """
+        try:
+            value = self.scope.zvs_dwell_fraction()
+        except Exception:
+            log.warning("ZVS dwell read failed", exc_info=True)
+            return None
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        return numeric if math.isfinite(numeric) else None
 
     def _prior_tuned_frequency_hz(self, point) -> Optional[float]:
         """Warm start from an earlier successful search, if there is one.

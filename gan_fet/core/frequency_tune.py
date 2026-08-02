@@ -59,6 +59,9 @@ class TunePoint:
     dc_current_a: float
     reachable: bool = True
     anomaly: bool = False
+    #: Fraction of the cycle Vds sat below the ZVS threshold here. ``None``
+    #: when unmeasurable, which is not the same as zero.
+    zvs_dwell_fraction: Optional[float] = None
     #: Peak seen on arrival at this frequency, before the bus was re-converged.
     #: The excursion it represents is what drives the adaptive step size.
     arrival_peak_v: Optional[float] = None
@@ -140,6 +143,20 @@ class FrequencyTuner:
             return self._finite(self.scope.peak_voltage())
         except Exception as exc:
             log.warning("scope peak read failed during frequency tune: %s", exc)
+            return None
+
+    def _read_dwell(self) -> Optional[float]:
+        """ZVS dwell here, recorded but not yet acted on.
+
+        A sweep already visits the whole window, so capturing the dwell at
+        every point turns each ordinary search into a map of where ZVS
+        actually begins - which is the evidence needed to decide whether
+        onset can be bisected instead of swept.
+        """
+        try:
+            return self._finite(self.scope.zvs_dwell_fraction())
+        except Exception as exc:
+            log.debug("ZVS dwell read failed during tune: %s", exc)
             return None
 
     def _read_current(self) -> Optional[float]:
@@ -430,6 +447,7 @@ class FrequencyTuner:
         self.safety.check_compliance()
         return TunePoint(
             arrival_peak_v=arrival_peak,
+            zvs_dwell_fraction=self._read_dwell(),
             frequency_hz=frequency_hz,
             bus_voltage_v=float(self.smu.setpoint_v),
             vds_peak_v=peak if peak is not None else float("nan"),

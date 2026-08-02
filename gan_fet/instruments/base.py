@@ -43,6 +43,35 @@ class OscilloscopeInterface(ABC):
         """Query switch-current RMS."""
         ...
 
+    def zvs_dwell_fraction(self) -> Optional[float]:
+        """Fraction of the cycle Vds spends below the ZVS threshold.
+
+        The direct ZVS indicator: below the condition the tank cannot bring
+        Vds to zero before turn-on and the dwell is zero; at or beyond it the
+        body diode holds the drain down and the dwell widens.
+
+        A *fraction* rather than a duration because the frequency search moves
+        the period: 20 ns means something different at 6 MHz than at 27 MHz,
+        so a width cannot be compared across a sweep.
+
+        Optional capability, not abstract: the parameter slot backing it is a
+        bench configuration that may simply not be present, and a scope without
+        it must still be a usable oscilloscope. ``None`` means "not measured",
+        which is deliberately distinct from a measured zero — the latter says
+        the switch is hard switching.
+        """
+        return None
+
+    def set_zvs_threshold(self, volts: float) -> bool:
+        """Set the voltage below which Vds counts as 'at zero'.
+
+        Scaled to the target peak by the caller, because a fixed absolute
+        threshold is a different fraction of the swing at each matrix voltage.
+        Returns ``False`` when the scope did not accept it, or does not
+        support the measurement at all.
+        """
+        return False
+
     @abstractmethod
     def screenshot(self, dest_path: Path) -> Optional[Path]:
         """Capture screenshot PNG of scope display."""

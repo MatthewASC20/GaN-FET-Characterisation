@@ -359,6 +359,11 @@ class FrequencyTuneSettings:
     #: A step change exceeding this multiple of the locally predicted change is
     #: recorded as an anomaly rather than as smooth data.
     anomaly_ratio: float = 4.0
+    #: ZVS dwell threshold as a fraction of target Vds peak. 2.5% is the
+    #: scaling arrived at empirically on the bench: 5 V at 200 V, 10 V at
+    #: 400 V. Must stay above the ringing on the zero dwell or the
+    #: measurement chatters.
+    zvs_threshold_frac: float = 0.025
     max_points: int = 400
 
 
@@ -946,6 +951,7 @@ class Settings:
                 "ceiling_margin_frac",
                 "gain_growth_factor",
                 "anomaly_ratio",
+                "zvs_threshold_frac",
                 "max_points",
             ),
             "safety": (

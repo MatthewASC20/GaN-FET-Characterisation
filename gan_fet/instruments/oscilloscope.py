@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import tempfile
 import zlib
@@ -126,7 +127,17 @@ class LeCroyHdo4054(OscilloscopeInterface):
     * P1 = Vds peak voltage
     * P2 = RMS current
     * P3 = switch-current RMS
+    * P4 = ZVS dwell, as a duty at level on Vds (optional)
+
+    P1-P3 are read only. P4 is the one exception to that rule: its threshold
+    must track the target Vds peak, because a level that is 2.5% of the swing
+    at 400 V is 5% at 200 V, and an operator reconfiguring the scope at every
+    matrix point is a reliable source of silently wrong data. The measurement
+    itself is still operator-defined; only its level is written.
     """
+
+    #: Parameter slot carrying the ZVS dwell measurement.
+    ZVS_PARAMETER = "P4"
 
     def __init__(self, client: ScpiSession, powi_scope: Optional[Any] = None):
         """Create the driver with an optional injected screenshot adapter.
@@ -184,6 +195,49 @@ class LeCroyHdo4054(OscilloscopeInterface):
         return self.client.query_float(
             "VBS? 'return=app.Measure.P3.Out.Result.Value'"
         )
+
+    def zvs_dwell_fraction(self) -> Optional[float]:
+        """Query the P4 ZVS dwell parameter, normalised to 0..1.
+
+        MAUI reports a duty as a percentage. An unconfigured or unmeasurable
+        parameter yields ``None`` rather than zero: "no dwell" and "no
+        measurement" are opposite conclusions about ZVS, and conflating them
+        would report hard switching whenever the scope was misconfigured.
+        """
+        raw = self.client.query_float(
+            f"VBS? 'return=app.Measure.{self.ZVS_PARAMETER}.Out.Result.Value'"
+        )
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value) or value < 0.0:
+            return None
+        # Tolerate either convention; anything above 1 is read as a percentage.
+        fraction = value / 100.0 if value > 1.0 else value
+        return min(1.0, fraction)
+
+    def set_zvs_threshold(self, volts: float) -> bool:
+        """Set the P4 level that defines 'Vds at zero'.
+
+        Written rather than read because it must track the target peak. A
+        failure is reported, not raised: the dwell measurement is diagnostic,
+        and losing it must never stop a characterisation run.
+        """
+        level = float(volts)
+        if not math.isfinite(level) or level <= 0.0:
+            log.warning("refusing to set a non-positive ZVS threshold: %r", volts)
+            return False
+        ok = self.client.write(
+            f"VBS 'app.Measure.{self.ZVS_PARAMETER}.Operator.LevelType = \"Absolute\"'"
+        ) and self.client.write(
+            f"VBS 'app.Measure.{self.ZVS_PARAMETER}.Operator.AbsLevel = {level:.4f}'"
+        )
+        if not ok:
+            log.warning("scope did not accept a %.2f V ZVS threshold", level)
+        return bool(ok)
 
     def _screenshot_configured_visa(self, dest_path: Path) -> Optional[Path]:
         session = _configured_visa_session(self.client)

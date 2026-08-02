@@ -10,7 +10,7 @@ import sqlite3
 
 from gan_fet.core.models import FinalReadings, MatrixPoint, RunRecord
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS runs (
     attempt_no INTEGER NOT NULL DEFAULT 1,
     tuned_frequency_hz REAL,
     tuned_input_power_w REAL,
-    sweep_direction TEXT
+    sweep_direction TEXT,
+    zvs_dwell_fraction REAL
 );
 CREATE INDEX IF NOT EXISTS idx_runs_point
     ON runs(device_id, config, frequency_hz, duty_pct, temperature_c, voltage_v, id);
@@ -86,6 +87,10 @@ ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("tuned_frequency_hz", "REAL"),
         ("tuned_input_power_w", "REAL"),
         ("sweep_direction", "TEXT"),
+        # Recorded on every run from schema 6 so ordinary matrix work
+        # accumulates the data needed to decide whether ZVS onset can be
+        # bisected, without a dedicated bench session.
+        ("zvs_dwell_fraction", "REAL"),
     ),
     "safety_events": (
         ("ctx_frequency_hz", "REAL"),
@@ -121,7 +126,8 @@ RUN_COLUMNS = (
     "r.voltage_v, r.duration_minutes, r.started_at, r.completed_at, r.status, "
     "r.bus_voltage_v, r.v_zvs, r.vin, r.iin, r.fsw_hz, r.irms, r.vds_pk, "
     "r.isw_rms, r.screenshot_path, r.attempt_no, "
-    "r.tuned_frequency_hz, r.tuned_input_power_w, r.sweep_direction"
+    "r.tuned_frequency_hz, r.tuned_input_power_w, r.sweep_direction, "
+    "r.zvs_dwell_fraction"
 )
 
 RUN_NATURAL_KEY_COLUMNS = (
@@ -165,4 +171,5 @@ def row_to_run(row: sqlite3.Row | tuple) -> RunRecord:
         tuned_frequency_hz=row[21],
         tuned_input_power_w=row[22],
         sweep_direction=row[23],
+        zvs_dwell_fraction=row[24],
     )

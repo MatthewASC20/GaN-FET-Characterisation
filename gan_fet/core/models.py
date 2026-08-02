@@ -72,6 +72,10 @@ class RunRecord:
     #: not strictly single-valued; without it, path dependence is undetectable
     #: after the fact.
     sweep_direction: Optional[str] = None
+    #: Fraction of the cycle Vds spent below the ZVS threshold. Zero means
+    #: hard switching; ``None`` means the measurement was unavailable, which
+    #: is a different conclusion entirely.
+    zvs_dwell_fraction: Optional[float] = None
 
 
 @dataclass

@@ -38,6 +38,7 @@ class SimulatedRigPlant:
         tank_q: float = 8.0,
         resonant_peak_gain: float = 4.2,
         coss_shift_frac: float = 0.045,
+        zvs_onset_gain: float = 3.2,
     ):
         self.lock = threading.RLock()
         self.peak_gain = float(peak_gain)
@@ -55,6 +56,10 @@ class SimulatedRigPlant:
         self.tank_q = float(tank_q)
         self.resonant_peak_gain = float(resonant_peak_gain)
         self.coss_shift_frac = float(coss_shift_frac)
+        # Tank gain at which the drain first reaches zero before turn-on.
+        # Below it the dwell is exactly zero, which is what makes ZVS onset
+        # a crossing rather than a minimum.
+        self.zvs_onset_gain = float(zvs_onset_gain)
         # Latched when the gates are armed: a physical bank does not retune
         # itself mid-run, so a frequency sweep must see a fixed resonance.
         self.tank_nominal_hz: Optional[float] = None
@@ -69,6 +74,8 @@ class SimulatedRigPlant:
         self.wavegen_c1_on = False
         self.wavegen_c2_on = False
         self.wavegen_coupled = False
+        #: Last ZVS threshold written by the software, for assertions.
+        self.zvs_threshold_v: Optional[float] = None
 
     @property
     def bus_voltage_v(self) -> float:
@@ -200,6 +207,30 @@ class SimulatedRigPlant:
         conduction_factor = 0.32 + 0.0032 * duty_pct
         channel_sharing = 0.78 if self.wavegen_c2_on else 1.0
         return load_rms * conduction_factor * channel_sharing
+
+    def zvs_dwell_fraction(self) -> float:
+        """Fraction of the cycle Vds sits below the ZVS threshold.
+
+        Modelled from tank gain rather than from a waveform: below the ZVS
+        condition the tank cannot pull the drain to zero and the dwell is
+        exactly zero; past it the body diode holds the drain down and the
+        dwell widens with how hard the tank is driven.
+
+        The zero region is the point of the model. It is what makes onset a
+        threshold crossing rather than an extremum, and therefore what any
+        bisection search would rely on.
+        """
+        if not self.resonant_model or not self.gates_armed or not self.smu_output_on:
+            return 0.0
+        gain, _detuning = self._tank_state()
+        # Below this gain the tank cannot complete the transition in the
+        # available dead time, so Vds never reaches the threshold.
+        onset = self.zvs_onset_gain
+        if gain <= onset:
+            return 0.0
+        excess = (gain - onset) / max(1e-6, onset)
+        # Saturating: diode conduction cannot occupy the whole period.
+        return min(0.45, 0.55 * excess)
 
     def compliance_tripped(self) -> bool:
         return self.force_compliance or (
@@ -644,6 +675,21 @@ class MockScpiTcpClient:
             if upper.startswith("++"):
                 return
 
+            # The ZVS threshold is the one measurement setting the software
+            # writes. Recorded rather than acted on: the simulated dwell is
+            # derived from tank gain, not from thresholding a waveform.
+            if "ABSLEVEL" in upper:
+                # VBS assignment syntax (``AbsLevel = 10.0``) rather than the
+                # comma-separated SCPI form the shared parser expects.
+                match = re.search(
+                    r"AbsLevel\s*=\s*([-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?)",
+                    command,
+                    re.IGNORECASE,
+                )
+                if match is not None:
+                    plant.zvs_threshold_v = float(match.group(1))
+                return
+
             normalized_name = self.name.upper()
             is_smu = (
                 re.search(r"(?:K|KEITHLEY)24(?:00|10)", normalized_name)
@@ -728,7 +774,13 @@ class MockScpiTcpClient:
                 return f"{plant.dc_current_a():.9f}"
 
             # HDO4054 MAUI measurement slots configured by the bench setup:
-            # P1 = Vds peak, P2 = RMS current, P3 = switch-current RMS.
+            # P1 = Vds peak, P2 = RMS current, P3 = switch-current RMS,
+            # P4 = ZVS dwell. P4 is matched first: a "P4" query also contains
+            # no other slot name, but keeping the order explicit avoids any
+            # future substring collision.
+            if "P4" in upper:
+                # Reported as a percentage, matching MAUI's duty convention.
+                return f"{plant.zvs_dwell_fraction() * 100.0:.6f}"
             if "P1" in upper:
                 return f"{plant.vds_peak_v():.6f}"
             if "P2" in upper:
