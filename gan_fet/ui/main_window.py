@@ -37,6 +37,7 @@ from gan_fet.ui.run_request import (
     require_populated_options,
     tuning_candidate,
 )
+from gan_fet.ui.operations.worker_pool import WorkerPool
 from gan_fet.ui.panels.device_bar import DeviceBar
 from gan_fet.ui.panels.run_controls import RunControls
 from gan_fet.ui.panels.smu_panel import SmuPanel
@@ -199,8 +200,7 @@ class MainWindow(tk.Tk):
         self._closing = False
         self._resources_closed = False
         self.operations = OperationCoordinator()
-        self._worker_lock = threading.Lock()
-        self._workers: set[threading.Thread] = set()
+        self._worker_pool = WorkerPool()
         self._emergency_worker: Optional[threading.Thread] = None
         self._event_unsubscribers: list[Callable[[], None]] = []
 
@@ -896,40 +896,10 @@ class MainWindow(tk.Tk):
         self, target: Callable[[], None], *, name: str
     ) -> threading.Thread:
         """Start a tracked, non-daemon worker."""
-
-        def run() -> None:
-            try:
-                target()
-            finally:
-                with self._worker_lock:
-                    self._workers.discard(threading.current_thread())
-
-        thread = threading.Thread(target=run, daemon=False, name=name)
-        with self._worker_lock:
-            self._workers.add(thread)
-        thread.start()
-        return thread
+        return self._worker_pool.start(target, name=name)
 
     def _join_workers(self, timeout: float) -> bool:
-        deadline = time.monotonic() + timeout
-        current = threading.current_thread()
-        while True:
-            with self._worker_lock:
-                workers = [
-                    worker
-                    for worker in self._workers
-                    if worker is not current and worker.is_alive()
-                ]
-            if not workers:
-                return True
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                log.warning(
-                    "Timed out waiting for UI workers: %s",
-                    ", ".join(worker.name for worker in workers),
-                )
-                return False
-            workers[0].join(min(0.2, remaining))
+        return self._worker_pool.join_all(timeout)
 
     def _begin_operation(
         self, kind: str, *, show_busy: bool = True
