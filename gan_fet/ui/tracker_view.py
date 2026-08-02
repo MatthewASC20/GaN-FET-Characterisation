@@ -4,11 +4,57 @@ database (v1 scanned the CSV file tree)."""
 from __future__ import annotations
 
 import tkinter as tk
+import webbrowser
+from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Callable, List, Optional, Tuple
 
-from gan_fet.core.models import MatrixPoint, freq_label
+from gan_fet.core.models import MatrixPoint, RunRecord, freq_label
 from gan_fet.storage.db import Database
+
+
+def _sample_plot_axis(
+    samples: list[tuple],
+) -> tuple[list[float] | list[str], str]:
+    """Prefer lossless active elapsed time, falling back for legacy samples."""
+    elapsed_values: list[float] = []
+    for row in samples:
+        if len(row) <= 6 or row[6] is None:
+            break
+        elapsed_values.append(float(row[6]))
+    else:
+        if elapsed_values:
+            return elapsed_values, "Elapsed time (s)"
+
+    return [str(row[0]) for row in samples], "Timestamp"
+
+
+def format_run_details(run: RunRecord, sample_count: int) -> str:
+    """Format the stored procedure outcome for operator review."""
+    readings = run.readings
+
+    def value(number, unit: str, digits: int = 4) -> str:
+        return "—" if number is None else f"{number:.{digits}g} {unit}".strip()
+
+    return "\n".join(
+        (
+            run.point.describe(),
+            "",
+            f"Status: {run.status} (attempt {run.attempt_no})",
+            f"Samples: {sample_count}",
+            f"Started: {run.started_at or '—'}",
+            f"Completed: {run.completed_at or '—'}",
+            f"Bus voltage: {value(run.bus_voltage_v, 'V')}",
+            f"ZVS voltage: {value(run.v_zvs, 'V')}",
+            f"Vin: {value(readings.vin, 'V')}",
+            f"Iin: {value(readings.iin, 'A', 6)}",
+            f"Switching frequency: {value(readings.fsw_hz, 'Hz')}",
+            f"Irms: {value(readings.irms, 'A')}",
+            f"Vds peak: {value(readings.vds_pk, 'V')}",
+            f"Isw RMS: {value(readings.isw_rms, 'A')}",
+            f"Scope capture: {run.screenshot_path or '—'}",
+        )
+    )
 
 
 class TrackerView(tk.Frame):
@@ -23,6 +69,7 @@ class TrackerView(tk.Frame):
         voltages: List[Tuple[int, str]],
         configs: List[Tuple[str, str]],
         on_delete_run: Optional[Callable[[MatrixPoint], None]] = None,
+        can_delete_run: Optional[Callable[[], bool]] = None,
         **kwargs,
     ):
         super().__init__(master, **kwargs)
@@ -34,6 +81,7 @@ class TrackerView(tk.Frame):
         self.voltages = list(voltages)
         self.configs = list(configs)
         self.on_delete_run = on_delete_run
+        self.can_delete_run = can_delete_run or (lambda: True)
 
         self.selected_freq = tk.IntVar(
             value=self.frequencies[0][0] if self.frequencies else 0
@@ -148,9 +196,13 @@ class TrackerView(tk.Frame):
             self.frequencies = list(frequencies)
             values = [v for v, _ in self.frequencies]
             self.freq_dropdown["values"] = [label for _, label in self.frequencies]
-            if values and self.selected_freq.get() not in values:
-                self.selected_freq.set(values[0])
-                self.freq_dropdown.current(0)
+            if values:
+                if self.selected_freq.get() not in values:
+                    self.selected_freq.set(values[0])
+                    self.freq_dropdown.current(0)
+            else:
+                self.selected_freq.set(0)
+                self.freq_dropdown.set("")
         if duties is not None:
             self.duties = list(duties)
         if temperatures is not None:
@@ -170,9 +222,15 @@ class TrackerView(tk.Frame):
             return None
         config_label, duty_label, volt_label, _ = values
         try:
-            config_val = next(v for v, l in self.configs if l == config_label)
-            duty_val = next(v for v, l in self.duties if l == duty_label)
-            volt_val = next(v for v, l in self.voltages if l == volt_label)
+            config_val = next(
+                value for value, label in self.configs if label == config_label
+            )
+            duty_val = next(
+                value for value, label in self.duties if label == duty_label
+            )
+            volt_val = next(
+                value for value, label in self.voltages if label == volt_label
+            )
         except StopIteration:
             return None
         return MatrixPoint(
@@ -196,7 +254,17 @@ class TrackerView(tk.Frame):
 
         menu = tk.Menu(tree, tearoff=0)
         if run is not None:
+            menu.add_command(
+                label="View Run Details",
+                command=lambda: self._show_run_details(run.id),
+            )
             menu.add_command(label="Plot Experiment", command=lambda: self._plot_run(run.id))
+            if run.screenshot_path:
+                menu.add_command(
+                    label="View Scope Screenshot",
+                    command=lambda: self._open_screenshot(run.id),
+                )
+            menu.add_separator()
             menu.add_command(label="Delete Test", command=lambda: self._delete_run(point))
         else:
             menu.add_command(label="(no data)", state="disabled")
@@ -205,7 +273,55 @@ class TrackerView(tk.Frame):
         finally:
             menu.grab_release()
 
+    def _show_run_details(self, run_id: int) -> None:
+        run = self.db.get_run(run_id)
+        if run is None:
+            messagebox.showwarning(
+                "Run Details", "The selected run no longer exists.", parent=self
+            )
+            return
+        sample_count = len(self.db.samples_for_run(run_id))
+        messagebox.showinfo(
+            "Run Details",
+            format_run_details(run, sample_count),
+            parent=self,
+        )
+
+    def _open_screenshot(self, run_id: int) -> None:
+        run = self.db.get_run(run_id)
+        if run is None or not run.screenshot_path:
+            messagebox.showinfo(
+                "Scope Screenshot",
+                "This run has no stored scope screenshot.",
+                parent=self,
+            )
+            return
+        screenshot = Path(run.screenshot_path).expanduser()
+        if not screenshot.is_absolute():
+            screenshot = self.db.path.parent / screenshot
+        screenshot = screenshot.resolve()
+        if not screenshot.is_file():
+            messagebox.showwarning(
+                "Scope Screenshot",
+                f"The stored screenshot could not be found:\n{screenshot}",
+                parent=self,
+            )
+            return
+        if not webbrowser.open(screenshot.as_uri()):
+            messagebox.showinfo(
+                "Scope Screenshot",
+                f"Open this image manually:\n{screenshot}",
+                parent=self,
+            )
+
     def _delete_run(self, point: MatrixPoint) -> None:
+        if not self.can_delete_run():
+            messagebox.showwarning(
+                "Rig Busy",
+                "Stored runs cannot be deleted while a rig operation is active.",
+                parent=self,
+            )
+            return
         run = self.db.find_run(point)
         if run is None:
             return
@@ -229,16 +345,142 @@ class TrackerView(tk.Frame):
 
         import matplotlib.pyplot as plt
 
-        timestamps = [row[0] for row in samples]
-        currents = [row[1] for row in samples]
-        plt.figure(figsize=(8, 5))
-        plt.plot(timestamps, currents)
-        plt.title(run.point.describe() if run else f"Run {run_id}")
-        plt.xlabel("Timestamp")
-        plt.ylabel("Current (A)")
-        step = max(1, len(timestamps) // 8)
-        plt.xticks(range(0, len(timestamps), step),
-                   [timestamps[i] for i in range(0, len(timestamps), step)],
-                   rotation=45)
-        plt.tight_layout()
+        x_values, x_label = _sample_plot_axis(samples)
+        figure, current_axis = plt.subplots(figsize=(9, 5.5))
+        voltage_axis = current_axis.twinx()
+        plotted = []
+        for axis, label, index, colour in (
+            (current_axis, "DC current", 1, "#1565c0"),
+            (current_axis, "RMS current", 4, "#00897b"),
+            (current_axis, "Switch RMS", 5, "#8e24aa"),
+            (voltage_axis, "SMU voltage", 2, "#ef6c00"),
+            (voltage_axis, "DC voltage", 3, "#c62828"),
+        ):
+            values = [row[index] for row in samples]
+            if any(value is not None for value in values):
+                (line,) = axis.plot(
+                    x_values,
+                    values,
+                    label=label,
+                    color=colour,
+                    linewidth=1.6,
+                )
+                plotted.append(line)
+        current_axis.set_title(run.point.describe() if run else f"Run {run_id}")
+        current_axis.set_xlabel(x_label)
+        current_axis.set_ylabel("Current (A)")
+        voltage_axis.set_ylabel("Voltage (V)")
+        current_axis.grid(True, alpha=0.3)
+        if plotted:
+            current_axis.legend(
+                plotted,
+                [str(line.get_label()) for line in plotted],
+                loc="best",
+            )
+        if x_label == "Timestamp":
+            step = max(1, len(x_values) // 8)
+            positions = range(0, len(x_values), step)
+            current_axis.set_xticks(
+                positions,
+                [str(x_values[i]) for i in positions],
+                rotation=45,
+            )
+        figure.tight_layout()
         plt.show()
+
+
+class UpNextView(ttk.LabelFrame):
+    """Widget displaying the next 5 tests that will run when auto sequence is enabled."""
+
+    def __init__(
+        self,
+        master,
+        db: Database,
+        get_device_name: Callable[[], str],
+        get_current_params: Callable[[], Optional[Tuple[int, list, list, list, list]]],
+        **kwargs,
+    ):
+        super().__init__(master, text="Auto Testing Queue (Next 5 Tests)", **kwargs)
+        self.db = db
+        self.get_device_name = get_device_name
+        self.get_current_params = get_current_params
+
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        self.status_lbl = ttk.Label(
+            self,
+            text="Next test points scheduled for execution if auto sequence is enabled:",
+            font=("TkDefaultFont", 9, "italic"),
+        )
+        self.status_lbl.pack(anchor="w", padx=10, pady=(5, 2))
+
+        table_frame = ttk.Frame(self)
+        table_frame.pack(fill="both", expand=True, padx=10, pady=(0, 5))
+
+        columns = ("step", "temp", "config", "freq", "duty", "voltage")
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=5)
+
+        self.tree.heading("step", text="#")
+        self.tree.heading("temp", text="Temp (°C)")
+        self.tree.heading("config", text="Configuration")
+        self.tree.heading("freq", text="Frequency")
+        self.tree.heading("duty", text="Duty (%)")
+        self.tree.heading("voltage", text="Voltage (V)")
+
+        self.tree.column("step", width=50, anchor="center")
+        self.tree.column("temp", width=90, anchor="center")
+        self.tree.column("config", width=160, anchor="w")
+        self.tree.column("freq", width=100, anchor="center")
+        self.tree.column("duty", width=80, anchor="center")
+        self.tree.column("voltage", width=90, anchor="center")
+
+        self.tree.pack(side="left", fill="both", expand=True)
+
+    def refresh(self) -> None:
+        device = self.get_device_name().strip()
+        params = self.get_current_params()
+        self.tree.delete(*self.tree.get_children())
+
+        if not device or not params:
+            self.status_lbl.config(text="Select a device to view scheduled tests.")
+            return
+
+        frequency_hz, configs, duties, voltages, temps = params
+        from gan_fet.core.sequence import build_plan
+
+        plan = build_plan(
+            db=self.db,
+            device_name=device,
+            frequency_hz=frequency_hz,
+            configs=configs,
+            duties=duties,
+            voltages=voltages,
+            temperatures=temps,
+        )
+
+        if not plan:
+            self.status_lbl.config(
+                text=f"All tests complete for {device} at {freq_label(frequency_hz)}! (0 pending)"
+            )
+            return
+
+        total_pending = len(plan)
+        next_5 = plan[:5]
+        self.status_lbl.config(
+            text=f"Next {len(next_5)} test(s) to execute ({total_pending} total pending for {device} @ {freq_label(frequency_hz)}):"
+        )
+
+        for idx, pt in enumerate(next_5, start=1):
+            self.tree.insert(
+                "",
+                "end",
+                values=(
+                    f"#{idx}",
+                    f"{pt.temperature_c} °C",
+                    pt.config,
+                    freq_label(pt.frequency_hz),
+                    f"{pt.duty_pct} %",
+                    f"{pt.voltage_v} V",
+                ),
+            )

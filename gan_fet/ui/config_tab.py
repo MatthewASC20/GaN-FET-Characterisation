@@ -1,15 +1,85 @@
-"""Configuration tab: parameter option editors, instrument addresses and
-SMU/safety limits."""
+"""Configuration tab: parameter option editors, instrument addresses,
+and SMU/safety limits."""
 
 from __future__ import annotations
 
-import functools
+import math
 import tkinter as tk
 from tkinter import messagebox, ttk
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from gan_fet.core import param_options
-from gan_fet.settings import Settings
+from gan_fet.settings import (
+    SCOPE_INSTRUMENT_KEY,
+    InstrumentAddress,
+    Settings,
+)
+from gan_fet.transport.address import AddressError, parse_address
+
+
+def options_without_indices(
+    options: List[Tuple[Any, str]], selected_indices: Iterable[int]
+) -> List[Tuple[Any, str]]:
+    """Return ``options`` with every selected listbox row removed."""
+
+    selected = {int(index) for index in selected_indices}
+    return [option for index, option in enumerate(options) if index not in selected]
+
+
+def validate_instrument_target(target_raw: str, port_raw: str) -> tuple[str, int]:
+    """Validate the persisted transport-neutral target and port/baud pair."""
+
+    target = target_raw.strip()
+    if not target:
+        raise ValueError("target/resource is required")
+    try:
+        port = int(port_raw.strip(), 10)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("port/baud must be an integer") from exc
+
+    is_uri = "://" in target
+    is_visa = target.upper().startswith("GPIB") or "::" in target
+    is_serial = target.upper().startswith("COM") or target.startswith("/")
+    if is_uri or is_visa:
+        valid_port = 0 <= port <= 4_000_000
+        range_text = "between 0 and 4000000"
+    elif is_serial:
+        valid_port = 0 < port <= 4_000_000
+        range_text = "between 1 and 4000000"
+    else:
+        valid_port = 0 < port <= 65_535
+        range_text = "between 1 and 65535"
+    if not valid_port:
+        raise ValueError(f"port/baud must be {range_text} for {target!r}")
+    try:
+        parse_address(target, port)
+    except AddressError as exc:
+        raise ValueError(str(exc)) from exc
+    return target, port
+
+
+def validate_optional_prologix_address(raw: str, smu_target: str) -> Optional[int]:
+    """Parse the legacy bridge address, rejecting modes that already own it."""
+
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    target = smu_target.strip()
+    if "://" in target:
+        raise ValueError(
+            "leave Prologix address blank for explicit transport URIs; "
+            "put addr= in a prologix+ URI instead"
+        )
+    if target.upper().startswith("GPIB") or "::" in target:
+        raise ValueError(
+            "leave Prologix address blank for direct VISA resources"
+        )
+    try:
+        address = int(cleaned, 10)
+    except ValueError as exc:
+        raise ValueError("Prologix GPIB address must be blank or an integer") from exc
+    if not 0 <= address <= 30:
+        raise ValueError("Prologix GPIB address must be between 0 and 30")
+    return address
 
 
 class ParameterListEditor(ttk.LabelFrame):
@@ -37,61 +107,76 @@ class ParameterListEditor(ttk.LabelFrame):
         self.set_options(initial_options)
 
     def _build_widgets(self) -> None:
-        self.tree = ttk.Treeview(self, columns=("value",), show="headings", height=6)
-        self.tree.heading("value", text="Value")
-        self.tree.column("value", anchor="center", width=160)
-        self.tree.grid(row=0, column=0, columnspan=3, sticky="nsew", padx=5, pady=5)
-        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        list_frame = ttk.Frame(self)
+        list_frame.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=5, pady=(5, 2))
 
-        ttk.Label(self, text="Value").grid(row=1, column=0, sticky="w", padx=5)
-        self.value_entry = ttk.Entry(self)
-        self.value_entry.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=(0, 5))
+        self.listbox = tk.Listbox(
+            list_frame,
+            height=4,
+            exportselection=False,
+            selectmode=tk.EXTENDED,
+            font=("Consolas", 10),
+        )
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=scrollbar.set)
 
-        ttk.Button(self, text="Add / Update", command=self._add_or_update).grid(
-            row=2, column=2, sticky="ew", padx=5, pady=(0, 5))
-        ttk.Button(self, text="Delete Selected", command=self._delete).grid(
-            row=3, column=0, sticky="ew", padx=5, pady=(0, 5))
-        ttk.Button(self, text="Reset to Defaults", command=self._reset).grid(
-            row=3, column=1, sticky="ew", padx=5, pady=(0, 5))
-        ttk.Button(self, text="Clear Field",
-                   command=lambda: self.value_entry.delete(0, tk.END)).grid(
-            row=3, column=2, sticky="ew", padx=5, pady=(0, 5))
+        self.listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.listbox.bind("<<ListboxSelect>>", self._on_select)
+        self.listbox.bind("<Delete>", lambda _e: self._delete())
 
-        for col in range(3):
-            self.grid_columnconfigure(col, weight=1 if col < 2 else 0)
+        entry_frame = ttk.Frame(self)
+        entry_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=2)
+
+        self.value_entry = ttk.Entry(entry_frame)
+        self.value_entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.value_entry.bind("<Return>", lambda _e: self._add_or_update())
+
+        ttk.Button(entry_frame, text="+ Add", width=7, command=self._add_or_update).pack(side="right")
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=(2, 5))
+
+        ttk.Button(btn_frame, text="Delete Selected", command=self._delete).pack(side="left", fill="x", expand=True, padx=(0, 2))
+        ttk.Button(btn_frame, text="Reset Defaults", command=self._reset).pack(side="right", fill="x", expand=True, padx=(2, 0))
+
+        self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
     def set_options(self, options: List[Tuple[Any, str]]) -> None:
         self.options = list(options)
-        self.tree.delete(*self.tree.get_children())
+        self.listbox.delete(0, tk.END)
         for value, _label in self.options:
-            self.tree.insert("", "end", values=(value,))
+            self.listbox.insert(tk.END, str(value))
         self.value_entry.delete(0, tk.END)
 
     def _add_or_update(self) -> None:
         raw = self.value_entry.get().strip()
         if not raw:
-            messagebox.showerror("Input Error", "Please provide a value.")
+            messagebox.showerror("Input Error", "Please provide a value.", parent=self)
             return
         try:
             value = self.value_parser(raw)
         except Exception:
-            messagebox.showerror("Input Error", f"Invalid value: {raw}")
+            messagebox.showerror("Input Error", f"Invalid value: {raw}", parent=self)
             return
         label = str(self.default_label_factory(value))
 
-        merged = [(v, l) for v, l in self.options if v != value] + [(value, label)]
+        merged = [
+            (option_value, option_label)
+            for option_value, option_label in self.options
+            if option_value != value
+        ] + [(value, label)]
         normalized = self.on_change(merged)
         if normalized is not None:
             self.set_options(normalized)
 
     def _delete(self) -> None:
-        selected = self.tree.selection()
-        if not selected:
-            messagebox.showerror("Selection Error", "Please select an entry to delete.")
+        selection = self.listbox.curselection()
+        if not selection:
+            messagebox.showerror("Selection Error", "Please select an entry to delete.", parent=self)
             return
-        selected_values = {self.tree.item(item, "values")[0] for item in selected}
-        remaining = [(v, l) for v, l in self.options if str(v) not in selected_values]
+        remaining = options_without_indices(self.options, selection)
         normalized = self.on_change(remaining)
         if normalized is not None:
             self.set_options(normalized)
@@ -102,76 +187,190 @@ class ParameterListEditor(ttk.LabelFrame):
             self.set_options(normalized)
 
     def _on_select(self, _event) -> None:
-        selection = self.tree.selection()
+        selection = self.listbox.curselection()
         if not selection:
             return
-        (value,) = self.tree.item(selection[0], "values")
+        value = self.options[selection[0]][0]
         self.value_entry.delete(0, tk.END)
-        self.value_entry.insert(0, value)
+        self.value_entry.insert(0, str(value))
 
 
-class InstrumentConfigEditor(ttk.LabelFrame):
-    """IP/port per instrument, applied to Settings (and saved)."""
+class InstrumentConfigEditor(ttk.Frame):
+    """Transport-neutral instrument targets plus optional Prologix framing."""
 
     def __init__(self, master, settings: Settings, on_applied: Callable[[], None]):
-        super().__init__(master, text="Instrument Connections")
+        super().__init__(master)
         self.settings = settings
         self.on_applied = on_applied
-        self.entries: Dict[str, Dict[str, ttk.Entry]] = {}
+        self.instrument_entries: Dict[str, Dict[str, ttk.Entry]] = {}
         self._build()
 
     def _build(self) -> None:
-        ttk.Label(self, text="Instrument").grid(row=0, column=0, padx=5, pady=(5, 2), sticky="w")
-        ttk.Label(self, text="IP Address").grid(row=0, column=1, padx=5, pady=(5, 2), sticky="w")
-        ttk.Label(self, text="Port").grid(row=0, column=2, padx=5, pady=(5, 2), sticky="w")
+        connections = ttk.LabelFrame(self, text="Instrument Connections")
+        connections.pack(fill="x", expand=True, padx=2, pady=(0, 6))
 
-        for row, (name, addr) in enumerate(self.settings.instruments.items(), start=1):
-            ttk.Label(self, text=name).grid(row=row, column=0, padx=5, pady=2, sticky="w")
-            ip_entry = ttk.Entry(self)
-            ip_entry.insert(0, addr.ip)
-            ip_entry.grid(row=row, column=1, padx=5, pady=2, sticky="ew")
-            port_entry = ttk.Entry(self, width=8)
+        ttk.Label(
+            connections, text="Instrument", font=("Helvetica", 9, "bold")
+        ).grid(
+            row=0, column=0, padx=5, pady=(5, 2), sticky="w"
+        )
+        ttk.Label(
+            connections, text="Target / Resource", font=("Helvetica", 9, "bold")
+        ).grid(
+            row=0, column=1, padx=5, pady=(5, 2), sticky="w"
+        )
+        ttk.Label(
+            connections, text="Port / Baud", font=("Helvetica", 9, "bold")
+        ).grid(
+            row=0, column=2, padx=5, pady=(5, 2), sticky="w"
+        )
+
+        scope_address = self.settings.instruments.get(SCOPE_INSTRUMENT_KEY)
+        if scope_address is None:
+            raise ValueError(
+                "No address is configured for the Teledyne LeCroy HDO4054"
+            )
+        rows = [
+            (
+                SCOPE_INSTRUMENT_KEY,
+                "Teledyne LeCroy HDO4054",
+                scope_address,
+            ),
+            *(
+                (name, name, address)
+                for name, address in self.settings.instruments.items()
+                if name != SCOPE_INSTRUMENT_KEY
+            ),
+        ]
+        for row, (name, label, addr) in enumerate(rows, start=1):
+            ttk.Label(connections, text=label).grid(
+                row=row, column=0, padx=5, pady=2, sticky="w"
+            )
+            target_entry = ttk.Entry(connections)
+            target_entry.insert(0, addr.ip)
+            target_entry.grid(row=row, column=1, padx=5, pady=2, sticky="ew")
+            port_entry = ttk.Entry(connections, width=10)
             port_entry.insert(0, str(addr.port))
             port_entry.grid(row=row, column=2, padx=5, pady=2, sticky="ew")
-            self.entries[name] = {"ip": ip_entry, "port": port_entry}
+            self.instrument_entries[name] = {
+                "target": target_entry,
+                "port": port_entry,
+            }
 
-        ttk.Button(self, text="Apply Changes", command=self._apply).grid(
-            row=len(self.entries) + 1, column=0, columnspan=3,
-            padx=5, pady=(10, 5), sticky="ew",
+        help_row = len(self.instrument_entries) + 1
+        ttk.Label(
+            connections,
+            text=(
+                "Targets may be hostnames/IPs, VISA resources, serial devices, or "
+                "tcp://, visa://, serial:// and prologix+ transport URIs. The "
+                "HDO4054 requires an LXI/VXI-11 VISA resource with port 0."
+            ),
+            wraplength=540,
+            justify="left",
+        ).grid(
+            row=help_row,
+            column=0,
+            columnspan=3,
+            padx=5,
+            pady=(4, 6),
+            sticky="w",
         )
-        self.grid_columnconfigure(1, weight=1)
+        connections.grid_columnconfigure(1, weight=1)
+
+        bridge = ttk.LabelFrame(self, text="Optional K2410 Prologix Framing")
+        bridge.pack(fill="x", expand=True, padx=2, pady=(0, 6))
+        ttk.Label(bridge, text="GPIB address:").grid(
+            row=0, column=0, padx=5, pady=5, sticky="w"
+        )
+        self.prologix_addr_entry = ttk.Entry(bridge, width=10)
+        prologix = self.settings.smu.prologix_gpib_addr
+        self.prologix_addr_entry.insert(0, "" if prologix is None else str(prologix))
+        self.prologix_addr_entry.grid(
+            row=0, column=1, padx=5, pady=5, sticky="w"
+        )
+        ttk.Label(
+            bridge,
+            text=(
+                "Leave blank for direct VISA, transparent TCP/serial SCPI, or an "
+                "explicit URI. Set 0–30 only for a legacy Prologix bridge target."
+            ),
+            wraplength=430,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=2, padx=5, pady=(0, 5), sticky="w")
+        bridge.grid_columnconfigure(1, weight=1)
+
+        ttk.Button(self, text="Apply Instrument Changes", command=self._apply).pack(
+            fill="x", padx=2, pady=5
+        )
 
     def _apply(self) -> None:
-        for name, fields in self.entries.items():
-            ip = fields["ip"].get().strip()
-            if not ip:
-                messagebox.showerror("Validation Error", f"IP address is required for {name}.")
-                return
+        edited_addresses: Dict[str, InstrumentAddress] = {}
+        for name, fields in self.instrument_entries.items():
             try:
-                port = int(fields["port"].get().strip(), 10)
-            except ValueError:
-                messagebox.showerror("Validation Error", f"Port must be a number for {name}.")
+                target, port = validate_instrument_target(
+                    fields["target"].get(), fields["port"].get()
+                )
+            except ValueError as exc:
+                messagebox.showerror(
+                    "Validation Error", f"{name}: {exc}", parent=self
+                )
                 return
-            if not (0 < port <= 65535):
-                messagebox.showerror("Validation Error", f"Port out of range for {name}.")
-                return
-            self.settings.instruments[name].ip = ip
-            self.settings.instruments[name].port = port
-        self.settings.save()
+            edited_addresses[name] = InstrumentAddress(target, port)
+
+        pending = edited_addresses
+
+        smu_address = pending.get("K2410")
+        if smu_address is None:
+            smu_address = next(
+                (
+                    address
+                    for name, address in pending.items()
+                    if name.upper().startswith("K24")
+                    or "KEITHLEY" in name.upper()
+                    or "SMU" in name.upper()
+                ),
+                None,
+            )
+        try:
+            prologix_addr = validate_optional_prologix_address(
+                self.prologix_addr_entry.get(),
+                smu_address.ip if smu_address is not None else "",
+            )
+        except ValueError as exc:
+            messagebox.showerror("Validation Error", str(exc), parent=self)
+            return
+
+        previous_instruments = self.settings.instruments
+        previous_prologix = self.settings.smu.prologix_gpib_addr
+        self.settings.instruments = pending
+        self.settings.smu.prologix_gpib_addr = prologix_addr
+        try:
+            self.settings.save()
+        except Exception as exc:
+            self.settings.instruments = previous_instruments
+            self.settings.smu.prologix_gpib_addr = previous_prologix
+            messagebox.showerror(
+                "Save Error", f"Could not save instrument settings: {exc}", parent=self
+            )
+            return
+
         self.on_applied()
+        messagebox.showinfo(
+            "Instrument Settings",
+            "Connection changes were saved and will take effect after restarting the application.",
+            parent=self,
+        )
 
 
 class SmuLimitsEditor(ttk.LabelFrame):
     """SMU envelope + safety limits. Numeric fields mapped onto Settings."""
 
-    FIELDS = [
+    FIELDS: list[tuple[str, str, str, Callable[[str], float]]] = [
         ("SMU max voltage (V)", "smu", "max_voltage_v", float),
         ("Current compliance (A)", "smu", "current_compliance_a", float),
         ("NPLC", "smu", "nplc", float),
         ("Sample interval (s)", "smu", "sample_interval_s", float),
         ("Ramp step (V)", "smu", "ramp_step_v", float),
-        ("Ramp delay (s)", "smu", "ramp_delay_s", float),
-        ("Prologix GPIB addr (blank = transparent bridge)", "smu", "prologix_gpib_addr", "int_or_none"),
         ("ZVS search window (± V)", "zvs", "window_v", float),
         ("ZVS step (V)", "zvs", "step_v", float),
         ("Max DC current (A)", "safety", "max_dc_current_a", float),
@@ -180,10 +379,12 @@ class SmuLimitsEditor(ttk.LabelFrame):
     ]
 
     def __init__(self, master, settings: Settings, on_applied: Callable[[], None]):
-        super().__init__(master, text="SMU / Safety Limits")
+        super().__init__(master, text="SMU & Safety Limits")
         self.settings = settings
         self.on_applied = on_applied
-        self.entries: list[tuple[ttk.Entry, str, str, Any]] = []
+        self.entries: list[
+            tuple[ttk.Entry, str, str, Callable[[str], float]]
+        ] = []
 
         for row, (label, section, attr, cast) in enumerate(self.FIELDS):
             ttk.Label(self, text=label).grid(row=row, column=0, padx=5, pady=2, sticky="w")
@@ -193,99 +394,203 @@ class SmuLimitsEditor(ttk.LabelFrame):
             entry.grid(row=row, column=1, padx=5, pady=2, sticky="ew")
             self.entries.append((entry, section, attr, cast))
 
-        ttk.Button(self, text="Apply Changes", command=self._apply).grid(
-            row=len(self.FIELDS), column=0, columnspan=2, padx=5, pady=(10, 5), sticky="ew",
+        ttk.Button(self, text="Apply Limit Changes", command=self._apply).grid(
+            row=len(self.FIELDS), column=0, columnspan=2, padx=5, pady=(8, 5), sticky="ew",
         )
         self.grid_columnconfigure(1, weight=1)
 
     def _apply(self) -> None:
+        pending: list[tuple[str, str, Any]] = []
         for entry, section, attr, cast in self.entries:
             raw = entry.get().strip()
             try:
-                if cast == "int_or_none":
-                    value = int(raw) if raw else None
-                else:
-                    value = cast(raw)
-            except ValueError:
-                messagebox.showerror("Validation Error", f"Invalid value for {attr}: {raw!r}")
+                value = cast(raw)
+            except (TypeError, ValueError):
+                messagebox.showerror("Validation Error", f"Invalid value for {attr}: {raw!r}", parent=self)
                 return
+            if not math.isfinite(value) or value <= 0:
+                messagebox.showerror(
+                    "Validation Error",
+                    f"{attr} must be a finite, positive number.",
+                    parent=self,
+                )
+                return
+            pending.append((section, attr, value))
+
+        for section, attr, value in pending:
             setattr(getattr(self.settings, section), attr, value)
-        self.settings.save()
+        try:
+            self.settings.save()
+        except Exception as exc:
+            messagebox.showerror(
+                "Save Error", f"Could not save limit settings: {exc}", parent=self
+            )
+            return
         self.on_applied()
 
 
-EDITOR_TITLES = {
-    "configurations": "Configurations",
-    "frequencies": "Frequencies (Hz)",
-    "duties": "Duty Cycles (%)",
-    "temperatures": "Temperatures (°C)",
-    "voltages": "Voltages (V)",
-}
+class RampRatesSliderEditor(ttk.LabelFrame):
+    """Stage ramp-rate changes and persist them with one explicit Apply."""
 
+    VOLTAGE_RANGE = (1.0, 200.0)
+    FREQUENCY_RANGE = (10.0, 2000.0)
+    DUTY_RANGE = (1.0, 100.0)
 
-class ConfigurationTab(ttk.Frame):
-    """The whole Configuration tab: one option editor per parameter key plus
-    the global instrument/limit editors."""
+    def __init__(self, master, settings: Settings, on_applied: Callable[[], None]):
+        super().__init__(master, text="Autotune & Ramp Speed Sliders")
+        self.settings = settings
+        self.on_applied = on_applied
+        self._dirty = False
 
-    def __init__(
-        self,
-        master: tk.Misc,
-        *,
-        settings: Settings,
-        options: Mapping[str, Sequence[param_options.Option]],
-        defaults: Mapping[str, Sequence[param_options.Option]],
-        on_options_changed: Callable[
-            [str, List[param_options.Option]], Optional[List[param_options.Option]]
-        ],
-        on_settings_applied: Callable[[], None],
-    ):
-        super().__init__(master)
-        self.editors: Dict[str, ParameterListEditor] = {}
+        # Voltage Ramp Rate (V/s)
+        ttk.Label(self, text="DC Voltage Ramp Rate (V/s):").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        current_v_rate = getattr(self.settings.smu, "ramp_rate_v_s", 25.0)
+        self.v_rate_var = tk.DoubleVar(value=current_v_rate)
+        self.v_label = ttk.Label(self, text=f"{current_v_rate:.1f} V/s", width=12)
+        self.v_label.grid(row=0, column=2, padx=5, pady=5)
 
-        ttk.Label(
+        self.v_slider = ttk.Scale(
             self,
-            text=(
-                "Per-device parameter options (stored in the database) and global "
-                "instrument/safety settings (stored in settings.json)."
-            ),
-            wraplength=800,
-            justify="left",
-        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 5))
-
-        editors_frame = ttk.Frame(self)
-        editors_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
-        for col in range(2):
-            editors_frame.grid_columnconfigure(col, weight=1, uniform="cfg")
-
-        for idx, key in enumerate(param_options.OPTION_KEYS):
-            editor = ParameterListEditor(
-                editors_frame,
-                EDITOR_TITLES[key],
-                list(options[key]),
-                on_change=functools.partial(self._changed, key, on_options_changed),
-                value_parser=functools.partial(param_options.parse_value, key),
-                default_label_factory=functools.partial(param_options.default_label, key),
-                default_options=list(defaults[key]),
-            )
-            editor.grid(row=idx // 2, column=idx % 2, sticky="nsew", padx=10, pady=10)
-            self.editors[key] = editor
-
-        side = ttk.Frame(self)
-        side.grid(row=1, column=1, sticky="nsew", padx=10, pady=(0, 10))
-        InstrumentConfigEditor(side, settings, on_settings_applied).pack(
-            fill="x", pady=(0, 10)
+            from_=self.VOLTAGE_RANGE[0],
+            to=self.VOLTAGE_RANGE[1],
+            variable=self.v_rate_var,
+            orient="horizontal",
+            command=self._on_v_slider,
         )
-        SmuLimitsEditor(side, settings, on_settings_applied).pack(fill="x")
+        self.v_slider.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
 
-        self.grid_columnconfigure(0, weight=3)
+        # Frequency Autotune Ramp Rate (kHz/s)
+        ttk.Label(self, text="Frequency Autotune Rate (kHz/s):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        current_freq_rate = getattr(self.settings.zvs, "autotune_freq_rate_khz_s", 200.0)
+        self.freq_rate_var = tk.DoubleVar(value=current_freq_rate)
+        self.freq_label = ttk.Label(self, text=f"{current_freq_rate:.0f} kHz/s", width=12)
+        self.freq_label.grid(row=1, column=2, padx=5, pady=5)
+
+        self.freq_slider = ttk.Scale(
+            self,
+            from_=self.FREQUENCY_RANGE[0],
+            to=self.FREQUENCY_RANGE[1],
+            variable=self.freq_rate_var,
+            orient="horizontal",
+            command=self._on_freq_slider,
+        )
+        self.freq_slider.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
+
+        # Duty Cycle Ramp Rate (%/s)
+        ttk.Label(self, text="Duty Cycle Ramp Rate (%/s):").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        current_duty_rate = getattr(
+            self.settings.wavegen, "duty_ramp_rate_pct_s", 10.0
+        )
+        self.duty_rate_var = tk.DoubleVar(value=current_duty_rate)
+        self.duty_label = ttk.Label(self, text=f"{current_duty_rate:.1f} %/s", width=12)
+        self.duty_label.grid(row=2, column=2, padx=5, pady=5)
+
+        self.duty_slider = ttk.Scale(
+            self,
+            from_=self.DUTY_RANGE[0],
+            to=self.DUTY_RANGE[1],
+            variable=self.duty_rate_var,
+            orient="horizontal",
+            command=self._on_duty_slider,
+        )
+        self.duty_slider.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
+
+        self.apply_button = ttk.Button(
+            self,
+            text="Apply Ramp Rates",
+            command=self._apply,
+            state="disabled",
+        )
+        self.apply_button.grid(
+            row=3, column=0, columnspan=3, sticky="ew", padx=5, pady=(6, 5)
+        )
+
         self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(1, weight=1)
 
-    @staticmethod
-    def _changed(key, handler, options):
-        return handler(key, list(options))
+    @classmethod
+    def normalize_rates(
+        cls, voltage_v_s: Any, frequency_khz_s: Any, duty_pct_s: Any
+    ) -> tuple[float, float, float]:
+        """Validate and round one staged slider selection."""
 
-    def set_options(self, options: Mapping[str, Sequence[param_options.Option]]) -> None:
-        for key, editor in self.editors.items():
-            if key in options:
-                editor.set_options(list(options[key]))
+        values = (
+            (float(voltage_v_s), cls.VOLTAGE_RANGE, 1, "voltage ramp rate"),
+            (float(frequency_khz_s), cls.FREQUENCY_RANGE, 0, "frequency ramp rate"),
+            (float(duty_pct_s), cls.DUTY_RANGE, 1, "duty ramp rate"),
+        )
+        normalized: list[float] = []
+        for value, (minimum, maximum), digits, label in values:
+            if not math.isfinite(value) or not minimum <= value <= maximum:
+                raise ValueError(
+                    f"{label} must be between {minimum:g} and {maximum:g}"
+                )
+            normalized.append(float(round(value, digits)))
+        return normalized[0], normalized[1], normalized[2]
+
+    def _mark_dirty(self) -> None:
+        self._dirty = True
+        if hasattr(self, "apply_button"):
+            self.apply_button.config(state="normal")
+
+    def _on_v_slider(self, val: str) -> None:
+        try:
+            v = float(val)
+            self.v_label.config(text=f"{v:.1f} V/s")
+        except ValueError:
+            return
+        self._mark_dirty()
+
+    def _on_freq_slider(self, val: str) -> None:
+        try:
+            f = float(val)
+            self.freq_label.config(text=f"{f:.0f} kHz/s")
+        except ValueError:
+            return
+        self._mark_dirty()
+
+    def _on_duty_slider(self, val: str) -> None:
+        try:
+            d = float(val)
+            self.duty_label.config(text=f"{d:.1f} %/s")
+        except ValueError:
+            return
+        self._mark_dirty()
+
+    def _apply(self) -> None:
+        try:
+            voltage, frequency, duty = self.normalize_rates(
+                self.v_rate_var.get(),
+                self.freq_rate_var.get(),
+                self.duty_rate_var.get(),
+            )
+        except (TypeError, ValueError, tk.TclError) as exc:
+            messagebox.showerror(
+                "Validation Error", f"Could not apply ramp rates: {exc}", parent=self
+            )
+            return
+
+        updates = [
+            (self.settings.smu, "ramp_rate_v_s", voltage),
+            (self.settings.zvs, "autotune_freq_rate_khz_s", frequency),
+            (self.settings.wavegen, "freq_ramp_rate_khz_s", frequency),
+            (self.settings.wavegen, "duty_ramp_rate_pct_s", duty),
+        ]
+        if hasattr(self.settings.zvs, "duty_ramp_rate_pct_s"):
+            updates.append((self.settings.zvs, "duty_ramp_rate_pct_s", duty))
+
+        previous = [(section, attr, getattr(section, attr)) for section, attr, _ in updates]
+        for section, attr, value in updates:
+            setattr(section, attr, value)
+        try:
+            self.settings.save()
+        except Exception as exc:
+            for section, attr, value in previous:
+                setattr(section, attr, value)
+            messagebox.showerror(
+                "Save Error", f"Could not save ramp-rate settings: {exc}", parent=self
+            )
+            return
+
+        self._dirty = False
+        self.apply_button.config(state="disabled")
+        self.on_applied()

@@ -8,11 +8,16 @@ platforms where colours work natively.
 from __future__ import annotations
 
 import logging
+import math
+import queue
+import threading
+import time
 import tkinter as tk
+from concurrent.futures import Future, TimeoutError as FutureTimeout
+from dataclasses import dataclass, field
+from functools import partial
 from tkinter import ttk
-from typing import Any, Callable, Dict, List, Optional, Tuple
-
-log = logging.getLogger(__name__)
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 try:
     from tkmacosx import Button as _ColorButtonBase  # type: ignore
@@ -20,6 +25,246 @@ try:
 except ImportError:
     _ColorButtonBase = tk.Button
     _HAVE_TKMACOSX = False
+
+
+log = logging.getLogger(__name__)
+
+
+class UiDispatcherClosed(RuntimeError):
+    """Raised when work is submitted after the Tk dispatcher has closed."""
+
+
+class UiDispatcher:
+    """Thread-safe queue drained exclusively by the Tk owner thread.
+
+    Worker threads only touch the Python queue; they never invoke ``after`` or
+    any other Tcl command themselves.
+    """
+
+    def __init__(self, root: tk.Misc, *, poll_ms: int = 20, max_batch: int = 200):
+        self.root = root
+        self.poll_ms = poll_ms
+        self.max_batch = max_batch
+        self._owner_ident = threading.get_ident()
+        self._queue: "queue.Queue[tuple[Callable[..., Any], tuple, dict, Future[Any]]]" = (
+            queue.Queue()
+        )
+        self._closed = threading.Event()
+        self._after_id: Optional[str] = self.root.after(self.poll_ms, self._drain)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed.is_set()
+
+    def post(self, func: Callable[..., Any], *args, **kwargs) -> Future[Any]:
+        future: Future[Any] = Future()
+        if self.closed:
+            future.set_exception(UiDispatcherClosed("UI dispatcher is closed"))
+            return future
+        if threading.get_ident() == self._owner_ident:
+            self._execute(func, args, kwargs, future)
+        else:
+            self._queue.put((func, args, kwargs, future))
+        return future
+
+    def call(
+        self,
+        func: Callable[[], Any],
+        *,
+        timeout: Optional[float] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Any:
+        """Run ``func`` on Tk and block until the operator/UI resolves it."""
+        if threading.get_ident() == self._owner_ident:
+            return func()
+        future = self.post(func)
+        started = time.monotonic()
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                future.cancel()
+                return None
+            if self.closed:
+                future.cancel()
+                return None
+            remaining = None
+            if timeout is not None:
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    future.cancel()
+                    return None
+            try:
+                return future.result(timeout=min(0.1, remaining) if remaining else 0.1)
+            except FutureTimeout:
+                continue
+
+    def _execute(self, func, args, kwargs, future: Future[Any]) -> None:
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            future.set_result(func(*args, **kwargs))
+        except BaseException as exc:
+            future.set_exception(exc)
+            log.exception("UI-dispatched callback failed")
+
+    def _drain(self) -> None:
+        self._after_id = None
+        if self.closed:
+            return
+        for _ in range(self.max_batch):
+            try:
+                func, args, kwargs, future = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            self._execute(func, args, kwargs, future)
+        if not self.closed:
+            self._after_id = self.root.after(self.poll_ms, self._drain)
+
+    def close(self) -> None:
+        """Close on the Tk owner thread and unblock all waiting workers."""
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        if self._after_id is not None:
+            try:
+                self.root.after_cancel(self._after_id)
+            except (tk.TclError, AttributeError):
+                pass
+            self._after_id = None
+        while True:
+            try:
+                _func, _args, _kwargs, future = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if not future.done():
+                future.set_exception(UiDispatcherClosed("UI dispatcher is closed"))
+
+
+@dataclass(frozen=True)
+class OperationToken:
+    kind: str
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
+class OperationCoordinator:
+    """One exclusive lease for every operation that can touch the rig."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active: Optional[OperationToken] = None
+
+    @property
+    def active(self) -> Optional[OperationToken]:
+        with self._lock:
+            return self._active
+
+    @property
+    def active_kind(self) -> Optional[str]:
+        token = self.active
+        return token.kind if token else None
+
+    @property
+    def busy(self) -> bool:
+        return self.active is not None
+
+    def try_begin(self, kind: str) -> Optional[OperationToken]:
+        with self._lock:
+            if self._active is not None:
+                return None
+            token = OperationToken(kind)
+            self._active = token
+            return token
+
+    def finish(self, token_or_kind: OperationToken | str) -> bool:
+        with self._lock:
+            if self._active is None:
+                return False
+            matches = (
+                self._active is token_or_kind
+                if isinstance(token_or_kind, OperationToken)
+                else self._active.kind == token_or_kind
+            )
+            if not matches:
+                return False
+            self._active = None
+            return True
+
+    def cancel_active(self) -> None:
+        token = self.active
+        if token is not None:
+            token.cancel_event.set()
+
+    def begin_stopping(self) -> OperationToken:
+        with self._lock:
+            if self._active is not None:
+                self._active.cancel_event.set()
+            token = OperationToken("stopping")
+            token.cancel_event.set()
+            self._active = token
+            return token
+
+
+@dataclass(frozen=True)
+class RigControlState:
+    """Resolved UI permissions for one snapshot of rig/application state.
+
+    Keeping this policy independent of Tk makes it straightforward to verify
+    that offline mode cannot accidentally re-enable an energising action when
+    another callback refreshes the window.
+    """
+
+    edit_inputs: bool
+    local_actions: bool
+    hardware_actions: bool
+    shutdown_actions: bool
+    configuration: bool
+    reset_safety: bool
+    stop_sequence: bool
+    stop_zvs: bool
+    pause_experiment: bool
+    cancel_operation: bool
+
+
+def resolve_rig_control_state(
+    *,
+    active_kind: Optional[str],
+    closing: bool,
+    safety_tripped: bool,
+    hardware_offline: bool,
+    engine_running: bool,
+) -> RigControlState:
+    """Return control permissions without consulting or mutating Tk widgets."""
+
+    idle = active_kind is None and not closing
+    hardware_reachable = not hardware_offline
+    hardware_actions = idle and hardware_reachable and not safety_tripped
+    sequence_active = active_kind == "sequence"
+    zvs_active = active_kind == "zvs"
+
+    return RigControlState(
+        edit_inputs=idle,
+        local_actions=idle,
+        hardware_actions=hardware_actions,
+        # De-energising actions may remain available during a safety trip, but
+        # not when startup established that the hardware transport is offline.
+        shutdown_actions=idle and hardware_reachable,
+        configuration=idle,
+        reset_safety=idle and hardware_reachable and safety_tripped,
+        stop_sequence=sequence_active and not closing,
+        stop_zvs=zvs_active and not closing,
+        pause_experiment=engine_running and not closing,
+        cancel_operation=(engine_running or sequence_active or zvs_active)
+        and not closing,
+    )
+
+
+def parse_positive_duration(raw: str, *, maximum_minutes: float = 24 * 60) -> float:
+    """Parse one finite, positive experiment duration."""
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0 or value > maximum_minutes:
+        raise ValueError(
+            f"duration must be finite and between 0 and {maximum_minutes:g} minutes"
+        )
+    return value
 
 
 class ColorButton(_ColorButtonBase):
@@ -37,7 +282,7 @@ class ColorButton(_ColorButtonBase):
         # accumulates its highlight border, so the widget grows a little on
         # each restyle. Pin the constructed pixel size and re-assert it on
         # every style change.
-        self._pinned_size = (
+        self._pinned_size: dict[str, Any] = (
             {k: kwargs[k] for k in ("width", "height") if k in kwargs}
             if _HAVE_TKMACOSX else {}
         )
@@ -74,6 +319,8 @@ class StatusBar(tk.Frame):
         self.label.config(text=message)
         self.label.update_idletasks()
 
+    set_text = set_message
+
 
 def show_temporary_popup(root: tk.Misc, message: str, duration_ms: int = 1500) -> None:
     popup = tk.Toplevel(root)
@@ -84,10 +331,7 @@ def show_temporary_popup(root: tk.Misc, message: str, duration_ms: int = 1500) -
     tk.Label(popup, text=message, font=("TkDefaultFont", 13)).pack(
         expand=True, fill="both", padx=10, pady=10
     )
-    # Cancel the auto-close callback if the popup dies first (e.g. app
-    # shutdown), otherwise Tk logs 'invalid command name "...destroy"'.
-    after_id = popup.after(duration_ms, popup.destroy)
-    popup.bind("<Destroy>", lambda _e: popup.after_cancel(after_id))
+    popup.after(duration_ms, popup.destroy)
 
 
 class ParamButtonGroup(tk.Frame):
@@ -129,7 +373,7 @@ class ParamButtonGroup(tk.Frame):
                 variable=self.variable,
                 value=value,
                 text=text,
-                command=lambda v=value: self._on_click(v),
+                command=partial(self._on_click, value),
                 indicatoron=False,
                 selectcolor=self.SELECTED_BG,
                 background=self.UNSELECTED_BG,
@@ -181,49 +425,35 @@ class ParamButtonGroup(tk.Frame):
     def set_options(self, options: List[Tuple[Any, str]]) -> None:
         self.options = list(options)
         self._build_buttons()
+        if not self.options:
+            self.grid_remove()
+        else:
+            self.grid()
         self.after(10, self._highlight)
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Enable or disable every choice without changing the selection."""
+        desired: Literal["normal", "disabled"] = (
+            "normal" if enabled else "disabled"
+        )
+        for button in self.buttons.values():
+            button.config(state=desired)
 
 
 def call_on_ui_thread(
     root: tk.Misc,
     func: Callable[[], Any],
-    *,
-    timeout: float = 300.0,
-    default: Any = None,
+    timeout: Optional[float] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Any:
     """Run func on the Tk main thread and return its result (blocking).
-
-    Returns `default` if the Tk loop is gone or `timeout` elapses, so a
-    worker thread can never be wedged by a window that closed while it was
-    waiting for an answer.
 
     Safe to call from worker threads; runs func directly when already on
     the main thread.
     """
-    import threading
-
     if threading.current_thread() is threading.main_thread():
         return func()
-
-    result: Dict[str, Any] = {}
-    done = threading.Event()
-
-    def wrapper():
-        try:
-            result["value"] = func()
-        finally:
-            done.set()
-
-    try:
-        root.after(0, wrapper)
-    except RuntimeError:
-        # The Tk loop is already gone; nothing will ever run the callback.
-        return default
-
-    # Never wait unboundedly: if the window closes while an engine or
-    # sequence thread is waiting on a prompt, the callback is never
-    # serviced and an unbounded wait would wedge that thread for good.
-    if not done.wait(timeout):
-        log.warning("UI call timed out after %.0fs; assuming %r", timeout, default)
-        return default
-    return result.get("value", default)
+    dispatcher = getattr(root, "ui_dispatcher", None)
+    if not isinstance(dispatcher, UiDispatcher):
+        raise RuntimeError("Tk root has no UiDispatcher; refusing a cross-thread Tcl call")
+    return dispatcher.call(func, timeout=timeout, cancel_event=cancel_event)
