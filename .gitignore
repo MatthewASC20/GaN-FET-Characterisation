@@ -38,3 +38,8 @@ logs/
 
 # Network lease files: per-session state, never source
 *.lock
+
+# Legacy bench records imported via --migrate: 41 MB of measurement data and
+# scope screenshots. Live data belongs in the per-user data directory, and this
+# tree is a one-off import source, not source code.
+Device Data/
