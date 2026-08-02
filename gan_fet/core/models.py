@@ -37,8 +37,15 @@ class ExperimentParams:
     point: MatrixPoint
     duration_minutes: float
     find_zvs: bool = False
-    #: Search the gate frequency for minimum input power before sampling.
-    find_frequency: bool = False
+    #: Tune the gate frequency for minimum input power *at the operating
+    #: point* — after the bus has reached the target Vds peak, and holding
+    #: that peak at every frequency tried. Tuning at any other amplitude
+    #: would find the wrong resonance, because Coss moves it.
+    #:
+    #: Defaults off *here* while the operator-facing default is on. A
+    #: programmatic caller should say what it wants rather than inherit a
+    #: minutes-long search implicitly; the UI passes the setting explicitly.
+    tune_frequency: bool = False
 
 
 @dataclass

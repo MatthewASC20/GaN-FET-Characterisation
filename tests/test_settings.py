@@ -363,3 +363,26 @@ def test_smu_ramp_uses_rate_unless_call_explicitly_overrides_delay(monkeypatch):
     sleeps.clear()
     smu.ramp_to(0.0, step_v=4.0, delay_s=0.1)
     assert sleeps == pytest.approx([0.1, 0.1])
+
+
+def test_frequency_tuning_is_on_for_the_operator_by_default() -> None:
+    """Nominal is historically 8.5% (median) to 21.7% (max) from the tuned
+    frequency, so running untuned characterises a knowingly wrong point."""
+    from gan_fet.settings import Settings
+
+    assert Settings().tune_frequency_at_operating_point is True
+
+
+def test_experiment_params_do_not_tune_implicitly() -> None:
+    """The operator-facing default is on, but a programmatic caller must ask.
+
+    Inheriting a minutes-long search from a bare constructor would surprise
+    every scripted or test caller; the UI passes the setting explicitly.
+    """
+    from gan_fet.core.models import ExperimentParams, MatrixPoint
+
+    params = ExperimentParams(
+        point=MatrixPoint("D", "Single Device", 6_000_000, 50, 25, 200),
+        duration_minutes=1.0,
+    )
+    assert params.tune_frequency is False

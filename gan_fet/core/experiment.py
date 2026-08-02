@@ -483,7 +483,7 @@ class ExperimentEngine:
             # holds the peak on target throughout, so it leaves a well-defined
             # operating point for anything that follows.
             tune_result = None
-            if params.find_frequency:
+            if params.tune_frequency:
                 self._update_status("Searching gate frequency for minimum P_in...")
                 tune_result = self.frequency_tuner.find_minimum(
                     float(point.frequency_hz),

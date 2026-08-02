@@ -35,3 +35,6 @@ exports/
 *.db-shm
 *.log
 logs/
+
+# Network lease files: per-session state, never source
+*.lock

@@ -299,11 +299,16 @@ class MainWindow(tk.Tk):
         self.temperature_var = tk.IntVar(value=self._first("temperatures"))
         self.voltage_var = tk.IntVar(value=self._first("voltages"))
         self.find_zvs_var = tk.BooleanVar(value=self.settings.find_zvs_before_run)
-        self.find_frequency_var = tk.BooleanVar(
-            value=self.settings.find_frequency_before_run
+        self.tune_frequency_var = tk.BooleanVar(
+            value=self.settings.tune_frequency_at_operating_point
         )
         self.show_zvs_sweep_var = tk.BooleanVar(
             value=self.settings.show_zvs_voltage_sweep
+        )
+
+    def _on_tune_frequency_toggled(self) -> None:
+        self.settings.tune_frequency_at_operating_point = bool(
+            self.tune_frequency_var.get()
         )
 
     def _on_show_zvs_sweep_toggled(self) -> None:
@@ -318,7 +323,7 @@ class MainWindow(tk.Tk):
             return
         if self.show_zvs_sweep_var.get():
             checkbox.grid(
-                row=ExperimentRow.RUN_OPTIONS, column=3, sticky="w", padx=5
+                row=ExperimentRow.RUN_OPTIONS, column=2, sticky="w", padx=5
             )
         else:
             checkbox.grid_remove()
@@ -578,15 +583,8 @@ class MainWindow(tk.Tk):
             row=ExperimentRow.RUN_OPTIONS, column=1, sticky="w"
         )
 
-        self.find_frequency_checkbox = ttk.Checkbutton(
-            self.main_frame,
-            text="Find frequency before run",
-            variable=self.find_frequency_var,
-        )
-        self.find_frequency_checkbox.grid(
-            row=ExperimentRow.RUN_OPTIONS, column=2, sticky="w", padx=5
-        )
-
+        # Frequency tuning is on by default and lives in Config > Advanced:
+        # it is part of establishing the operating point, not a per-run choice.
         # The voltage-only ZVS sweep is kept mainly to exercise the frequency
         # search independently, so it stays hidden unless revealed in Config.
         self.find_zvs_checkbox = ttk.Checkbutton(
@@ -820,7 +818,7 @@ class MainWindow(tk.Tk):
             point=point,
             duration_minutes=SIMULATION_VALIDATION_DURATION_MINUTES,
             find_zvs=bool(self.find_zvs_var.get()),
-            find_frequency=bool(self.find_frequency_var.get()),
+            tune_frequency=bool(self.tune_frequency_var.get()),
         )
 
         def launch() -> None:
@@ -956,6 +954,23 @@ class MainWindow(tk.Tk):
 
         advanced = ttk.LabelFrame(side, text="Advanced")
         advanced.pack(fill="x", pady=(10, 0))
+        ttk.Checkbutton(
+            advanced,
+            text="Tune frequency at operating point",
+            variable=self.tune_frequency_var,
+            command=self._on_tune_frequency_toggled,
+        ).pack(anchor="w", padx=8, pady=(6, 0))
+        ttk.Label(
+            advanced,
+            text=(
+                "Runs after the bus reaches the target Vds peak, holding\n"
+                "that peak at every frequency tried. Off means running at\n"
+                "nominal, which historically differs from the tuned\n"
+                "frequency by a median of 8.5% and up to 21.7%."
+            ),
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 6))
+        ttk.Separator(advanced, orient="horizontal").pack(fill="x", padx=8)
         ttk.Checkbutton(
             advanced,
             text="Show voltage-only ZVS sweep",
@@ -1474,8 +1489,8 @@ class MainWindow(tk.Tk):
             "duration": self.duration_entry.get(),
         }
         self.settings.find_zvs_before_run = bool(self.find_zvs_var.get())
-        self.settings.find_frequency_before_run = bool(
-            self.find_frequency_var.get()
+        self.settings.tune_frequency_at_operating_point = bool(
+            self.tune_frequency_var.get()
         )
         self.settings.show_zvs_voltage_sweep = bool(
             self.show_zvs_sweep_var.get()
@@ -2136,7 +2151,7 @@ class MainWindow(tk.Tk):
             point=point,
             duration_minutes=duration,
             find_zvs=bool(self.find_zvs_var.get()),
-            find_frequency=bool(self.find_frequency_var.get()),
+            tune_frequency=bool(self.tune_frequency_var.get()),
         )
 
     def _start_experiment(self) -> None:

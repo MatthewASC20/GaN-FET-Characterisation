@@ -546,9 +546,12 @@ class Settings:
     # UI state persisted between sessions (replaces last_params.json)
     last_params: dict[str, Any] = field(default_factory=dict)
     find_zvs_before_run: bool = False
-    #: Frequency search before a run. Off by default: it energises the rig
-    #: while stepping the gate frequency, so it is opted into deliberately.
-    find_frequency_before_run: bool = False
+    #: Tune the gate frequency at the operating point before sampling. On by
+    #: default: across 460 historical runs the tuned frequency departed from
+    #: nominal by a median of 8.5% and up to 21.7%, so running at nominal
+    #: characterises the device at a frequency known to be wrong. The control
+    #: exists only to take the search out of the loop deliberately.
+    tune_frequency_at_operating_point: bool = True
     #: The voltage-only ZVS sweep is retained mainly to exercise the frequency
     #: search independently, so its control is hidden unless revealed here.
     show_zvs_voltage_sweep: bool = False
@@ -892,7 +895,7 @@ class Settings:
             settings.last_params = dict(raw["last_params"])
         for flag in (
             "find_zvs_before_run",
-            "find_frequency_before_run",
+            "tune_frequency_at_operating_point",
             "show_zvs_voltage_sweep",
         ):
             if isinstance(raw.get(flag), bool):
