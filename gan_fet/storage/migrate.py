@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +26,7 @@ from gan_fet.storage.db import Database
 @dataclass
 class MigrationReport:
     runs_imported: int = 0
+    runs_partial: int = 0
     runs_skipped_existing: int = 0
     samples_imported: int = 0
     devices: set[str] = field(default_factory=set)
@@ -38,6 +40,11 @@ class MigrationReport:
         ]
         if self.runs_skipped_existing:
             lines.append(f"Skipped {self.runs_skipped_existing} runs already in the database.")
+        if self.runs_partial:
+            lines.append(
+                f"Preserved {self.runs_partial} legacy runs with incomplete final readings "
+                "as 'legacy_partial'."
+            )
         if self.errors:
             lines.append(f"{len(self.errors)} files could not be parsed:")
             lines.extend(f"  - {e}" for e in self.errors[:10])
@@ -71,10 +78,11 @@ def _float_or_none(raw: str) -> Optional[float]:
         return None
 
 
-def _parse_csv(path: Path) -> tuple[list[tuple], FinalReadings]:
-    """Return (sample rows for Database.add_samples, final readings)."""
+def _parse_csv(path: Path) -> tuple[list[tuple], FinalReadings, bool]:
+    """Return sample rows, final readings and whether a final row was present."""
     samples: list[tuple] = []
     readings = FinalReadings()
+    final_seen = False
     with path.open(newline="", encoding="utf-8", errors="replace") as fh:
         for row in csv.reader(fh):
             if not row or not row[0].strip():
@@ -83,6 +91,7 @@ def _parse_csv(path: Path) -> tuple[list[tuple], FinalReadings]:
             if first == "Timestamp":
                 continue  # header
             if first == "FINAL_READINGS":
+                final_seen = True
                 # FINAL_READINGS, vin, irms, iin, fsw [, isw_rms, vds_pk]
                 readings.vin = _float_or_none(row[1]) if len(row) > 1 else None
                 readings.irms = _float_or_none(row[2]) if len(row) > 2 else None
@@ -95,7 +104,24 @@ def _parse_csv(path: Path) -> tuple[list[tuple], FinalReadings]:
                 # ts, device, temp, freq, volt, config, duty, current
                 current = _float_or_none(row[7])
                 samples.append((first, current, None, None, None, None))
-    return samples, readings
+    return samples, readings, final_seen
+
+
+def _has_required_final_readings(
+    readings: FinalReadings,
+    config: str,
+) -> bool:
+    """Apply the same completeness contract as a live experiment."""
+    required = [
+        readings.vin,
+        readings.iin,
+        readings.fsw_hz,
+        readings.irms,
+        readings.vds_pk,
+    ]
+    if config == "Dual Conduction":
+        required.append(readings.isw_rms)
+    return all(value is not None and math.isfinite(value) for value in required)
 
 
 def _import_device_options(db: Database, device_dir: Path) -> None:
@@ -124,36 +150,64 @@ def migrate_legacy_tree(db: Database, root: Path) -> MigrationReport:
                 report.errors.append(str(csv_path.relative_to(root)))
                 continue
 
-            if db.find_run(point) is not None:
-                report.runs_skipped_existing += 1
-                continue
-
             try:
-                samples, readings = _parse_csv(csv_path)
+                samples, readings, final_seen = _parse_csv(csv_path)
             except Exception as exc:
                 report.errors.append(f"{csv_path.relative_to(root)}: {exc}")
                 continue
 
             started_at = samples[0][0] if samples else None
             completed_at = samples[-1][0] if samples else None
-            run_id = db.create_run(
-                point,
-                duration_minutes=0.0,
-                status="completed",
-                started_at=started_at,
-                replace_existing=False,
+            is_complete = final_seen and _has_required_final_readings(
+                readings, point.config
             )
-            if samples:
-                db.add_samples(run_id, samples)
-
             screenshot = csv_path.with_suffix(".png")
-            db.complete_run(
-                run_id,
-                readings,
-                screenshot_path=str(screenshot) if screenshot.is_file() else None,
-                completed_at=completed_at,
-            )
+            try:
+                with db.transaction():
+                    # Keep the check and insert in the same write transaction:
+                    # append-only attempts otherwise make a check/insert race possible.
+                    existing_attempts = db.run_attempts_for_point(point)
+                    has_completed = any(
+                        attempt.status == "completed"
+                        for attempt in existing_attempts
+                    )
+                    has_same_partial = not is_complete and any(
+                        attempt.status == "legacy_partial"
+                        for attempt in existing_attempts
+                    )
+                    if has_completed or has_same_partial:
+                        report.runs_skipped_existing += 1
+                        continue
+
+                    run_id = db.create_run(
+                        point,
+                        duration_minutes=0.0,
+                        status="importing" if is_complete else "legacy_partial",
+                        started_at=started_at,
+                        replace_existing=False,
+                    )
+                    if samples:
+                        db.add_samples(run_id, samples)
+
+                    screenshot_path = (
+                        str(screenshot.resolve()) if screenshot.is_file() else None
+                    )
+                    if is_complete:
+                        db.complete_run(
+                            run_id,
+                            readings,
+                            screenshot_path=screenshot_path,
+                            completed_at=completed_at,
+                        )
+                    elif screenshot_path is not None:
+                        db.set_run_screenshot(run_id, screenshot_path)
+            except Exception as exc:
+                report.errors.append(f"{csv_path.relative_to(root)}: {exc}")
+                continue
+
             report.runs_imported += 1
+            if not is_complete:
+                report.runs_partial += 1
             report.samples_imported += len(samples)
             report.devices.add(device)
 
