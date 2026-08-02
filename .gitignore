@@ -1,19 +1,37 @@
+# Python bytecode and build artefacts
 __pycache__/
 *.pyc
 *.egg-info/
 build/
 dist/
-.DS_Store
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tool caches
 .mplconfig/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# OS cruft
+.DS_Store
+._*
 
 # Secrets — never commit the Google service-account key
 credentials.json
 
-# Runtime state
+# Runtime state (live tree)
 settings.json
-gan_fet.db
-gan_fet.db-wal
-gan_fet.db-shm
 screenshots/
 reports/
 exports/
+
+# Databases and logs — generated at run time, never source
+*.db
+*.db-wal
+*.db-shm
+*.log
+logs/
