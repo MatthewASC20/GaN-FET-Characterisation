@@ -31,6 +31,9 @@ class _Scope:
     def peak_voltage(self):
         return self.plant.vds_peak_v()
 
+    def zvs_dwell_fraction(self):
+        return self.plant.zvs_dwell_fraction()
+
 
 class _Smu:
     """Minimal SMU standing in for the driver, backed by the shared plant."""
@@ -245,20 +248,15 @@ def test_survey_locates_a_resonance_away_from_nominal(plant):
     assert resonance == pytest.approx(6_390_000.0, rel=0.05)
 
 
-def test_edge_clipping_is_reported(plant):
-    """A window that excludes the true optimum must say so rather than
-    silently returning its boundary."""
-    tuner, _smu, _wavegen, _safety = _build(plant)
-    # A window entirely below the lowest basin, so P_in is still falling at
-    # the upper edge and the best point is the boundary itself.
-    result = tuner.find_minimum(
-        6_000_000.0,
-        200.0,
-        "Single Device",
-        warm_start_hz=4_600_000.0,
-        run_survey=False,
-    )
-    assert result.clipped_at_edge
+def test_boundary_detection_flags_only_the_ends():
+    """What ``clipped_at_edge`` is built on. A best point in the interior means
+    the window bracketed its minimum; one on either end means it did not."""
+    points = [TunePoint(float(i), 10.0, 200.0, 1.0) for i in range(4)]
+    assert FrequencyTuner._is_edge(0, points) is True
+    assert FrequencyTuner._is_edge(3, points) is True
+    assert FrequencyTuner._is_edge(1, points) is False
+    assert FrequencyTuner._is_edge(None, points) is False
+    assert FrequencyTuner._is_edge(0, []) is False
 
 
 def test_anomalous_step_is_flagged_not_silently_accepted():
@@ -301,3 +299,43 @@ def test_gain_still_peaks_near_the_built_resonance(plant):
         gains[mhz], _ = plant._tank_state()
     assert gains[6.4] > gains[5.0]
     assert gains[6.4] > gains[8.0]
+
+
+def test_a_clipped_warm_start_is_discarded_and_widened(plant):
+    """Warm starting must not be able to ratchet the answer run after run.
+
+    A clipped result seeds the next run's window centre, so accepting an edge
+    would walk the reported frequency in one direction indefinitely without
+    ever reaching the true minimum. Seen on the bench: successive runs drifting
+    down ~5% each time, reporting 0 minima and an edge every time.
+    """
+    tuner, _smu, wavegen, _safety = _build(plant)
+    # A warm start well above the lowest basin, narrow enough to exclude it.
+    result = tuner.find_minimum(
+        6_000_000.0,
+        200.0,
+        "Single Device",
+        warm_start_hz=5_900_000.0,
+        run_survey=False,
+    )
+    span = max(wavegen.frequencies) - min(wavegen.frequencies)
+    warm_span = 2 * 5_900_000.0 * tuner.settings.warm_window_frac
+    assert span > warm_span * 1.5, "the search should have widened past the warm window"
+    assert not result.clipped_at_edge
+    assert result.minima_hz, "a widened window should contain a real minimum"
+
+
+def test_an_unclipped_warm_start_is_kept(plant):
+    """Widening is an escalation, not the normal path: a warm start that
+    brackets its minimum must stay narrow, which is what makes it cheap."""
+    tuner, _smu, wavegen, _safety = _build(plant)
+    tuner.find_minimum(
+        6_000_000.0,
+        200.0,
+        "Single Device",
+        warm_start_hz=6_950_000.0,
+        run_survey=False,
+    )
+    span = max(wavegen.frequencies) - min(wavegen.frequencies)
+    warm_span = 2 * 6_950_000.0 * tuner.settings.warm_window_frac
+    assert span <= warm_span * 1.5

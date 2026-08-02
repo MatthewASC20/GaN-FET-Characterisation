@@ -496,6 +496,13 @@ class FrequencyTuner:
         return minima
 
     @staticmethod
+    def _is_edge(index: Optional[int], points: list[TunePoint]) -> bool:
+        """Whether the best point sits on a boundary of what was searched."""
+        if index is None or not points:
+            return False
+        return index in (0, len(points) - 1)
+
+    @staticmethod
     def _best_index(points: list[TunePoint]) -> Optional[int]:
         best: Optional[int] = None
         for index, point in enumerate(points):
@@ -553,8 +560,48 @@ class FrequencyTuner:
                 "gain is too low everywhere, so resonance lies outside it"
             )
 
+        # A best point on the boundary means the window excluded the answer.
+        # Escalating matters most when a warm start caused it: the result seeds
+        # the next run's window, so accepting a clipped edge lets successive
+        # runs ratchet in one direction and never reach the true minimum.
+        if self._is_edge(best, coarse) and warm_start_hz is not None:
+            log.warning(
+                "best frequency %.4f MHz is at the edge of a warm-started "
+                "window; discarding the warm start and searching the full "
+                "window so the result cannot ratchet run to run",
+                coarse[best].frequency_hz / 1e6,
+            )
+            if status is not None:
+                status("Warm-started window clipped; widening the search...")
+            if survey_hz is None and run_survey:
+                survey_hz, _gain = self.survey(
+                    nominal_hz,
+                    target_peak_v,
+                    config,
+                    cancel_check=cancel_check,
+                    status=status,
+                )
+            low, high = self.select_window(
+                nominal_hz, warm_start_hz=None, survey_resonance_hz=survey_hz
+            )
+            coarse, wide_anomalies = self.sweep(
+                low,
+                high,
+                cfg.coarse_step_hz,
+                target_peak_v,
+                config,
+                cancel_check=cancel_check,
+                status=status,
+            )
+            anomalies += wide_anomalies
+            best = self._best_index(coarse)
+            if best is None:
+                raise FrequencyTuneError(
+                    "Vds peak was unreachable across the widened window"
+                )
+
         minima = self.local_minima(coarse)
-        clipped = best in (0, len(coarse) - 1)
+        clipped = self._is_edge(best, coarse)
         if clipped:
             log.warning(
                 "best frequency %.4f MHz is at a window edge; the true "
