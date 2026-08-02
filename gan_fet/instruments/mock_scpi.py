@@ -21,6 +21,11 @@ from gan_fet.core.events import InstrumentCommandEvent, bus
 
 log = logging.getLogger(__name__)
 
+#: Operating point the resonant loss constants are quoted at. They only set
+#: the scale; the shape comes from the tank gain.
+REFERENCE_BUS_V = 100.0
+REFERENCE_PEAK_V = 200.0
+
 
 class SimulatedRigPlant:
     """Deterministic shared state for an entire simulated GaN test rig."""
@@ -40,6 +45,10 @@ class SimulatedRigPlant:
         coss_shift_frac: float = 0.045,
         zvs_onset_gain: float = 3.2,
         off_resonance_gain: float = 1.15,
+        switching_loss_w: float = 3.5,
+        circulating_loss_w: float = 1.5,
+        zvs_full_dwell: float = 0.06,
+        partial_zvs_frac: float = 0.40,
     ):
         self.lock = threading.RLock()
         self.peak_gain = float(peak_gain)
@@ -67,6 +76,29 @@ class SimulatedRigPlant:
         # bare Lorentzian decays to zero instead, which invents a regime where
         # the bus must exceed the peak it is producing.
         self.off_resonance_gain = float(off_resonance_gain)
+        # -- loss terms, both derived from the same tank gain ---------------
+        # Losses are watts, not amps. The bus falls by half across this window
+        # as gain rises, so a loss expressed as a current silently changes
+        # meaning as the search moves; expressed as power it does not.
+        #
+        # Hard-switched Coss loss at the reference bus, paid in full when the
+        # drain is still at the bus at turn-on. This is the loss ZVS exists to
+        # remove, so it is written in terms of the dwell rather than of
+        # frequency: letting the two be shaped independently is how an earlier
+        # model ended up with its loss minimum and its ZVS in different places.
+        self.switching_loss_w = float(switching_loss_w)
+        # Conduction loss from tank circulating current at the reference peak,
+        # which grows with how hard the tank is driven and so peaks at
+        # resonance. This is what makes driving past ZVS onset cost rather
+        # than pay, and therefore what puts the minimum *at* onset.
+        self.circulating_loss_w = float(circulating_loss_w)
+        # Dwell at which the transition is complete and switching loss is gone.
+        self.zvs_full_dwell = float(zvs_full_dwell)
+        # How much of the switching loss the tank removes on the approach,
+        # before the drain reaches zero at all. Below onset the tank still
+        # pulls the drain partway down, so the loss falls smoothly into onset
+        # instead of stepping.
+        self.partial_zvs_frac = float(partial_zvs_frac)
         # Latched when the gates are armed: a physical bank does not retune
         # itself mid-run, so a frequency sweep must see a fixed resonance.
         self.tank_nominal_hz: Optional[float] = None
@@ -148,19 +180,54 @@ class SimulatedRigPlant:
         return gain, detuning
 
     def _resonant_loss_a(self) -> float:
-        """Two competing loss terms, giving two minima either side of resonance.
+        """Two competing loss terms, both derived from the tank gain.
 
-        Circulating current peaks sharply at resonance, so conduction loss has
-        a local *maximum* there. Switching loss falls broadly as resonance is
-        approached. Their sum therefore dips on both shoulders, which is the
-        multi-minimum structure the search must cope with. A slight tilt makes
-        the two minima unequal so there is a well-defined global answer.
+        Switching loss is what ZVS removes, so it is written in terms of the
+        dwell this same object reports rather than of frequency. An earlier
+        version shaped it with an independent Lorentzian and tilt, which put
+        the loss minimum and the ZVS region in different places — the search
+        then correctly minimised input power and landed somewhere with no ZVS
+        at all, and every simulated run looked successful while doing it.
+
+        Their sum dips at or just past ZVS onset: below it switching loss
+        dominates and falls, above it circulating current keeps rising with
+        nothing left to buy. That is the class-E design point — just enough
+        circulating current to complete the transition and no more — and it is
+        what the operator finds by hand on the bench.
         """
-        _gain, detuning = self._tank_state()
-        lorentz = 1.0 / (1.0 + (2.0 * self.tank_q * detuning) ** 2)
-        circulating = 0.035 * lorentz**2
-        switching = 0.010 * (1.0 - 0.86 * lorentz) * (1.0 + 3.5 * detuning)
-        return circulating + max(0.0, switching)
+        bus = self.bus_voltage_v
+        if bus <= 1e-3:
+            # No bus, no power flow. Both terms scale with voltage squared, so
+            # the current they imply goes to zero with the bus rather than
+            # dividing by it.
+            return 0.0
+        gain, _detuning = self._tank_state()
+        peak = gain * bus
+
+        # Conduction loss: the tank current is V_peak / Z, and Z falls toward
+        # resonance, so P = I²R rises on both counts.
+        circulating = (
+            self.circulating_loss_w
+            * (peak / REFERENCE_PEAK_V) ** 2
+            * (gain / max(1e-6, self.resonant_peak_gain)) ** 2
+        )
+
+        # Switching loss: ½·Coss·V_residual²·f. The residual drain voltage at
+        # turn-on is a fraction of the bus — the tank pulls it partway down on
+        # the approach, then the ZVS dwell finishes the job. Both the fraction
+        # and the bus itself are squared, which is why hard switching far from
+        # resonance is expensive: the bus is highest exactly where the tank
+        # helps least.
+        approach = min(1.0, gain / max(1e-6, self.zvs_onset_gain))
+        completeness = min(
+            1.0, self.zvs_dwell_fraction() / max(1e-6, self.zvs_full_dwell)
+        )
+        residual = (1.0 - self.partial_zvs_frac * approach) * (1.0 - completeness)
+        switching = (
+            self.switching_loss_w * (bus / REFERENCE_BUS_V) ** 2 * residual**2
+        )
+
+        return (circulating + switching) / bus
 
     def dc_current_a(self) -> float:
         if not self.smu_output_on:

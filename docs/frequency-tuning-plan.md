@@ -233,6 +233,119 @@ this. Add voltage-dependent Coss so it reproduces multiple minima — and
 whatever Phase 1 measures of the hysteresis — making the search and its
 interlocks testable headlessly before 400 V.
 
+#### Proposed changes (2026-08-01)
+
+Voltage-dependent Coss and the multi-minimum structure are in. What is wrong
+is the loss model that sits on top of them. Measured from the plant, holding
+Vds peak at 200 V:
+
+| f (MHz) | gain | I (mA) | P_in (W) | dwell |
+|---|---|---|---|---|
+| 5.30 | 2.11 | 23.5 | **2.243** ← the search picks this | **0.000** |
+| 6.50 | 4.19 | 65.2 | 3.113 | **0.170** ← best ZVS |
+
+Minimum `P_in` and ZVS are anti-correlated, so the search lands somewhere with
+no ZVS at all and simulation cannot validate the objective. **The operator
+confirms the two coincide on the bench**, so the model, not the search, is
+wrong.
+
+The cause is `_resonant_loss_a`. Its switching term is shaped by a Lorentzian
+and a `(1 + 3.5·detuning)` tilt, which makes it largest on the high side —
+exactly where the same object's `zvs_dwell_fraction` is largest. Switching
+loss is the loss ZVS removes; the two must not be free to disagree.
+
+**Proposal: derive both loss terms from the tank gain that already decides the
+dwell, so they cannot drift apart.**
+
+1. **Switching loss.** The FET turns on into a charged `Coss`, dissipating
+   `½·Coss·V_residual²` each cycle. Model the residual voltage, not the
+   frequency:
+
+   ```
+   approach     = min(1, gain / zvs_onset_gain)      # partial pull-down pre-onset
+   completeness = min(1, dwell / zvs_full_dwell)     # ZVS proper, post-onset
+   residual     = (1 − partial_zvs_frac·approach)·(1 − completeness)
+   switching    = switching_loss_a · residual²
+   ```
+
+   Below onset the tank pulls the drain partway down and the loss falls
+   smoothly; past onset the dwell finishes the job and it collapses. Squared,
+   because the energy goes as voltage squared.
+
+2. **Circulating loss.** Conduction loss from tank current, which scales with
+   how hard the tank is driven: `circulating_loss_a · (gain / resonant_peak_gain)²`.
+   Rises monotonically toward resonance.
+
+3. **Their sum has its minimum at or just past ZVS onset** — just enough
+   circulating current to achieve ZVS and no more, which is the class-E design
+   point and what the operator finds by hand. Below onset switching loss
+   dominates and falls; above it circulating loss dominates and rises.
+
+Four new named parameters (`switching_loss_a`, `circulating_loss_a`,
+`zvs_full_dwell`, `partial_zvs_frac`) rather than the current inline
+constants, so the shape can be refitted when Phase 1 measures the real rig.
+
+**Acceptance, checked numerically rather than by eye:**
+
+- the `P_in` minimum has **non-zero dwell** — the property the whole change
+  exists for, and the one the old model failed;
+- the minimum is near onset, not at maximum dwell (excess circulating current
+  is a real cost, not a free lunch);
+- more than one local minimum survives across the window, so the search still
+  has to compare basins rather than descend into the nearest;
+- gain behaviour is untouched: `_tank_state` is not modified, so the peak
+  controller and every reachability test see exactly what they saw before.
+
+**Not claimed:** this is still not a circuit model. It encodes one
+relationship — that ZVS is what removes switching loss — because that is the
+relationship the search exists to exploit and the one whose absence made every
+simulated run look successful while choosing a non-ZVS point.
+
+#### Implemented — measured result
+
+One correction to the proposal above: the loss terms are **watts, not amps**.
+The bus falls by half across this window as gain rises, so a loss expressed as
+a current silently changes meaning as the search moves. Expressed as power and
+divided by the bus it does not — and both terms scale with voltage squared, so
+the implied current falls to zero with the bus rather than dividing by it,
+which matters because every run ramps through zero.
+
+That also supplied the term the first attempt was missing. Switching loss goes
+as `V_residual²`, and off resonance the bus is *highest* exactly where the tank
+helps least, so hard switching there is expensive twice over. Without it the
+falling bus dominates and `P_in` simply decreases toward resonance no matter
+what the residual does — the first attempt put the minimum at maximum dwell and
+left a single flat basin.
+
+Constants: `switching_loss_w = 3.5`, `circulating_loss_w = 1.5`,
+`zvs_full_dwell = 0.06`, `partial_zvs_frac = 0.40`, chosen by scanning the
+parameter space against the acceptance criteria rather than by eye. Measured
+over 4.6–7.4 MHz at 200 V peak:
+
+| | before | after |
+|---|---|---|
+| `P_in` minimum | 5.30 MHz | **6.20 MHz** |
+| dwell there | **0.000** | **0.054** |
+| ZVS onset | 6.10 MHz | 6.10 MHz |
+| maximum dwell | 6.50 MHz (costs +39%) | 6.55 MHz (costs +13%) |
+| basins | 1 | 2 (6.20 and 6.85, both with ZVS) |
+| well depth | — | 53% |
+| current range | 23–65 mA | 42–61 mA |
+
+The minimum now sits 100 kHz past onset and is *not* at maximum dwell: driving
+harder buys no more ZVS and costs conduction loss, which is the class-E design
+point and what the operator finds by hand.
+
+Five tests pin this, all of which fail against the previous model. `_tank_state`
+is untouched, so every gain, peak-control and reachability test sees exactly
+what it saw before.
+
+**Known limitation.** The two basins differ by only 1.4% in `P_in`, while the
+±2 V peak-control tolerance is worth ~2%. Which basin wins is therefore partly
+noise — the simulator now reproduces that difficulty rather than hiding it,
+which is the argument for doing the `P_in` normalisation next. No test asserts
+*which* basin wins, only that both exist and both have ZVS.
+
 ### Phase 3 — Foundations (safe regardless, do early)
 
 - Objective → `P_in = V_bus × I_dc`

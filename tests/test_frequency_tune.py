@@ -1,10 +1,17 @@
 """Frequency-search regressions against the simulated resonant plant.
 
-The plant is not a circuit model. These tests assert control behaviour and
-safety ordering — that the search covers its window, compares every minimum
+The plant is not a circuit model. Most of these tests assert control behaviour
+and safety ordering — that the search covers its window, compares every minimum
 rather than descending into the nearest one, holds Vds peak on target, honours
-cancellation, and never reaches the hard ceiling. Whether the frequency it
-picks is *physically* right is a bench question, not a test question.
+cancellation, and never reaches the hard ceiling. Which *exact* frequency it
+picks remains a bench question, not a test question.
+
+One physical relationship is asserted, at the end of the file: minimum input
+power coincides with ZVS. That is not a modelling preference but the operator's
+measured experience of this rig, and the earlier model contradicted it — which
+let the search minimise its objective perfectly while landing somewhere with no
+ZVS at all, and let every simulated run report success while doing it. Anything
+the simulator is allowed to get wrong about the objective, it will.
 """
 
 from __future__ import annotations
@@ -470,3 +477,134 @@ def test_a_failed_final_read_falls_back_to_what_the_sweep_saw(plant):
     )
     assert result.zvs_dwell_fraction == pytest.approx(0.11)
     assert not result.no_zvs_at_winner
+
+
+# -- the plant's loss model must agree with its own ZVS -----------------------
+#
+# An earlier model shaped switching loss with a Lorentzian and a tilt,
+# independently of the dwell it reported. The two ended up in different places:
+# minimum P_in sat at 5.30 MHz with dwell exactly zero, while the best ZVS at
+# 6.50 MHz cost 39% more power. The search then correctly minimised its
+# objective and landed somewhere with no ZVS, and every simulated run looked
+# successful while doing it. Nothing failed, because nothing asserted the two
+# agreed. These do.
+
+
+def _loss_landscape(plant, tuner, low_hz=4.6e6, high_hz=7.4e6, step_hz=50_000.0):
+    """Measured P_in and dwell across the window, peak held on target."""
+    points = []
+    frequency = low_hz
+    while frequency <= high_hz:
+        point = tuner._evaluate(
+            frequency, 200.0, False, cancel_check=None, status=None
+        )
+        if point.reachable and math.isfinite(point.input_power_w):
+            points.append(point)
+        frequency += step_hz
+    return points
+
+
+def _basins(points):
+    return [
+        points[i]
+        for i in range(1, len(points) - 1)
+        if points[i].input_power_w < points[i - 1].input_power_w
+        and points[i].input_power_w < points[i + 1].input_power_w
+    ]
+
+
+@pytest.fixture()
+def landscape(plant):
+    tuner, _smu, _wavegen, _safety = _build(plant)
+    return _loss_landscape(plant, tuner)
+
+
+def test_minimum_input_power_coincides_with_zvs(landscape):
+    """The property the whole model exists for, and the one it used to fail.
+
+    On the bench the operator finds ZVS near the target peak and minimises
+    current around it, so the two must not be separable in simulation either.
+    """
+    best = min(landscape, key=lambda point: point.input_power_w)
+    assert best.zvs_dwell_fraction, (
+        f"minimum P_in at {best.frequency_hz / 1e6:.2f} MHz has no ZVS "
+        "— the loss model and the dwell model disagree again"
+    )
+
+
+def test_the_minimum_sits_near_zvs_onset_not_at_maximum_dwell(landscape):
+    """Just enough circulating current to complete the transition, no more.
+
+    Driving past onset buys nothing and costs conduction loss, which is the
+    class-E design point. A minimum sitting at maximum dwell would mean
+    circulating current had been made free.
+    """
+    best = min(landscape, key=lambda point: point.input_power_w)
+    with_zvs = [p for p in landscape if p.zvs_dwell_fraction]
+    onset = min(with_zvs, key=lambda point: point.frequency_hz)
+    deepest = max(landscape, key=lambda point: point.zvs_dwell_fraction or 0.0)
+
+    assert abs(best.frequency_hz - onset.frequency_hz) < 300_000.0
+    assert best.frequency_hz != deepest.frequency_hz
+    assert best.input_power_w < deepest.input_power_w
+
+
+def test_more_than_one_basin_survives(landscape):
+    """The search must compare minima rather than descend into the nearest.
+
+    A single smooth bowl would let a local descent pass every test here and
+    still be the wrong algorithm for the bench, where multiple minima were
+    observed directly.
+    """
+    basins = _basins(landscape)
+    assert len(basins) > 1
+    assert all(point.zvs_dwell_fraction for point in basins), (
+        "a basin without ZVS is the pathology this model was fixed to remove"
+    )
+
+
+def test_hard_switching_far_from_resonance_is_expensive(landscape):
+    """What makes the minimum findable at all.
+
+    Switching loss goes as the residual drain voltage squared, and off
+    resonance the bus is highest exactly where the tank helps least. Without
+    that the bus term dominates and P_in simply falls toward resonance.
+    """
+    best = min(landscape, key=lambda point: point.input_power_w)
+    worst = max(landscape, key=lambda point: point.input_power_w)
+    assert not worst.zvs_dwell_fraction
+    assert worst.input_power_w > best.input_power_w * 1.25
+
+
+def test_losses_vanish_with_the_bus_rather_than_dividing_by_it(plant):
+    """Losses are watts, so the model divides by the bus to get a current.
+
+    Both terms scale with voltage squared, which is what keeps that division
+    finite: the implied current falls to zero with the bus instead of
+    exploding as the ramp passes through zero. Every run starts there.
+    """
+    for bus in (0.0, 0.001, 0.5, 2.0):
+        plant.smu_voltage_setpoint_v = bus
+        assert math.isfinite(plant.dc_current_a())
+        assert plant.dc_current_a() < 0.1
+
+    # At a bus of zero the resonant terms contribute nothing at all, so the
+    # plant reads exactly as it would with the resonant model switched off.
+    plant.smu_voltage_setpoint_v = 0.0
+    assert plant._resonant_loss_a() == 0.0
+    quiet = SimulatedRigPlant(resonant_model=False)
+    quiet.smu_output_on = True
+    quiet.smu_voltage_setpoint_v = 0.0
+    assert plant.dc_current_a() == pytest.approx(quiet.dc_current_a())
+
+
+def test_a_ramp_from_zero_never_trips_the_overcurrent_interlock(plant):
+    """The bus climbs from zero on every run, so a loss model that blew up at
+    small bus voltages would trip the interlock before the rig did anything."""
+    tuner, _smu, _wavegen, safety = _build(plant)
+    for bus in range(0, 120, 2):
+        plant.smu_voltage_setpoint_v = float(bus)
+        safety.check_sample(
+            dc_current=plant.dc_current_a(), vds_peak=plant.vds_peak_v()
+        )
+    assert not safety.is_tripped
