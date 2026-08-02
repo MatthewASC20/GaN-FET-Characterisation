@@ -38,7 +38,11 @@ from gan_fet.ui.run_request import (
     tuning_candidate,
 )
 from gan_fet.ui.operations.background import run_in_background
-from gan_fet.ui.operations.rig_ops import ZvsAction, zvs_precondition
+from gan_fet.ui.operations.rig_ops import (
+    ZvsAction,
+    raise_if_aborted,
+    zvs_precondition,
+)
 from gan_fet.ui.operations.worker_pool import WorkerPool
 from gan_fet.ui.panels.device_bar import DeviceBar
 from gan_fet.ui.panels.run_controls import RunControls
@@ -1545,35 +1549,29 @@ class MainWindow(tk.Tk):
 
         config = self.config_var.get()
 
-        def worker() -> None:
-            error: Optional[BaseException] = None
-            try:
-                self.wavegen_controller.ramp_to_frequency(
-                    target,
-                    config,
-                    rate_khz_s=self.settings.zvs.autotune_freq_rate_khz_s,
-                    cancel_check=token.cancel_event.is_set,
-                    status=self._status_async,
-                )
-                actual = self.wavegen_controller.tuned_freq_hz
-                if token.cancel_event.is_set():
-                    raise InterruptedError("autotune cancelled")
-                if actual is None or abs(actual - target) > 1.0:
-                    raise RuntimeError(
-                        "Autotune stopped before the target frequency was applied"
-                    )
-            except BaseException as exc:
-                error = exc
-            self.ui_dispatcher.post(
-                self._on_autotune_done,
-                token,
+        def work() -> None:
+            self.wavegen_controller.ramp_to_frequency(
                 target,
-                src_config,
-                src_temp,
-                error,
+                config,
+                rate_khz_s=self.settings.zvs.autotune_freq_rate_khz_s,
+                cancel_check=token.cancel_event.is_set,
+                status=self._status_async,
             )
+            actual = self.wavegen_controller.tuned_freq_hz
+            if token.cancel_event.is_set():
+                raise InterruptedError("autotune cancelled")
+            # Readback, not "the call returned": a ramp that stopped short
+            # leaves the gate at a frequency nobody chose.
+            if actual is None or abs(actual - target) > 1.0:
+                raise RuntimeError(
+                    "Autotune stopped before the target frequency was applied"
+                )
 
-        self._start_worker(worker, name="autotune")
+        self._run_operation(
+            work,
+            partial(self._on_autotune_done, token, target, src_config, src_temp),
+            name="autotune",
+        )
 
     def _on_autotune_done(
         self, token, target, src_config, src_temp, error
@@ -1690,14 +1688,20 @@ class MainWindow(tk.Tk):
         self._tuner_busy = True
         self.status_bar.set_message("Preparing the HDO4054-verified ZVS search...")
 
+        # Re-checked before every step that arms or energises: both conditions
+        # can arrive during the previous step.
+        abort_check = partial(
+            raise_if_aborted,
+            cancelled=token.cancel_event.is_set,
+            safety=self.safety,
+            trip_error=SafetyTrip,
+            what="ZVS search",
+        )
+
         def worker() -> None:
             error = result = None
             try:
-                if token.cancel_event.is_set():
-                    raise InterruptedError("ZVS search cancelled")
-                reason = self.safety.trip_reason
-                if reason is not None:
-                    raise SafetyTrip(*reason)
+                abort_check()
 
                 self._status_async("Verifying LeCroy HDO4054 identity...")
                 identity = self.engine.scope.verify_identity()
@@ -1706,21 +1710,13 @@ class MainWindow(tk.Tk):
                     identity,
                 )
 
-                if token.cancel_event.is_set():
-                    raise InterruptedError("ZVS search cancelled")
-                reason = self.safety.trip_reason
-                if reason is not None:
-                    raise SafetyTrip(*reason)
+                abort_check()
 
                 armed = self.safety.arm_wavegen(config)
                 if not armed or not self.wavegen_controller.outputs_armed:
                     raise RuntimeError("Wavegen outputs did not confirm armed")
 
-                if token.cancel_event.is_set():
-                    raise InterruptedError("ZVS search cancelled")
-                reason = self.safety.trip_reason
-                if reason is not None:
-                    raise SafetyTrip(*reason)
+                abort_check()
 
                 if not self.safety.enable_bus():
                     raise ConnectionError("Could not enable the SMU output")

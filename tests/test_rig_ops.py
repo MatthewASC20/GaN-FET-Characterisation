@@ -112,3 +112,85 @@ def test_a_bad_target_is_refused_before_the_wavegen_is_offered():
     and leaves the wavegen changed for nothing."""
     decision = _decide(target_peak_v=0.0, wavegen_pending=True)
     assert decision.action is ZvsAction.REFUSE
+
+
+# -- the interlock guard between energising steps -----------------------------
+
+
+class _Safety:
+    def __init__(self, trip_reason=None) -> None:
+        self.trip_reason = trip_reason
+
+
+class _Trip(Exception):
+    def __init__(self, *reason) -> None:
+        super().__init__(*reason)
+        self.reason = reason
+
+
+def _abort(*, cancelled=False, trip_reason=None):
+    from gan_fet.ui.operations.rig_ops import raise_if_aborted
+
+    return raise_if_aborted(
+        cancelled=lambda: cancelled,
+        safety=_Safety(trip_reason),
+        trip_error=_Trip,
+        what="ZVS search",
+    )
+
+
+def test_a_clear_rig_passes_the_guard():
+    assert _abort() is None
+
+
+def test_cancellation_stops_the_next_step():
+    with pytest.raises(InterruptedError, match="ZVS search cancelled"):
+        _abort(cancelled=True)
+
+
+def test_a_trip_stops_the_next_step_and_carries_its_reason():
+    with pytest.raises(_Trip) as raised:
+        _abort(trip_reason=("overcurrent", "DC input current exceeded limit"))
+    assert raised.value.reason == (
+        "overcurrent",
+        "DC input current exceeded limit",
+    )
+
+
+def test_cancellation_is_reported_ahead_of_a_trip():
+    """An operator who pressed Stop is told the search stopped, not shown a
+    trip they did not cause. The trip is not lost: the safety monitor has
+    already latched and recorded it independently."""
+    with pytest.raises(InterruptedError):
+        _abort(cancelled=True, trip_reason=("overcurrent", "…"))
+
+
+def test_the_operation_name_appears_in_the_cancellation():
+    from gan_fet.ui.operations.rig_ops import raise_if_aborted
+
+    with pytest.raises(InterruptedError, match="autotune cancelled"):
+        raise_if_aborted(
+            cancelled=lambda: True,
+            safety=_Safety(),
+            trip_error=_Trip,
+            what="autotune",
+        )
+
+
+def test_the_guard_is_re_evaluated_on_every_call():
+    """It exists to be called between steps, because both conditions can
+    arrive during the previous one. A guard that cached its answer would let
+    the rest of the sequence run on a rig already told to stop."""
+    from gan_fet.ui.operations.rig_ops import raise_if_aborted
+
+    state = {"cancelled": False}
+    guard = lambda: raise_if_aborted(  # noqa: E731
+        cancelled=lambda: state["cancelled"],
+        safety=_Safety(),
+        trip_error=_Trip,
+        what="ZVS search",
+    )
+    assert guard() is None
+    state["cancelled"] = True
+    with pytest.raises(InterruptedError):
+        guard()

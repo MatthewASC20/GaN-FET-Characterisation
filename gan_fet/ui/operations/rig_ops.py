@@ -16,9 +16,41 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional
+from typing import Any, Callable, Optional, Protocol
 
 from gan_fet.ui.refusal import Refusal
+
+
+class _TripSource(Protocol):
+    @property
+    def trip_reason(self) -> Optional[tuple[Any, ...]]: ...
+
+
+def raise_if_aborted(
+    *,
+    cancelled: Callable[[], bool],
+    safety: _TripSource,
+    trip_error: Callable[..., BaseException],
+    what: str,
+) -> None:
+    """Stop before the next energising step if cancellation or a trip landed.
+
+    Called between every step that arms or energises something, because both
+    conditions can arrive *during* the previous step: the operator presses Stop
+    while the bus is ramping, or the safety monitor trips on a sample taken
+    mid-search. Checking once at the top would let the rest of the sequence run
+    on a rig that had already been told to stop.
+
+    Cancellation is checked first, so an operator who pressed Stop is told the
+    search stopped rather than being shown a trip they did not cause. The trip
+    is not lost by this: the safety monitor has already latched and recorded it
+    independently, and the window reflects the latched state either way.
+    """
+    if cancelled():
+        raise InterruptedError(f"{what} cancelled")
+    reason = safety.trip_reason
+    if reason is not None:
+        raise trip_error(*reason)
 
 
 class ZvsAction(Enum):
