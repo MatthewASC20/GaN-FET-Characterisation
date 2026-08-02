@@ -50,3 +50,11 @@ testpaths = ["tests"]
 python_version = "3.10"
 check_untyped_defs = true
 ignore_missing_imports = true
+
+# numpy reaches us only transitively (via matplotlib); we never import it.
+# Its published stubs use syntax newer than our target python_version, so
+# following them makes mypy fail to parse third-party code that is not ours.
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
