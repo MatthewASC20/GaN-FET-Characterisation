@@ -38,7 +38,9 @@ from gan_fet.ui.run_request import (
     tuning_candidate,
 )
 from gan_fet.ui.panels.device_bar import DeviceBar
+from gan_fet.ui.panels.smu_panel import SmuPanel
 from gan_fet.ui.panels.telemetry_panel import TelemetryPanel
+from gan_fet.ui.smu_status import smu_status_line
 from gan_fet.ui.param_options import (
     OPTION_KEYS as _OPTION_KEYS,
     default_label,
@@ -653,8 +655,14 @@ class MainWindow(tk.Tk):
         )
 
     def _build_smu_panel(self) -> None:
-        frame = ttk.LabelFrame(self.main_frame, text="SMU (Keithley 2400-series)")
-        frame.grid(
+        self.smu_panel = SmuPanel(
+            self.main_frame,
+            on_find_zvs=self._find_zvs_now,
+            on_bus_off=self._bus_off,
+            on_reset_safety=self._reset_safety,
+            on_emergency_stop=self._emergency_stop,
+        )
+        self.smu_panel.grid(
             row=ExperimentRow.SMU,
             column=0,
             columnspan=EXPERIMENT_CONTROL_COLUMNS,
@@ -662,30 +670,13 @@ class MainWindow(tk.Tk):
             padx=5,
             pady=5,
         )
-        self.smu_status_label = ttk.Label(frame, text="Bus: — | I: — | Output: OFF")
-        self.smu_status_label.grid(row=0, column=0, sticky="w", padx=8, pady=4)
-
-        self.zvs_button = ttk.Button(frame, text="Find ZVS Now", command=self._find_zvs_now)
-        self.zvs_button.grid(row=0, column=1, padx=6, pady=4)
-
-        self.bus_off_button = ttk.Button(frame, text="Bus Off", command=self._bus_off)
-        self.bus_off_button.grid(row=0, column=2, padx=6, pady=4)
-
-        self.reset_safety_button = ttk.Button(
-            frame, text="Reset Safety", command=self._reset_safety
-        )
-        self.reset_safety_button.grid(row=0, column=3, padx=6, pady=4)
-
-        self.estop_button = ColorButton(
-            frame,
-            text="EMERGENCY STOP",
-            command=self._emergency_stop,
-            width=170, height=36, borderless=1, highlightthickness=1,
-        )
-        self.estop_button.set_style(bg="#b71c1c", fg="white", active_bg="#7f0000",
-                                    active_fg="white")
-        self.estop_button.grid(row=0, column=4, padx=10, pady=4)
-        frame.grid_columnconfigure(0, weight=1)
+        # Enabled state is decided by resolve_rig_control_state and applied
+        # here, so the buttons stay addressable from the window.
+        self.smu_status_label = self.smu_panel.status_label
+        self.zvs_button = self.smu_panel.zvs_button
+        self.bus_off_button = self.smu_panel.bus_off_button
+        self.reset_safety_button = self.smu_panel.reset_safety_button
+        self.estop_button = self.smu_panel.estop_button
 
     def _build_action_buttons(self) -> None:
         bar = tk.Frame(self.main_frame)
@@ -1694,11 +1685,12 @@ class MainWindow(tk.Tk):
     # ------------------------------------------------------------------
 
     def _update_smu_panel(self) -> None:
-        state = "ON" if self.smu.output_is_on else "OFF"
-        current = self.engine.last_current
-        current_text = f"{current * 1000:.2f} mA" if current is not None else "—"
         self.smu_status_label.config(
-            text=f"Bus setpoint: {self.smu.setpoint_v:.1f} V | I: {current_text} | Output: {state}"
+            text=smu_status_line(
+                setpoint_v=self.smu.setpoint_v,
+                current_a=self.engine.last_current,
+                output_on=bool(self.smu.output_is_on),
+            )
         )
         self.update_telemetry()
 
