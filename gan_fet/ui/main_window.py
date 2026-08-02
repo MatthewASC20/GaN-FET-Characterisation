@@ -22,6 +22,14 @@ from gan_fet.core.autotune import (
     find_prior_tuned_frequency,
 )
 from gan_fet.ui.command_log_view import CommandLogConsole
+from gan_fet.ui.device_actions import (
+    Refusal,
+    device_after_removal,
+    removal_confirmation,
+    removal_refusal,
+    removal_report,
+    validated_new_device_name,
+)
 from gan_fet.ui.run_request import (
     InputRejected,
     build_experiment_params,
@@ -29,6 +37,7 @@ from gan_fet.ui.run_request import (
     require_populated_options,
     tuning_candidate,
 )
+from gan_fet.ui.panels.device_bar import DeviceBar
 from gan_fet.ui.panels.telemetry_panel import TelemetryPanel
 from gan_fet.ui.param_options import (
     OPTION_KEYS as _OPTION_KEYS,
@@ -443,59 +452,37 @@ class MainWindow(tk.Tk):
         self.main_frame.grid_rowconfigure(ExperimentRow.FLEX_SPACER, weight=1)
 
     def _build_device_row(self) -> None:
-        tk.Label(self.main_frame, text="Device Name:").grid(
-            row=ExperimentRow.DEVICE, column=0, sticky="e", padx=5, pady=5
-        )
-        self.device_dropdown = ttk.Combobox(
+        self.device_bar = DeviceBar(
             self.main_frame,
+            row=ExperimentRow.DEVICE,
             textvariable=self.device_name_var,
-            values=self.db.list_devices(),
-            width=20,
-            state="normal",
-        )
-        self.device_dropdown.grid(
-            row=ExperimentRow.DEVICE, column=1, sticky="w", padx=5, pady=5
-        )
-        for event in ("<<ComboboxSelected>>", "<FocusOut>", "<Return>"):
-            self.device_dropdown.bind(event, self._on_device_committed)
-
-        device_button_bar = ttk.Frame(self.main_frame)
-        device_button_bar.grid(
-            row=ExperimentRow.DEVICE, column=2, sticky="w", padx=(2, 5), pady=5
+            devices=self.db.list_devices(),
+            on_commit=self._on_device_committed,
+            on_add=self._prompt_add_device,
+            on_remove=self._prompt_remove_device,
         )
 
-        self.add_device_button = ttk.Button(
-            device_button_bar,
-            text="+ Add Device",
-            command=self._prompt_add_device,
-            width=12,
+    def _show_refusal(self, refusal: Refusal) -> None:
+        show = (
+            messagebox.showinfo
+            if refusal.severity == "info"
+            else messagebox.showwarning
         )
-        self.add_device_button.pack(side="left", padx=(0, 2))
-
-        self.remove_device_button = ttk.Button(
-            device_button_bar,
-            text="- Remove Device",
-            command=self._prompt_remove_device,
-            width=14,
-        )
-        self.remove_device_button.pack(side="left", padx=(2, 0))
+        show(refusal.title, refusal.message, parent=self)
 
     def _prompt_add_device(self) -> None:
-        raw_name = simpledialog.askstring(
-            "Add Device",
-            "Enter new GaN device name (e.g. EPC2001C, GS66508B):",
-            parent=self,
-        )
-        if not raw_name:
-            return
-        raw_name = raw_name.strip()
-        clean_name = sanitize_device_name(raw_name)
-        if not clean_name or clean_name != raw_name:
-            messagebox.showerror(
-                "Invalid Device Name",
-                "Device name contains unsupported characters.",
-                parent=self,
+        try:
+            clean_name = validated_new_device_name(
+                simpledialog.askstring(
+                    "Add Device",
+                    "Enter new GaN device name (e.g. EPC2001C, GS66508B):",
+                    parent=self,
+                )
             )
+        except InputRejected as rejected:
+            messagebox.showerror(rejected.title, rejected.message, parent=self)
+            return
+        if clean_name is None:
             return
 
         self.db.get_or_create_device(clean_name)
@@ -508,61 +495,31 @@ class MainWindow(tk.Tk):
         )
 
     def _prompt_remove_device(self) -> None:
-        if self.operations.busy:
-            messagebox.showinfo(
-                "Rig Busy",
-                "Devices cannot be removed while a rig operation is active.",
-                parent=self,
-            )
-            return
         device_name = self.device_name_var.get().strip()
-        if not device_name:
-            messagebox.showwarning(
-                "No Device Selected",
-                "Please select or enter a device name to remove.",
-                parent=self,
-            )
-            return
-
-        devices = self.db.list_devices()
-        if device_name not in devices:
-            messagebox.showwarning(
-                "Device Not Found",
-                f"Device '{device_name}' does not exist in the database.",
-                parent=self,
-            )
-            return
-
-        confirm = messagebox.askyesno(
-            "Confirm Delete Device",
-            f"Permanently delete device '{device_name}' and all of its runs and "
-            "samples from the local database?\n\n"
-            "Saved screenshots, reports/exports, and Google Sheets/Drive data "
-            "will not be deleted.\n\nThis action cannot be undone.",
-            parent=self,
-            icon="warning",
+        refusal = removal_refusal(
+            busy=self.operations.busy,
+            device_name=device_name,
+            known_devices=self.db.list_devices(),
         )
-        if not confirm:
+        if refusal is not None:
+            self._show_refusal(refusal)
             return
 
-        deleted = self.db.delete_device(device_name)
-        if deleted:
-            self._active_device = ""
-            remaining = self.db.list_devices()
-            next_device = remaining[0] if remaining else ""
-            self.device_name_var.set(next_device)
-            self._refresh_device_dropdown()
-            if next_device:
-                self._on_device_committed()
-            else:
-                self._clear_device_context()
-            messagebox.showinfo(
-                "Device Removed",
-                f"Device '{device_name}' and its local database records were "
-                "permanently removed. External files and cloud data were left "
-                "unchanged.",
-                parent=self,
-            )
+        title, message = removal_confirmation(device_name)
+        if not messagebox.askyesno(title, message, parent=self, icon="warning"):
+            return
+
+        if not self.db.delete_device(device_name):
+            return
+        self._active_device = ""
+        next_device = device_after_removal(self.db.list_devices())
+        self.device_name_var.set(next_device)
+        self._refresh_device_dropdown()
+        if next_device:
+            self._on_device_committed()
+        else:
+            self._clear_device_context()
+        messagebox.showinfo(*removal_report(device_name), parent=self)
 
     def _build_parameter_groups(self) -> None:
         specs = [
@@ -1122,9 +1079,9 @@ class MainWindow(tk.Tk):
                 )
         state(getattr(self, "bus_off_button", None), controls.shutdown_actions)
         state(getattr(self, "confirm_button", None), controls.hardware_actions)
-        state(getattr(self, "add_device_button", None), controls.edit_inputs)
-        state(getattr(self, "remove_device_button", None), controls.edit_inputs)
-        state(getattr(self, "device_dropdown", None), controls.edit_inputs)
+        device_bar = getattr(self, "device_bar", None)
+        if device_bar is not None:
+            device_bar.set_enabled(controls.edit_inputs)
         state(getattr(self, "duration_entry", None), controls.edit_inputs)
         state(getattr(self, "find_zvs_checkbox", None), controls.edit_inputs)
         state(
@@ -1291,7 +1248,7 @@ class MainWindow(tk.Tk):
         self._refresh_control_states()
 
     def _refresh_device_dropdown(self) -> None:
-        self.device_dropdown["values"] = self.db.list_devices()
+        self.device_bar.set_devices(self.db.list_devices())
 
     def _clear_device_context(self) -> None:
         """Clear every device-dependent control and view after the last deletion."""
