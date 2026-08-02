@@ -29,10 +29,11 @@ from __future__ import annotations
 
 import logging
 import math
-import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
+from gan_fet.core.control_loop import finite_float, is_cancelled, settle
+from gan_fet.core.reachability import ReachabilityGuard
 from gan_fet.core.safety import SafetyMonitor
 from gan_fet.core.voltage_control import PeakControlError, PeakVoltageController
 from gan_fet.instruments.base import (
@@ -104,141 +105,63 @@ class FrequencyTuner:
         self.settings = settings
         self.safety_settings = safety_settings
         self.safety = safety
-        # Gain here and now, which sets the running bus cap; and the largest
-        # seen, kept only for reporting.
-        self._observed_gain = 0.0
-        self._observed_max_gain = 0.0
-        #: Gain at each converged point, used to extrapolate one step ahead.
-        self._gain_history: list[float] = []
+        self.guard = ReachabilityGuard(
+            ceiling_v=safety_settings.max_vds_peak_v * settings.ceiling_margin_frac,
+            growth_factor=settings.gain_growth_factor,
+        )
 
     # -- helpers ----------------------------------------------------------
 
     @staticmethod
     def _cancelled(cancel_check: Optional[Callable[[], bool]]) -> bool:
-        return cancel_check is not None and cancel_check()
-
-    @staticmethod
-    def _finite(value: object) -> Optional[float]:
-        try:
-            numeric = float(value)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            return None
-        return numeric if math.isfinite(numeric) else None
+        return is_cancelled(cancel_check)
 
     def _wait(
         self, seconds: float, cancel_check: Optional[Callable[[], bool]]
     ) -> None:
-        """Settle in short slices so cancellation is not hidden by the wait."""
-        deadline = time.monotonic() + max(0.0, seconds)
-        while True:
-            if self._cancelled(cancel_check):
-                raise FrequencyTuneError("cancelled")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return
-            time.sleep(min(0.05, remaining))
+        """Settle, converting an interrupted wait into this loop's error."""
+        if not settle(seconds, cancel_check):
+            raise FrequencyTuneError("cancelled")
+
+    @staticmethod
+    def _read(reader: Callable[[], Any], what: str) -> Optional[float]:
+        """Take one reading, treating any failure as absent telemetry.
+
+        Never fatal: a search spanning a whole window will meet the occasional
+        bad read, and the safety monitor's watchdog already escalates a run of
+        them. Failing the search here would discard good data over one glitch.
+
+        Callers pass a zero-argument callable rather than a bound method so
+        that resolving the attribute happens inside the guard too — the ZVS
+        dwell is an optional capability, and a scope that lacks it must read as
+        absent telemetry rather than raising.
+        """
+        try:
+            return finite_float(reader())
+        except Exception as exc:
+            log.warning("%s read failed during frequency tune: %s", what, exc)
+            return None
 
     def _read_peak(self) -> Optional[float]:
-        try:
-            return self._finite(self.scope.peak_voltage())
-        except Exception as exc:
-            log.warning("scope peak read failed during frequency tune: %s", exc)
-            return None
+        return self._read(lambda: self.scope.peak_voltage(), "scope peak")
 
     def _read_dwell(self) -> Optional[float]:
         """ZVS dwell here, recorded but not yet acted on.
 
         A sweep already visits the whole window, so capturing the dwell at
         every point turns each ordinary search into a map of where ZVS
-        actually begins - which is the evidence needed to decide whether
-        onset can be bisected instead of swept.
+        actually begins - the evidence needed to decide whether onset can be
+        bisected instead of swept.
         """
-        try:
-            return self._finite(self.scope.zvs_dwell_fraction())
-        except Exception as exc:
-            log.debug("ZVS dwell read failed during tune: %s", exc)
-            return None
+        return self._read(lambda: self.scope.zvs_dwell_fraction(), "ZVS dwell")
 
     def _read_current(self) -> Optional[float]:
-        try:
-            return self._finite(self.smu.measure_dc_current())
-        except Exception as exc:
-            log.warning("SMU current read failed during frequency tune: %s", exc)
-            return None
-
-    def reachability_cap_v(self, small_signal_gain: float) -> float:
-        """Largest bus voltage that cannot breach the ceiling if gain grows.
-
-        Gain rises as the sweep approaches resonance, and it can rise faster
-        between iterations than polling follows. Bounding the bus makes an
-        over-voltage operating point unreachable rather than something to be
-        detected after the fact.
-
-        Note how little room there is at the top of the matrix: a 400 V target
-        under a 450 V ceiling leaves only 12 % headroom, so
-        ``gain_growth_factor`` must stay near unity or the target itself
-        becomes unreachable. The protection comes from tracking the gain
-        actually observed, not from a large blanket margin.
-        """
-        cfg = self.settings
-        ceiling = self.safety_settings.max_vds_peak_v * cfg.ceiling_margin_frac
-        gain = max(1e-6, small_signal_gain * cfg.gain_growth_factor)
-        return max(0.0, ceiling / gain)
-
-    def _note_gain(self, peak_v: Optional[float], bus_v: float) -> None:
-        """Track the gain here and now.
-
-        Deliberately the *latest* value, not the largest seen. Gain varies by
-        several times across the window, so a cap sized for the highest-gain
-        frequency would make perfectly safe lower-gain frequencies unreachable.
-        The margin against a sudden rise comes from ``gain_growth_factor``, and
-        gradual growth is handled by the adaptive step size.
-        """
-        if peak_v is None or bus_v <= 1e-6:
-            return
-        gain = peak_v / bus_v
-        if math.isfinite(gain) and gain > 0.0:
-            self._observed_gain = gain
-            self._observed_max_gain = max(self._observed_max_gain, gain)
+        return self._read(lambda: self.smu.measure_dc_current(), "SMU current")
 
     @property
     def _peak_ceiling_v(self) -> float:
         """Search ceiling, held below the interlock so a sweep never trips it."""
-        return (
-            self.safety_settings.max_vds_peak_v
-            * self.settings.ceiling_margin_frac
-        )
-
-    @property
-    def _current_cap_v(self) -> Optional[float]:
-        if self._observed_gain <= 0.0:
-            return None
-        return self.reachability_cap_v(self._observed_gain)
-
-    def _predicted_next_gain(self) -> Optional[float]:
-        """Extrapolate the gain one step ahead of where the sweep is now.
-
-        Sizing the pre-step back-off from the *present* gain is always one step
-        behind: the excursion happens on arrival, when the gain is already
-        higher. Two consecutive gains give the growth per step, which is what
-        the bus must be backed off against. Only upward growth is extrapolated
-        — a falling gain needs no protection.
-        """
-        if len(self._gain_history) >= 2:
-            previous, latest = self._gain_history[-2], self._gain_history[-1]
-            if previous > 0.0:
-                ratio = min(max(latest / previous, 1.0), 3.0)
-                return latest * ratio
-            return latest
-        if self._gain_history:
-            return self._gain_history[-1]
-        return None
-
-    def _prestep_cap_v(self) -> Optional[float]:
-        predicted = self._predicted_next_gain()
-        if predicted is None or predicted <= 0.0:
-            return None
-        return self.reachability_cap_v(predicted)
+        return self.guard.ceiling_v
 
     def _prepare_for_jump(
         self, cancel_check: Optional[Callable[[], bool]]
@@ -253,9 +176,9 @@ class FrequencyTuner:
         keep under the ceiling. The first point of the sweep then converges
         back up under the normal guards.
         """
-        if self._observed_max_gain <= 0.0:
+        safe_bus = self.guard.jump_cap_v
+        if safe_bus is None:
             return
-        safe_bus = self.reachability_cap_v(self._observed_max_gain)
         if float(self.smu.setpoint_v) > safe_bus:
             log.debug(
                 "backing bus off to %.1f V before a frequency jump", safe_bus
@@ -330,7 +253,7 @@ class FrequencyTuner:
             bus = max(1e-6, float(self.smu.setpoint_v))
             if peak is not None:
                 gain = peak / bus
-                self._note_gain(peak, bus)
+                self.guard.observe(peak, bus)
                 if gain > best_gain:
                     best_gain, best_hz = gain, frequency
             frequency += cfg.survey_step_hz
@@ -401,7 +324,7 @@ class FrequencyTuner:
         # bus still applied, and the peak excursion is far larger than the
         # allowance for smooth stepping. Backing off first makes the excursion
         # impossible rather than something to be caught afterwards.
-        cap = self._prestep_cap_v()
+        cap = self.guard.prestep_cap_v
         if cap is not None and float(self.smu.setpoint_v) > cap:
             self.smu.ramp_to(cap, cancel_check=cancel_check)
 
@@ -415,7 +338,7 @@ class FrequencyTuner:
         # is the excursion the step actually caused, and is what sizes the
         # next one.
         arrival_peak = self._read_peak()
-        self._note_gain(arrival_peak, float(self.smu.setpoint_v))
+        self.guard.observe(arrival_peak, float(self.smu.setpoint_v))
         self.safety.check_sample(vds_peak=arrival_peak)
 
         reachable = True
@@ -424,7 +347,7 @@ class FrequencyTuner:
                 target_peak_v,
                 cancel_check=cancel_check,
                 status=status,
-                max_setpoint_v=self._current_cap_v,
+                max_setpoint_v=self.guard.local_cap_v,
                 peak_ceiling_v=self._peak_ceiling_v,
             )
         except PeakControlError as exc:
@@ -437,12 +360,7 @@ class FrequencyTuner:
 
         peak = self._read_peak()
         current = self._read_current()
-        bus_now = float(self.smu.setpoint_v)
-        self._note_gain(peak, bus_now)
-        if peak is not None and bus_now > 1e-6:
-            gain_here = peak / bus_now
-            if math.isfinite(gain_here) and gain_here > 0.0:
-                self._gain_history.append(gain_here)
+        self.guard.record_converged(peak, float(self.smu.setpoint_v))
         self.safety.check_sample(dc_current=current, vds_peak=peak)
         self.safety.check_compliance()
         return TunePoint(
@@ -511,7 +429,7 @@ class FrequencyTuner:
         # Entering a sweep is a discontinuous jump from wherever the previous
         # one ended, so per-step extrapolation does not apply here.
         self._prepare_for_jump(cancel_check)
-        self._gain_history.clear()
+        self.guard.start_new_sweep()
         frequency = low_hz
         step = step_hz
         min_step = max(1.0, step_hz / 16.0)
@@ -675,11 +593,12 @@ class FrequencyTuner:
         # value belongs to wherever the fine sweep happened to finish, and on
         # the low side of resonance gain falls as amplitude rises — so a cap
         # taken elsewhere can forbid a bus the winner demonstrably reached.
-        settle_cap = self._current_cap_v
-        if winner.bus_voltage_v > 1e-6 and math.isfinite(winner.vds_peak_v):
-            winner_gain = winner.vds_peak_v / winner.bus_voltage_v
-            if math.isfinite(winner_gain) and winner_gain > 0.0:
-                settle_cap = self.reachability_cap_v(winner_gain)
+        settle_cap = self.guard.local_cap_v
+        winner_gain = ReachabilityGuard._gain(
+            winner.vds_peak_v, winner.bus_voltage_v
+        )
+        if winner_gain is not None:
+            settle_cap = self.guard.cap_for(winner_gain)
         try:
             self.peak_controller.achieve_peak(
                 target_peak_v,

@@ -10,11 +10,10 @@ window to find the current minimum.
 from __future__ import annotations
 
 import logging
-import math
-import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
+from gan_fet.core.control_loop import finite_float, is_cancelled, settle
 from gan_fet.core.safety import SafetyMonitor
 from gan_fet.instruments.base import OscilloscopeInterface, SmuInterface
 from gan_fet.settings import ZvsSettings
@@ -48,17 +47,7 @@ class ZvsTuner:
 
     @staticmethod
     def _cancelled(cancel_check: Optional[Callable[[], bool]]) -> bool:
-        return cancel_check is not None and cancel_check()
-
-    @staticmethod
-    def _finite_float(value: Any) -> Optional[float]:
-        if value is None:
-            return None
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            return None
-        return numeric if math.isfinite(numeric) else None
+        return is_cancelled(cancel_check)
 
     def _wait(
         self,
@@ -66,14 +55,7 @@ class ZvsTuner:
         cancel_check: Optional[Callable[[], bool]],
     ) -> bool:
         """Return ``False`` when cancellation interrupts a settling wait."""
-        deadline = time.monotonic() + max(0.0, seconds)
-        while True:
-            if self._cancelled(cancel_check):
-                return False
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return True
-            time.sleep(min(0.05, remaining))
+        return settle(seconds, cancel_check)
 
     def _avg_current(
         self,
@@ -96,7 +78,7 @@ class ZvsTuner:
                 log.warning("Scope peak query failed during ZVS search: %s", exc)
                 vds_pk = None
 
-            numeric_peak = self._finite_float(vds_pk)
+            numeric_peak = finite_float(vds_pk)
             if self.scope is not None:
                 if numeric_peak is None:
                     self.safety.record_read_failure("scope peak voltage (ZVS)")
@@ -104,7 +86,7 @@ class ZvsTuner:
                     self.safety.record_read_success("scope peak voltage (ZVS)")
                     self.safety.check_sample(vds_peak=numeric_peak)
 
-            current = self._finite_float(value)
+            current = finite_float(value)
             if current is None:
                 self.safety.record_read_failure("SMU current (ZVS)")
             else:

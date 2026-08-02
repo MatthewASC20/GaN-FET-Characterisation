@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import logging
 import math
-import time
 from typing import Callable, Optional
 
+from gan_fet.core.control_loop import finite_float, is_cancelled, settle
 from gan_fet.core.safety import SafetyMonitor
 from gan_fet.instruments.base import OscilloscopeInterface, SmuInterface
 from gan_fet.instruments.smu import SmuLimitError
@@ -42,22 +42,16 @@ class PeakVoltageController:
 
     @staticmethod
     def _cancelled(cancel_check: Optional[Callable[[], bool]]) -> bool:
-        return cancel_check is not None and cancel_check()
+        return is_cancelled(cancel_check)
 
     def _wait(
         self,
         seconds: float,
         cancel_check: Optional[Callable[[], bool]],
     ) -> None:
-        """Wait in short slices so cancellation is not hidden by settling."""
-        deadline = time.monotonic() + max(0.0, seconds)
-        while True:
-            if self._cancelled(cancel_check):
-                raise PeakControlError("cancelled")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return
-            time.sleep(min(0.05, remaining))
+        """Settle, converting an interrupted wait into this loop's error."""
+        if not settle(seconds, cancel_check):
+            raise PeakControlError("cancelled")
 
     def _read_peak(
         self,
@@ -78,16 +72,9 @@ class PeakVoltageController:
                     "Scope peak retry failed during peak control: %s", exc
                 )
                 peak = None
-        if peak is None:
-            return None
-        try:
-            numeric_peak = float(peak)
-        except (TypeError, ValueError):
-            log.warning("Scope returned a non-numeric peak reading: %r", peak)
-            return None
-        if not math.isfinite(numeric_peak):
-            log.warning("Scope returned a non-finite peak-voltage reading: %r", peak)
-            return None
+        numeric_peak = finite_float(peak)
+        if numeric_peak is None and peak is not None:
+            log.warning("Scope returned an unusable peak reading: %r", peak)
         return numeric_peak
 
     def _check_input_current(self) -> None:
@@ -97,11 +84,8 @@ class PeakVoltageController:
         except Exception as exc:
             log.warning("SMU current query failed during peak control: %s", exc)
             current = None
-        try:
-            numeric_current = float(current) if current is not None else None
-        except (TypeError, ValueError):
-            numeric_current = None
-        if numeric_current is None or not math.isfinite(numeric_current):
+        numeric_current = finite_float(current)
+        if numeric_current is None:
             self.safety.record_read_failure("SMU current (peak control)")
         else:
             self.safety.record_read_success("SMU current (peak control)")

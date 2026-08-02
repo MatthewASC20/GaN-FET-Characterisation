@@ -190,11 +190,11 @@ def test_search_never_reaches_the_hard_ceiling(plant):
 
 def test_reachability_cap_keeps_a_gain_excursion_below_the_ceiling(plant):
     tuner, _smu, _wavegen, _safety = _build(plant)
-    cap = tuner.reachability_cap_v(small_signal_gain=4.0)
+    cap = tuner.guard.cap_for(4.0)
     # Even if gain doubled beyond the measured small-signal value, the peak
     # stays under the interlock: that is the point of bounding reachability
     # rather than trying to react to a transition faster than it happens.
-    worst_case_peak = cap * 4.0 * tuner.settings.gain_growth_factor
+    worst_case_peak = cap * 4.0 * tuner.guard.growth_factor
     assert worst_case_peak <= 450.0
 
 
