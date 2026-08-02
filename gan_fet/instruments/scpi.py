@@ -1,112 +1,80 @@
-"""SCPI-over-TCP transport shared by all instruments.
+"""Backward-compatible SCPI client constructor.
 
-One persistent socket per instrument, guarded by a lock so the UI thread,
-engine thread and sync thread never interleave commands. Failures close the
-socket (forcing a reconnect on the next call), log, and return None/False —
-matching the fault tolerance of the original per-command implementation.
+The historical name is retained because the application and external scripts
+construct ``ScpiTcpClient(name, host, port)``.  The resolved connection can now
+be TCP, serial, or VISA, while the public write/query API remains unchanged.
 """
 
 from __future__ import annotations
 
 import logging
-import socket
-import threading
-import time
 from typing import Optional
+
+from gan_fet.scpi.client import ScpiClient as _ScpiClient
+from gan_fet.transport.address import AddressError, parse_address
+from gan_fet.transport.factory import transport_for_spec
 
 log = logging.getLogger(__name__)
 
-# After a failed connect, don't re-attempt for this long. Without it, every
-# command sent to an unreachable instrument blocks for a full connect
-# timeout — which freezes whatever thread is doing the sending.
-RETRY_COOLDOWN_S = 10.0
 
+class ScpiTcpClient(_ScpiClient):
+    """A SCPI client addressed by the legacy ``(host, port)`` API."""
 
-class ScpiTcpClient:
-    def __init__(self, name: str, host: str, port: int, timeout: float = 5.0):
-        self.name = name
+    def __init__(
+        self,
+        name: str,
+        host: str,
+        port: int,
+        timeout: float = 5.0,
+        *,
+        prologix_addr: Optional[int] = None,
+    ):
         self.host = host
         self.port = port
         self.timeout = timeout
-        self._sock: Optional[socket.socket] = None
-        self._lock = threading.RLock()
-        self._next_attempt = 0.0
-
-    # -- connection ----------------------------------------------------
-
-    def connect(self) -> bool:
-        with self._lock:
-            if self._sock is not None:
-                return True
-            if time.monotonic() < self._next_attempt:
-                return False  # still in cooldown from the last failure
-            try:
-                self._sock = socket.create_connection(
-                    (self.host, self.port), timeout=self.timeout
-                )
-                self._sock.settimeout(self.timeout)
-                self._next_attempt = 0.0
-                return True
-            except OSError as exc:
-                log.warning("%s: connect to %s:%s failed: %s (retry in %.0fs)",
-                            self.name, self.host, self.port, exc, RETRY_COOLDOWN_S)
-                self._sock = None
-                self._next_attempt = time.monotonic() + RETRY_COOLDOWN_S
-                return False
-
-    def close(self) -> None:
-        with self._lock:
-            if self._sock is not None:
-                try:
-                    self._sock.close()
-                except OSError:
-                    pass
-                self._sock = None
+        try:
+            self.spec = parse_address(host, port, prologix_addr=prologix_addr)
+        except AddressError:
+            log.exception("%s: could not parse address %r", name, host)
+            raise
+        super().__init__(name, transport_for_spec(self.spec, timeout=timeout))
 
     @property
-    def connected(self) -> bool:
-        with self._lock:
-            return self._sock is not None
+    def is_visa(self) -> bool:
+        return self.spec.is_visa
 
-    # -- I/O -------------------------------------------------------------
+    @property
+    def is_serial(self) -> bool:
+        return self.spec.is_serial
 
-    def write(self, command: str) -> bool:
+    @property
+    def uses_prologix(self) -> bool:
+        return self.spec.uses_prologix
+
+    def configure_prologix(self, gpib_addr: int, *, auto_read: bool = True) -> bool:
+        """Enable controller framing for a legacy TCP/serial address.
+
+        This method is intentionally a no-op for VISA resources.  Calling it
+        from a driver is therefore safe even when the settings retain their
+        historical default GPIB address while the bench uses direct VISA.
+        """
         with self._lock:
-            if not self.connect():
+            if self.spec.is_visa:
                 return False
-            try:
-                self._sock.sendall((command + "\n").encode())
+            updated = self.spec.with_prologix(gpib_addr, auto_read=auto_read)
+            if updated == self.spec and self.transport.handles_prologix_framing:
                 return True
-            except OSError as exc:
-                log.warning("%s: write '%s' failed: %s", self.name, command, exc)
-                self.close()
-                return False
 
-    def query(self, command: str) -> Optional[str]:
-        with self._lock:
-            if not self.write(command):
-                return None
-            try:
-                chunks = []
-                while True:
-                    chunk = self._sock.recv(4096)
-                    if not chunk:
-                        raise ConnectionError("connection closed by instrument")
-                    chunks.append(chunk)
-                    if chunk.endswith(b"\n"):
-                        break
-                return b"".join(chunks).decode(errors="replace").strip()
-            except (OSError, ConnectionError) as exc:
-                log.warning("%s: query '%s' failed: %s", self.name, command, exc)
-                self.close()
-                return None
+            # Framing must be in place before the next byte is sent.  Rebuild
+            # from the immutable address spec and force a clean reconnect if
+            # a caller configured an already-open legacy client.
+            self.transport.close()
+            self.spec = updated
+            self.transport = transport_for_spec(updated, timeout=self.timeout)
+            return True
 
-    def query_float(self, command: str) -> Optional[float]:
-        raw = self.query(command)
-        if raw is None:
-            return None
-        try:
-            return float(raw)
-        except ValueError:
-            log.warning("%s: non-numeric response to '%s': %r", self.name, command, raw)
-            return None
+
+# Historical alias retained for imports from gan_fet.instruments.scpi.
+ScpiClient = ScpiTcpClient
+
+__all__ = ["ScpiClient", "ScpiTcpClient"]

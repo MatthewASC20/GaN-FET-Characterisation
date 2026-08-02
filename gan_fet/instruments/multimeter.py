@@ -8,11 +8,12 @@ from __future__ import annotations
 
 from typing import Optional
 
-from gan_fet.instruments.scpi import ScpiTcpClient
+from gan_fet.instruments.base import MultimeterInterface
+from gan_fet.scpi.protocol import ScpiSession
 
 
-class Sdm3055:
-    def __init__(self, client: ScpiTcpClient):
+class Sdm3055(MultimeterInterface):
+    def __init__(self, client: ScpiSession):
         self.client = client
 
     def dc_voltage(self) -> Optional[float]:
