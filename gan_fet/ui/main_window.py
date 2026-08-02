@@ -37,6 +37,7 @@ from gan_fet.ui.run_request import (
     require_populated_options,
     tuning_candidate,
 )
+from gan_fet.ui.operations.rig_ops import ZvsAction, zvs_precondition
 from gan_fet.ui.operations.worker_pool import WorkerPool
 from gan_fet.ui.panels.device_bar import DeviceBar
 from gan_fet.ui.panels.run_controls import RunControls
@@ -458,11 +459,10 @@ class MainWindow(tk.Tk):
         )
 
     def _show_refusal(self, refusal: Refusal) -> None:
-        show = (
-            messagebox.showinfo
-            if refusal.severity == "info"
-            else messagebox.showwarning
-        )
+        show = {
+            "info": messagebox.showinfo,
+            "error": messagebox.showerror,
+        }.get(refusal.severity, messagebox.showwarning)
         show(refusal.title, refusal.message, parent=self)
 
     def _prompt_add_device(self) -> None:
@@ -1613,46 +1613,46 @@ class MainWindow(tk.Tk):
         self.update_telemetry()
 
     def _find_zvs_now(self) -> None:
+        # Stopping comes first and reads nothing. An operator reaching for Stop
+        # while the hardware has dropped offline, or after a trip, still needs
+        # the search to stop — so it must not depend on any of the state that
+        # decides whether one could be *started*.
         if self._request_zvs_stop():
             return
-        if not self._ensure_hardware_online(HARDWARE_OPERATION_LABELS["zvs"]):
-            return
-        if self._safety_is_tripped():
-            messagebox.showwarning(
-                "Find ZVS",
-                "Reset the latched safety interlock before energizing the rig.",
-                parent=self,
-            )
-            return
         try:
-            target_v = int(self.voltage_var.get())
+            target_v: Optional[float] = float(self.voltage_var.get())
         except (ValueError, tk.TclError):
-            target_v = 0
-        if (
-            target_v <= 0
-            or target_v > float(self.settings.safety.max_vds_peak_v)
-        ):
-            messagebox.showerror(
-                "Find ZVS",
-                "The selected Vds target must be positive and no greater than "
-                f"the {self.settings.safety.max_vds_peak_v:g} V safety limit.",
-                parent=self,
+            target_v = None
+        try:
+            wavegen_pending = self.wavegen_controller.has_pending_changes(
+                self.config_var.get(),
+                int(self.frequency_var.get()),
+                int(self.duty_var.get()),
             )
-            return
-        if self.wavegen_controller.has_pending_changes(
-            self.config_var.get(),
-            int(self.frequency_var.get()),
-            int(self.duty_var.get()),
-        ):
-            if not messagebox.askyesno(
-                "Find ZVS",
-                "The wavegen does not match the selected parameters. Apply them before the ZVS search?",
-                parent=self,
-            ):
-                return
-            self._apply_wavegen(after_success=self._launch_zvs)
-            return
-        self._launch_zvs()
+        except (ValueError, tk.TclError):
+            # Unreadable inputs cannot match what is on the wavegen, so treat
+            # it as out of date rather than assume it agrees.
+            wavegen_pending = True
+
+        decision = zvs_precondition(
+            hardware_offline=self.hardware_offline,
+            safety_tripped=self._safety_is_tripped(),
+            target_peak_v=target_v,
+            max_vds_peak_v=float(self.settings.safety.max_vds_peak_v),
+            wavegen_pending=wavegen_pending,
+        )
+
+        if decision.action is ZvsAction.HARDWARE_OFFLINE:
+            self._ensure_hardware_online(HARDWARE_OPERATION_LABELS["zvs"])
+        elif decision.action is ZvsAction.REFUSE:
+            assert decision.refusal is not None
+            self._show_refusal(decision.refusal)
+        elif decision.action is ZvsAction.APPLY_WAVEGEN_FIRST:
+            assert decision.prompt is not None
+            if messagebox.askyesno(*decision.prompt, parent=self):
+                self._apply_wavegen(after_success=self._launch_zvs)
+        else:
+            self._launch_zvs()
 
     def _request_zvs_stop(self) -> bool:
         """Request cooperative cancellation of the active manual ZVS search."""

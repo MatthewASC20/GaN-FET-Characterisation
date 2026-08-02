@@ -14,11 +14,20 @@ No tkinter: callers pass plain data.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional, Sequence
 
 from gan_fet.core.models import sanitize_device_name
+from gan_fet.ui.refusal import Refusal
 from gan_fet.ui.run_request import InputRejected
+
+__all__ = [
+    "Refusal",
+    "device_after_removal",
+    "removal_confirmation",
+    "removal_refusal",
+    "removal_report",
+    "validated_new_device_name",
+]
 
 #: What survives a device deletion. Stated in the confirmation because the
 #: operator's real question is "have I lost the measurements", and the answer
@@ -27,19 +36,6 @@ _REMOVAL_SURVIVES = (
     "Saved screenshots, reports/exports, and Google Sheets/Drive data "
     "will not be deleted."
 )
-
-
-@dataclass(frozen=True)
-class Refusal:
-    """A refused action and the dialog to show for it.
-
-    ``severity`` picks the message box: ``"info"`` for "not now, the rig is
-    busy", ``"warning"`` for "that request does not make sense".
-    """
-
-    title: str
-    message: str
-    severity: str = "warning"
 
 
 def removal_refusal(
