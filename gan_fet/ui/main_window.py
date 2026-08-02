@@ -29,6 +29,7 @@ from gan_fet.ui.run_request import (
     require_populated_options,
     tuning_candidate,
 )
+from gan_fet.ui.panels.telemetry_panel import TelemetryPanel
 from gan_fet.ui.param_options import (
     OPTION_KEYS as _OPTION_KEYS,
     default_label,
@@ -205,7 +206,6 @@ class MainWindow(tk.Tk):
             key: list(options) for key, options in self.default_param_options.items()
         }
         self.parameter_editors: Dict[str, ParameterListEditor] = {}
-        self.telemetry_labels: Dict[str, ttk.Label] = {}
 
         self._init_variables()
         self._wire_engine()
@@ -647,8 +647,8 @@ class MainWindow(tk.Tk):
         )
 
     def _build_telemetry_panel(self) -> None:
-        frame = ttk.LabelFrame(self.main_frame, text="Live Telemetry & Meters")
-        frame.grid(
+        self.telemetry_panel = TelemetryPanel(self.main_frame)
+        self.telemetry_panel.grid(
             row=ExperimentRow.TELEMETRY,
             column=0,
             columnspan=EXPERIMENT_CONTROL_COLUMNS,
@@ -656,24 +656,9 @@ class MainWindow(tk.Tk):
             padx=5,
             pady=5,
         )
-
-        cards = [
-            ("Frequency (f_sw)", "frequency", "13.00 MHz"),
-            ("Peak Voltage (V_ds,pk)", "vds_peak", "— V"),
-            ("DC Voltage (V_dc)", "dc_voltage", "— V"),
-            ("DC Current (I_dc)", "dc_current", "— mA"),
-            ("Load Current (I_rms)", "rms_current", "— A"),
-            ("Switch Current (I_sw,rms)", "isw_rms", "— A"),
-        ]
-
-        for col, (title, attr, default_val) in enumerate(cards):
-            card = ttk.Frame(frame, padding=6, relief="ridge")
-            card.grid(row=0, column=col, padx=6, pady=6, sticky="nsew")
-            ttk.Label(card, text=title, font=("Helvetica", 8, "bold")).pack(anchor="w")
-            lbl = ttk.Label(card, text=default_val, font=("Consolas", 13, "bold"))
-            lbl.pack(anchor="e", pady=(4, 0))
-            self.telemetry_labels[attr] = lbl
-            frame.grid_columnconfigure(col, weight=1)
+        # Seed the frequency card with the selection so it reads the chosen
+        # frequency before the first sample rather than a hardcoded default.
+        self.telemetry_panel.update_values(freq_hz=self.frequency_var.get())
 
     def update_telemetry(
         self,
@@ -684,46 +669,31 @@ class MainWindow(tk.Tk):
         rms_current_a: Optional[float] = None,
         isw_rms_a: Optional[float] = None,
     ) -> None:
-        frequency_label = self.telemetry_labels["frequency"]
-        vds_label = self.telemetry_labels["vds_peak"]
-        voltage_label = self.telemetry_labels["dc_voltage"]
-        current_label = self.telemetry_labels["dc_current"]
-        rms_label = self.telemetry_labels["rms_current"]
-        isw_label = self.telemetry_labels["isw_rms"]
-        if freq_hz is not None and freq_hz > 0:
-            if freq_hz >= 1e6:
-                frequency_label.config(text=f"{freq_hz / 1e6:.2f} MHz")
-            else:
-                frequency_label.config(text=f"{freq_hz / 1e3:.1f} kHz")
-        elif hasattr(self, "frequency_var"):
-            f_val = self.frequency_var.get()
-            frequency_label.config(
-                text=(
-                    f"{f_val / 1e6:.2f} MHz"
-                    if f_val >= 1e6
-                    else f"{f_val / 1e3:.1f} kHz"
-                )
-            )
+        """Push readings to the panel, filling gaps from what the rig knows.
 
-        if vds_peak is not None:
-            vds_label.config(text=f"{vds_peak:.1f} V")
+        Resolving a fallback needs the instruments and the selection, so it
+        stays here; the panel only renders what it is handed.
+        """
+        # A reported 0 Hz is the gate not running, not a measurement, so it
+        # falls back to the selection like a missing reading does.
+        if (freq_hz is None or freq_hz <= 0) and hasattr(self, "frequency_var"):
+            try:
+                freq_hz = float(self.frequency_var.get())
+            except (ValueError, tk.TclError):
+                freq_hz = None
+        if dc_volts is None and self.smu is not None:
+            dc_volts = getattr(self.smu, "setpoint_v", None)
+        if dc_current_a is None:
+            dc_current_a = self.engine.last_current
 
-        if dc_volts is not None:
-            voltage_label.config(text=f"{dc_volts:.1f} V")
-        elif self.smu is not None and hasattr(self.smu, "setpoint_v"):
-            voltage_label.config(text=f"{self.smu.setpoint_v:.1f} V")
-
-        if dc_current_a is not None:
-            current_label.config(text=f"{dc_current_a * 1000.0:.2f} mA")
-        elif self.engine.last_current is not None:
-            current_label.config(
-                text=f"{self.engine.last_current * 1000.0:.2f} mA"
-            )
-
-        if rms_current_a is not None:
-            rms_label.config(text=f"{rms_current_a:.3f} A")
-        if isw_rms_a is not None:
-            isw_label.config(text=f"{isw_rms_a:.3f} A")
+        self.telemetry_panel.update_values(
+            freq_hz=freq_hz,
+            vds_peak=vds_peak,
+            dc_volts=dc_volts,
+            dc_current_a=dc_current_a,
+            rms_current_a=rms_current_a,
+            isw_rms_a=isw_rms_a,
+        )
 
     def _build_smu_panel(self) -> None:
         frame = ttk.LabelFrame(self.main_frame, text="SMU (Keithley 2400-series)")
