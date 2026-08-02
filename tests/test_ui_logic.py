@@ -36,6 +36,30 @@ from gan_fet.ui.widgets import (
 )
 
 
+class _HeadlessWindow(MainWindow):
+    """``MainWindow`` with Tk's attribute forwarding disabled.
+
+    ``tk.Misc.__getattr__`` forwards unknown attributes to ``self.tk``. On an
+    instance built with ``object.__new__`` — never initialised, so ``tk`` is
+    absent too — that recurses until the stack blows, and a test double missing
+    one attribute fails with ``RecursionError`` naming nothing.
+
+    Raising ``AttributeError`` instead names the attribute, and lets the
+    ``hasattr`` guards in the window behave as they do in a real session.
+    """
+
+    def __getattr__(self, name):  # pragma: no cover - diagnostics only
+        raise AttributeError(
+            f"{type(self).__name__} test double has no attribute {name!r}; "
+            "set it on the double if the code under test now needs it"
+        )
+
+
+def _headless_window() -> MainWindow:
+    """A window instance with no Tk root, for exercising pure methods."""
+    return object.__new__(_HeadlessWindow)
+
+
 class _FakeWidget:
     def __init__(self) -> None:
         self.options = {}
@@ -116,13 +140,14 @@ def test_mode_banner_makes_virtual_and_live_operation_unambiguous() -> None:
 def test_simulation_validation_launches_normal_engine_with_short_duration(
     matrix_point,
 ) -> None:
-    window = object.__new__(MainWindow)
+    window = _headless_window()
     window.is_simulated = True
     window._simulation_validation_active = False
     window._safety_is_tripped = lambda: False
     window.operations = SimpleNamespace(busy=False)
     window._validated_current_point = lambda: matrix_point
     window.find_zvs_var = _FakeVar(True)
+    window.tune_frequency_var = _FakeVar(True)
     window.wavegen_controller = SimpleNamespace(
         has_pending_changes=lambda *_args: False
     )
@@ -137,6 +162,9 @@ def test_simulation_validation_launches_normal_engine_with_short_duration(
     assert launched[0].point == matrix_point
     assert launched[0].duration_minutes == SIMULATION_VALIDATION_DURATION_MINUTES
     assert launched[0].find_zvs
+    # The validation is the production path, so it must carry the frequency
+    # search too rather than quietly running at nominal.
+    assert launched[0].tune_frequency
     assert window._simulation_validation_active
     assert "normal experiment workflow" in messages[-1]
 
@@ -271,7 +299,7 @@ def test_control_policy_preserves_safety_and_cancellation_paths() -> None:
 
 
 def test_manual_zvs_button_requests_cooperative_stop_before_hardware_checks() -> None:
-    window = object.__new__(MainWindow)
+    window = _headless_window()
     window.operations = OperationCoordinator()
     token = window.operations.try_begin("zvs")
     assert token is not None
@@ -327,7 +355,7 @@ def test_manual_zvs_wrong_scope_identity_never_energizes() -> None:
 
     safety = _Safety()
     callbacks = []
-    window = object.__new__(MainWindow)
+    window = _headless_window()
     window._begin_operation = lambda _kind: token
     window._start_worker = lambda worker, **_kwargs: worker()
     window._status_async = lambda _message: None
@@ -360,7 +388,7 @@ def test_clear_device_context_clears_all_parameter_consumers() -> None:
         def set_options(self, options) -> None:
             calls[self.name] = list(options)
 
-    window = object.__new__(MainWindow)
+    window = _headless_window()
     window._ui_ready = True
     window._active_device = "GaN-1"
     window.device_name_var = _FakeVar("GaN-1")
@@ -424,7 +452,7 @@ def test_remove_last_device_describes_local_database_scope(monkeypatch) -> None:
             self.deleted = True
             return True
 
-    window = object.__new__(MainWindow)
+    window = _headless_window()
     window.operations = SimpleNamespace(busy=False)
     window.device_name_var = _FakeVar("GaN-1")
     window.db = _Database()
@@ -473,7 +501,7 @@ def test_ui_estop_requests_latch_before_cancelling_active_operation() -> None:
         def is_alive(self) -> bool:
             return False
 
-    window = object.__new__(MainWindow)
+    window = _headless_window()
     window._emergency_worker = None
     window.status_bar = SimpleNamespace(set_message=lambda _message: None)
     window._refresh_control_states = lambda: None
