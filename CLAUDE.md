@@ -19,13 +19,16 @@ gan-fet --migrate            # import the legacy "Device Data" CSV tree
 
 ruff check gan_fet scripts tests
 mypy gan_fet                 # must stay clean; CI gates on it
-pytest -q                    # 107 tests, all headless
+pytest -q                    # 336 tests, all headless
 ```
 
-Python ≥ 3.10 with tkinter (`python3-tk` on Debian/Ubuntu). **Without tkinter,
-`tests/test_ui_logic.py` fails to collect and one test in
-`test_simulation_isolation.py` fails on import** — those two failures are
-environmental, not defects.
+Python ≥ 3.10 with tkinter (`python3-tk` on Debian/Ubuntu). Without it,
+`tests/conftest.py` falls back to the import-only stub in `tests/tkstub/` so the
+UI-logic tests still run, and prints a header saying so. **A real `tkinter`
+always wins** — the fallback only triggers when the real import raises, so CI is
+unaffected. The stub cannot see a wrong Tk option name, a bad geometry call or a
+widget used after destruction; treat a pass under it as "the logic is right",
+never as "the GUI works". See `tests/tkstub/README.md`.
 
 CI runs lint → mypy → `compileall` → import-without-credentials → pytest on
 Python 3.10 and 3.12.
