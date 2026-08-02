@@ -81,6 +81,8 @@ class SimulatedRigPlant:
         self.wavegen_c1_on = False
         self.wavegen_c2_on = False
         self.wavegen_coupled = False
+        self.wavegen_freq_coupled = False
+        self.wavegen_duty_coupled = False
         #: Last ZVS threshold written by the software, for assertions.
         self.zvs_threshold_v: Optional[float] = None
 
@@ -748,6 +750,15 @@ class MockScpiTcpClient:
 
             if upper.startswith("COUP STATE,"):
                 plant.wavegen_coupled = upper.endswith("ON")
+                if not plant.wavegen_coupled:
+                    plant.wavegen_freq_coupled = False
+                    plant.wavegen_duty_coupled = False
+                return
+            if upper.startswith("COUP FCOUP,"):
+                plant.wavegen_freq_coupled = upper.endswith("ON")
+                return
+            if upper.startswith("COUP DCOUP,"):
+                plant.wavegen_duty_coupled = upper.endswith("ON")
                 return
 
             if upper.startswith("C1:BSWV") or upper.startswith("C2:BSWV"):
@@ -797,6 +808,13 @@ class MockScpiTcpClient:
                 return f"{plant.rms_current_a():.6f}"
             if "P3" in upper:
                 return f"{plant.switch_current_rms_a():.6f}"
+
+            if upper in {"COUP?", "COUP ?"}:
+                return (
+                    f"COUP STATE,{'ON' if plant.wavegen_coupled else 'OFF'},"
+                    f"FCOUP,{'ON' if plant.wavegen_freq_coupled else 'OFF'},"
+                    f"DCOUP,{'ON' if plant.wavegen_duty_coupled else 'OFF'}"
+                )
 
             if upper == "C1:OUTP?":
                 return f"C1:OUTP {'ON' if plant.wavegen_c1_on else 'OFF'}"

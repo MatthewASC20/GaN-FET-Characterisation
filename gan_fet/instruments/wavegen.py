@@ -96,6 +96,12 @@ class Sdg6022x(WavegenInterface):
                 self._write_or_raise("COUP STATE,ON")
                 self._write_or_raise("COUP FCOUP,ON")
                 self._write_or_raise("COUP DCOUP,ON")
+                # Read back before relying on it. Every later frequency and
+                # duty change writes only C1 and lets the generator mirror it,
+                # so unverified coupling would leave the second gate stranded
+                # at the old value with the bus live — the one failure this
+                # configuration cannot tolerate.
+                self._verify_coupling()
             else:
                 # Always undo coupling left by a previous dual-channel run.
                 # This is required for both single-channel configurations.
@@ -116,13 +122,48 @@ class Sdg6022x(WavegenInterface):
         time.sleep(0.3)
         log.info("Wavegen configured: %s, %.0f Hz, %s%% duty", config, freq_hz, duty_pct)
 
+    def _verify_coupling(self) -> None:
+        """Confirm the generator reports channel coupling as enabled.
+
+        Fails closed, like the scope identity check: an unconfirmed coupling
+        means the two gates could diverge, so configuration is rejected rather
+        than proceeding on an assumption.
+        """
+        response = self.client.query("COUP?")
+        if response is None or not response.strip():
+            raise ConnectionError(
+                "Wavegen did not report its channel-coupling state; dual "
+                "conduction needs C2 to track C1"
+            )
+        upper = response.upper()
+        missing = [
+            name
+            for name, token in (
+                ("state", "STATE,ON"),
+                ("frequency", "FCOUP,ON"),
+                ("duty", "DCOUP,ON"),
+            )
+            if token.replace(",", "") not in upper.replace(",", "").replace(" ", "")
+        ]
+        if missing:
+            raise ConnectionError(
+                f"Wavegen channel coupling is not active ({', '.join(missing)} "
+                f"coupling missing): {response.strip()!r}"
+            )
+        log.info("Wavegen channel coupling verified: C2 tracks C1")
+
     def _raw_set_frequency(self, freq_hz: float, dual: bool) -> None:
+        """Set the gate frequency.
+
+        Only C1 is written even in dual configurations: coupling was verified
+        at configuration time and the generator mirrors C1 onto C2 itself.
+        Writing both doubled the command count on the frequency ramp, which is
+        stepped every 10 kHz and dominates search wall-clock.
+        """
         self._validate_frequency(freq_hz)
         freq = int(round(freq_hz))
         try:
             self._write_or_raise(f"C1:BSWV FRQ,{freq}")
-            if dual:
-                self._write_or_raise(f"C2:BSWV FRQ,{freq}")
         except Exception:
             with self._state_lock:
                 self._current_freq_hz = None
@@ -132,11 +173,10 @@ class Sdg6022x(WavegenInterface):
             self._current_freq_hz = float(freq)
 
     def _raw_set_duty(self, duty_pct: float, dual: bool) -> None:
+        """Set the gate duty. C1 only; verified coupling mirrors it onto C2."""
         self._validate_duty(duty_pct)
         try:
             self._write_or_raise(f"C1:BSWV DUTY,{duty_pct}")
-            if dual:
-                self._write_or_raise(f"C2:BSWV DUTY,{duty_pct}")
         except Exception:
             with self._state_lock:
                 self._current_duty_pct = None
