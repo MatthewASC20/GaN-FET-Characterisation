@@ -215,6 +215,10 @@ class RigControlState:
     edit_inputs: bool
     local_actions: bool
     hardware_actions: bool
+    #: Actions that move the gate frequency. Denied while the bus is
+    #: energised: changing frequency shifts the resonant operating point, and
+    #: therefore Vds peak, so it is only unconditionally safe with the bus off.
+    frequency_actions: bool
     shutdown_actions: bool
     configuration: bool
     reset_safety: bool
@@ -231,6 +235,7 @@ def resolve_rig_control_state(
     safety_tripped: bool,
     hardware_offline: bool,
     engine_running: bool,
+    bus_energised: bool = False,
 ) -> RigControlState:
     """Return control permissions without consulting or mutating Tk widgets."""
 
@@ -244,6 +249,10 @@ def resolve_rig_control_state(
         edit_inputs=idle,
         local_actions=idle,
         hardware_actions=hardware_actions,
+        # A standalone frequency move has no closed-loop peak control behind
+        # it, so it is confined to a de-energised bus. The in-run frequency
+        # search is a different path: it holds Vds peak on target throughout.
+        frequency_actions=hardware_actions and not bus_energised,
         # De-energising actions may remain available during a safety trip, but
         # not when startup established that the hardware transport is offline.
         shutdown_actions=idle and hardware_reachable,

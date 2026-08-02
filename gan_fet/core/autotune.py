@@ -10,15 +10,42 @@ other configs, then the 25 °C equivalents.
 from __future__ import annotations
 
 import logging
+import math
 import threading
+import time
 from typing import Callable, Optional
 
 from gan_fet.core.models import MatrixPoint
-from gan_fet.instruments.base import WavegenInterface
+from gan_fet.instruments.base import OscilloscopeInterface, WavegenInterface
 from gan_fet.settings import WavegenSettings
 from gan_fet.storage.db import Database
 
 log = logging.getLogger(__name__)
+
+#: Vds peak is polled at least this often during a frequency ramp, counted in
+#: driver steps rather than seconds. Risk scales with how far the frequency has
+#: moved, not with elapsed time: a time-based throttle alone is starved by a
+#: fast ramp, which is exactly when the guard is needed most.
+PEAK_POLL_STEPS = 5
+#: A wall-clock bound as well, so a slow ramp is still watched frequently.
+PEAK_POLL_INTERVAL_S = 0.05
+
+
+class FrequencyRampAborted(RuntimeError):
+    """A frequency ramp was stopped because Vds peak approached the ceiling.
+
+    Distinct from a safety trip: the ramp is halted *before* the interlock
+    would fire, so the rig stays energised and under operator control.
+    """
+
+    def __init__(self, peak_v: float, ceiling_v: float, frequency_hz: float):
+        super().__init__(
+            f"frequency ramp stopped at {frequency_hz / 1e6:.4f} MHz: "
+            f"Vds peak {peak_v:.1f} V reached the {ceiling_v:.1f} V ramp ceiling"
+        )
+        self.peak_v = peak_v
+        self.ceiling_v = ceiling_v
+        self.frequency_hz = frequency_hz
 
 def tuned_frequency_search_order(
     temperature_c: int, config: str, all_configs: list[str]
@@ -49,9 +76,19 @@ class WavegenController:
         self,
         wavegen: WavegenInterface,
         settings: Optional[WavegenSettings] = None,
+        *,
+        scope: Optional[OscilloscopeInterface] = None,
+        peak_ceiling_v: Optional[float] = None,
     ):
         self.wavegen = wavegen
         self.settings = settings or WavegenSettings()
+        # Optional Vds peak guard. Moving the gate frequency shifts the
+        # resonant operating point, so with the bus live the peak can climb
+        # with nothing controlling it — this ramp has no closed loop behind it,
+        # unlike the in-run frequency search. When a scope and ceiling are
+        # supplied the ramp is halted before the interlock would trip.
+        self.scope = scope
+        self.peak_ceiling_v = peak_ceiling_v
         # State reads are short and never encompass transport I/O.  The
         # operation lock serializes compound hardware changes without causing
         # the nested state-lock deadlocks that the previous implementation had.
@@ -61,6 +98,63 @@ class WavegenController:
         self.applied_freq_hz: Optional[float] = None   # nominal selection
         self.applied_duty: Optional[float] = None
         self.tuned_freq_hz: Optional[float] = None     # actual (possibly tuned)
+
+    def _peak_guard(
+        self,
+        cancel_check: Optional[Callable[[], bool]],
+        breach: list[float],
+    ) -> Optional[Callable[[], bool]]:
+        """Wrap ``cancel_check`` so the ramp also stops on a peak excursion.
+
+        The driver already consults a cancel check on every step, which makes
+        it the natural place to hook monitoring without changing the transport
+        layer. Reads are throttled: the driver steps far more often than the
+        tank can respond, and a scope query per 10 kHz would dominate the ramp.
+
+        A failed read is *not* treated as safe-to-continue by this guard alone;
+        it is left to the safety monitor's read-failure watchdog, which already
+        trips after repeated failures.
+        """
+        ceiling = self.peak_ceiling_v
+        if self.scope is None or ceiling is None or ceiling <= 0.0:
+            return cancel_check
+
+        last_poll = 0.0
+        steps_since_poll = PEAK_POLL_STEPS
+
+        def guarded() -> bool:
+            nonlocal last_poll, steps_since_poll
+            if cancel_check is not None and cancel_check():
+                return True
+            steps_since_poll += 1
+            now = time.monotonic()
+            due = (
+                steps_since_poll >= PEAK_POLL_STEPS
+                or now - last_poll >= PEAK_POLL_INTERVAL_S
+            )
+            if not due:
+                return False
+            last_poll = now
+            steps_since_poll = 0
+            try:
+                raw = self.scope.peak_voltage()  # type: ignore[union-attr]
+            except Exception as exc:
+                log.warning("peak read failed during frequency ramp: %s", exc)
+                return False
+            if raw is None:
+                return False
+            try:
+                peak = float(raw)
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(peak):
+                return False
+            if peak > ceiling:
+                breach.append(peak)
+                return True
+            return False
+
+        return guarded
 
     def has_pending_changes(self, config: str, freq_hz: int, duty: int) -> bool:
         with self._state_lock:
@@ -236,6 +330,7 @@ class WavegenController:
             if start is None:
                 raise RuntimeError("Cannot determine current wavegen frequency")
 
+            breach: list[float] = []
             actual = self.wavegen.ramp_to_frequency(
                 target_hz,
                 dual,
@@ -244,10 +339,23 @@ class WavegenController:
                     if rate_khz_s is not None
                     else self.settings.freq_ramp_rate_khz_s
                 ),
-                cancel_check=cancel_check,
+                cancel_check=self._peak_guard(cancel_check, breach),
             )
+            # The ramp stops where it is rather than continuing to target, so
+            # the recorded tuned frequency must be what was actually applied.
             with self._state_lock:
                 self.tuned_freq_hz = actual
+            if breach:
+                log.error(
+                    "Frequency ramp aborted at %.4f MHz: Vds peak %.1f V "
+                    "reached the %.1f V ramp ceiling",
+                    actual / 1e6,
+                    breach[0],
+                    self.peak_ceiling_v or 0.0,
+                )
+                raise FrequencyRampAborted(
+                    breach[0], self.peak_ceiling_v or 0.0, float(actual)
+                )
             if status is not None:
                 status(f"Autotune: {actual / 1e6:.2f} MHz")
             log.info("Autotune ramp complete: %.0f Hz → %.0f Hz", start, actual)

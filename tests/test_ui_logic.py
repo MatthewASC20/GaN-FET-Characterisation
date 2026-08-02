@@ -182,6 +182,55 @@ def test_offline_policy_blocks_rig_actions_but_keeps_configuration_usable() -> N
     assert not state.reset_safety
 
 
+def test_frequency_actions_are_denied_while_the_bus_is_energised() -> None:
+    """Autotune moves the gate frequency with no closed-loop peak control.
+
+    Frequency shifts the resonant operating point and therefore Vds peak, so a
+    standalone move is confined to a de-energised bus. The in-run frequency
+    search is a separate path that holds the peak on target throughout.
+    """
+    live = resolve_rig_control_state(
+        active_kind=None,
+        closing=False,
+        safety_tripped=False,
+        hardware_offline=False,
+        engine_running=False,
+        bus_energised=True,
+    )
+    assert not live.frequency_actions
+    # Specific to frequency: other hardware actions stay available.
+    assert live.hardware_actions
+
+    off = resolve_rig_control_state(
+        active_kind=None,
+        closing=False,
+        safety_tripped=False,
+        hardware_offline=False,
+        engine_running=False,
+        bus_energised=False,
+    )
+    assert off.frequency_actions
+
+
+def test_frequency_actions_inherit_every_hardware_restriction() -> None:
+    for overrides in (
+        {"safety_tripped": True},
+        {"hardware_offline": True},
+        {"active_kind": "zvs"},
+        {"closing": True},
+    ):
+        kwargs = dict(
+            active_kind=None,
+            closing=False,
+            safety_tripped=False,
+            hardware_offline=False,
+            engine_running=False,
+            bus_energised=False,
+        )
+        kwargs.update(overrides)
+        assert not resolve_rig_control_state(**kwargs).frequency_actions, overrides
+
+
 def test_control_policy_preserves_safety_and_cancellation_paths() -> None:
     tripped = resolve_rig_control_state(
         active_kind=None,

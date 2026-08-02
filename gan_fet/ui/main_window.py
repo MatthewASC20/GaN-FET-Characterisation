@@ -16,7 +16,11 @@ from functools import partial
 from tkinter import messagebox, simpledialog, ttk
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from gan_fet.core.autotune import WavegenController, find_prior_tuned_frequency
+from gan_fet.core.autotune import (
+    FrequencyRampAborted,
+    WavegenController,
+    find_prior_tuned_frequency,
+)
 from gan_fet.ui.command_log_view import CommandLogConsole
 from gan_fet.core.events import (
     SampleAcquiredEvent,
@@ -1064,7 +1068,20 @@ class MainWindow(tk.Tk):
             hardware_offline=self.hardware_offline,
             engine_running=self.engine.state
             in (ExperimentState.RUNNING, ExperimentState.PAUSED),
+            bus_energised=self._bus_is_energised(),
         )
+
+    def _bus_is_energised(self) -> bool:
+        """Whether the SMU output is on, from cached state rather than I/O."""
+        smu = getattr(self, "smu", None)
+        if smu is None:
+            return False
+        try:
+            return bool(smu.output_is_on)
+        except Exception:  # pragma: no cover - defensive
+            # Unknown state is treated as energised: the conservative reading
+            # denies a frequency move rather than permitting one.
+            return True
 
     def _ensure_hardware_online(self, action: str) -> bool:
         """Block rig commands in offline mode; emergency stop remains available."""
@@ -1163,7 +1180,7 @@ class MainWindow(tk.Tk):
             controls.cancel_operation,
         )
 
-        if hasattr(self, "autotune_button") and not controls.hardware_actions:
+        if hasattr(self, "autotune_button") and not controls.frequency_actions:
             self.autotune_button.config(state="disabled")
 
     def _reset_safety(self) -> None:
@@ -1516,21 +1533,28 @@ class MainWindow(tk.Tk):
             self.confirm_button.set_style(bg=COLOR_OK, fg="white")
 
         controls = self._control_state()
-        if candidate and not self._tuner_busy and controls.hardware_actions:
+        if candidate and not self._tuner_busy and controls.frequency_actions:
             freq_mhz = candidate[0] / 1e6
             self.autotune_button.set_style(
                 bg=COLOR_OK, fg="white", active_bg="#388e3c",
                 text=f"Autotune: {freq_mhz:.2f} MHz", state="normal",
             )
         elif not self._tuner_busy:
+            # Say *why* it is unavailable: a live bus is an operator-fixable
+            # condition, unlike having no prior run to tune towards.
+            reason = (
+                "Autotune: Bus On"
+                if controls.hardware_actions and not controls.frequency_actions
+                else "Autotune Unavailable"
+            )
             self.autotune_button.set_style(
                 bg="#bdbdbd", fg="white",
-                text="Autotune Unavailable", state="disabled",
+                text=reason, state="disabled",
             )
         self.confirm_button.config(
             state="normal" if controls.hardware_actions else "disabled"
         )
-        if not controls.hardware_actions:
+        if not controls.frequency_actions:
             self.autotune_button.config(state="disabled")
 
     def _confirm_high_risk(self) -> bool:
@@ -1620,6 +1644,21 @@ class MainWindow(tk.Tk):
             HARDWARE_OPERATION_LABELS["autotune"]
         ):
             return
+        # Checked here as well as on the button: widget state is refreshed by
+        # callbacks and can lag the rig, and this operation moves the gate
+        # frequency with no closed-loop peak control behind it.
+        if self._bus_is_energised():
+            messagebox.showwarning(
+                "Autotune",
+                "The SMU bus is energised.\n\n"
+                "Autotune ramps the gate frequency, which moves the resonant "
+                "operating point and therefore Vds peak, with no closed-loop "
+                "peak control.\n\n"
+                "Switch the bus off first, or use 'Find frequency before run', "
+                "which holds Vds peak on target throughout the search.",
+                parent=self,
+            )
+            return
         candidate = self._tuning_candidate()
         if candidate is None:
             messagebox.showinfo("Autotune", "No tuned frequency is available for the current settings.")
@@ -1688,7 +1727,21 @@ class MainWindow(tk.Tk):
         self._tuner_busy = False
         self._finish_operation(token)
         if error is not None:
-            if not isinstance(error, InterruptedError):
+            if isinstance(error, FrequencyRampAborted):
+                # Not a trip: the ramp stopped short deliberately, so the gate
+                # is at an intermediate frequency and the rig is still live.
+                messagebox.showwarning(
+                    "Autotune Stopped",
+                    f"{error}\n\n"
+                    "The gate is left at the frequency reached, not the "
+                    "target. Reduce the bus voltage before retrying.",
+                    parent=self,
+                )
+                self.status_bar.set_message(
+                    f"Autotune stopped at {error.frequency_hz / 1e6:.4f} MHz "
+                    f"(Vds peak {error.peak_v:.0f} V)"
+                )
+            elif not isinstance(error, InterruptedError):
                 messagebox.showerror(
                     "Autotune Error", f"Autotune failed: {error}", parent=self
                 )

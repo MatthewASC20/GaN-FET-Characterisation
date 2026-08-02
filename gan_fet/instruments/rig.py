@@ -152,7 +152,19 @@ def build_instrument_rig(settings: Settings, *, simulate: bool = False) -> Instr
         smu = InstrumentFactory.create_smu(
             make_client(roles["smu"], is_smu=True), settings.smu
         )
-        controller = WavegenController(wavegen, settings.wavegen)
+        # The controller gets the scope and a ramp ceiling below the interlock,
+        # so a standalone frequency move is halted before a trip rather than
+        # after one. Sits under the hard ceiling by the same margin the
+        # frequency search uses.
+        controller = WavegenController(
+            wavegen,
+            settings.wavegen,
+            scope=scope,
+            peak_ceiling_v=(
+                settings.safety.max_vds_peak_v
+                * settings.frequency_tune.ceiling_margin_frac
+            ),
+        )
     except Exception:
         for client in clients:
             try:
