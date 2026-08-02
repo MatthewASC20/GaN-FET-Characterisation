@@ -239,10 +239,11 @@ def run_gui(settings: Settings, simulate: bool = False) -> int:
 
 
 def run_migration(settings: Settings, source: Path) -> int:
-    # Simulation reclaims its own abandoned lease; live data never does.
+    # Live bench records take the project lease; simulation does not, so a
+    # crashed practice run cannot leave a file that blocks the next start.
     db = Database(
         settings.db_path,
-        allow_stale_takeover=settings.is_simulation_runtime,
+        use_project_lock=not settings.is_simulation_runtime,
     )
     try:
         report = migrate_legacy_tree(db, source)

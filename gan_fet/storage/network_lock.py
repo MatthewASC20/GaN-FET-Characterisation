@@ -84,19 +84,9 @@ class NetworkProjectLock:
     _registry_lock: ClassVar[threading.RLock] = threading.RLock()
     _registry: ClassVar[dict[str, _SharedLease]] = {}
 
-    #: Takeover attempts before giving up, so a directory being repeatedly
-    #: re-locked by something else cannot spin here forever.
-    MAX_TAKEOVER_ATTEMPTS = 3
-
-    def __init__(self, target_dir: Path, *, allow_stale_takeover: bool = False):
+    def __init__(self, target_dir: Path):
         self.target_dir = Path(target_dir).resolve()
         self.lock_file = self.target_dir.parent / f"{self.target_dir.name}.lock"
-        # Reclaim a dead or stale lease instead of refusing. Off for live data,
-        # where the records are irreplaceable and network clock skew makes
-        # "stale" an unreliable judgement. Simulation opts in: its data is
-        # disposable practice output, and a lease left by a crash otherwise
-        # blocks the mode that exists to be a safe sandbox.
-        self.allow_stale_takeover = bool(allow_stale_takeover)
         self._pid = os.getpid()
         self._host = socket.gethostname()
         self._editing_since = datetime.now(timezone.utc).isoformat()
@@ -174,7 +164,6 @@ class NetworkProjectLock:
 
     def _acquire_sidecar(self, lease: _SharedLease) -> None:
         self.lock_file.parent.mkdir(parents=True, exist_ok=True)
-        takeovers = 0
         while True:
             try:
                 fd = os.open(
@@ -188,23 +177,7 @@ class NetworkProjectLock:
                     raise ConcurrentAccessError(
                         f"Existing project lock disappeared at {self.lock_file}"
                     )
-                dead_owner = _is_local_pid_dead(
-                    str(info.get("host", "")), info.get("pid")
-                )
-                stale = self._is_stale(info)
-                if (dead_owner or stale) and self.allow_stale_takeover:
-                    if takeovers >= self.MAX_TAKEOVER_ATTEMPTS:
-                        raise ConcurrentAccessError(
-                            f"{self._conflict_message(info)} The lease was "
-                            f"reclaimed {takeovers} times and is still being "
-                            "re-taken; something else is using this directory."
-                        )
-                    takeovers += 1
-                    self._take_over(
-                        info, reason="owner not running" if dead_owner else "stale"
-                    )
-                    continue
-                if dead_owner:
+                if _is_local_pid_dead(str(info.get("host", "")), info.get("pid")):
                     raise ConcurrentAccessError(
                         f"{self._conflict_message(info)} The local owner is no "
                         "longer running, but the lease was not removed "
@@ -212,7 +185,7 @@ class NetworkProjectLock:
                         "the path during cleanup. Verify the process is stopped, "
                         f"then remove the lock file manually: {self.lock_file}"
                     )
-                if stale:
+                if self._is_stale(info):
                     raise ConcurrentAccessError(
                         f"{self._conflict_message(info)} The lease appears stale, "
                         "but it was not removed automatically. Verify that the "
@@ -234,36 +207,6 @@ class NetworkProjectLock:
                 self.lock_file.unlink(missing_ok=True)
                 raise
             return
-
-    def _take_over(self, info: dict[str, Any], *, reason: str) -> None:
-        """Remove a lease this process has judged abandoned.
-
-        Only reached when takeover is enabled. The token is re-read and
-        compared immediately before unlinking: between the first read and now,
-        the owner may have released and someone else acquired, and removing
-        *their* live lease would be far worse than refusing to start.
-
-        A token that has changed is not an error — it means the path is in use
-        again — so the caller simply retries and finds a live conflict.
-        """
-        current = self._read_lock_info(strict=False)
-        if current is None:
-            return  # already gone; the retry will create it
-        if current.get("token") != info.get("token"):
-            return
-        log.warning(
-            "Reclaiming %s lease at %s (%s). This is enabled for simulation "
-            "only; live data requires an operator to confirm and remove it.",
-            reason,
-            self.lock_file,
-            self._conflict_message(info),
-        )
-        try:
-            self.lock_file.unlink(missing_ok=True)
-        except OSError as exc:
-            raise ConcurrentAccessError(
-                f"Could not reclaim the {reason} lease at {self.lock_file}: {exc}"
-            ) from exc
 
     @staticmethod
     def _payload(lease: _SharedLease) -> dict[str, Any]:

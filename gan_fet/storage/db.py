@@ -14,7 +14,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Protocol
 
 from gan_fet.core.models import (
     FinalReadings,
@@ -34,22 +34,56 @@ from gan_fet.storage.schema import (
 
 log = logging.getLogger(__name__)
 
+
+class _ProjectLock(Protocol):
+    """The three operations :class:`Database` needs from a project lease."""
+
+    def acquire(self) -> bool: ...
+
+    def release(self) -> None: ...
+
+    def assert_owned(self) -> None: ...
+
+
+class _UnlockedProject:
+    """No-op lease for data nobody else can be expected to be holding.
+
+    Not a weakened lock — an explicit absence of one. Simulation writes
+    disposable output to a private directory, so the cost of a leftover lease
+    file outweighs a mutual-exclusion guarantee that has nothing to exclude.
+    """
+
+    def acquire(self) -> bool:
+        return True
+
+    def release(self) -> None:
+        return None
+
+    def assert_owned(self) -> None:
+        return None
+
+
 class Database:
-    def __init__(self, path: Path | str, *, allow_stale_takeover: bool = False):
+    def __init__(self, path: Path | str, *, use_project_lock: bool = True):
         """Open the store, taking the project lease for its directory.
 
-        ``allow_stale_takeover`` lets a dead or stale lease be reclaimed rather
-        than refused. Reserved for simulation: bench records are irreplaceable
-        and network clock skew makes "stale" an unreliable judgement, so live
-        data always requires an operator to confirm and remove one.
+        ``use_project_lock`` exists for simulation. The lease protects
+        irreplaceable bench records on a shared directory, and is deliberately
+        fail-closed: a stale-looking lock is never cleared automatically,
+        because network clock skew makes that judgement unreliable. Applied to
+        disposable practice data on a local disk it only produces a file that
+        blocks the next start, so simulation does without it. SQLite's own
+        locking still serialises concurrent writers.
         """
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
         from gan_fet.storage.network_lock import NetworkProjectLock
 
-        self._net_lock = NetworkProjectLock(
-            self.path.parent, allow_stale_takeover=allow_stale_takeover
+        self._net_lock: _ProjectLock = (
+            NetworkProjectLock(self.path.parent)
+            if use_project_lock
+            else _UnlockedProject()
         )
         self._lock = threading.RLock()
         self._transaction_depth = 0
