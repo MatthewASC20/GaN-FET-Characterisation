@@ -357,10 +357,8 @@ class FrequencyTuner:
         """
         cfg = self.settings
         if warm_start_hz is not None and warm_start_hz > 0.0:
-            return (
-                max(1.0, warm_start_hz - cfg.warm_window_hz),
-                warm_start_hz + cfg.warm_window_hz,
-            )
+            half = warm_start_hz * cfg.warm_window_frac
+            return max(1.0, warm_start_hz - half), warm_start_hz + half
         if survey_resonance_hz is not None and survey_resonance_hz > 0.0:
             centre = survey_resonance_hz * (1.0 + cfg.survey_upward_bias_frac)
         else:

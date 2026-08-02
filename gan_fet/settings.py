@@ -325,19 +325,28 @@ class FrequencyTuneSettings:
     """
 
     #: Working window as a fraction of nominal when no warm start exists.
-    window_frac: float = 0.20
+    #: Across 460 historical runs the tuned frequency departed from nominal by
+    #: up to 21.7% (median 8.5%, p90 15.6%), so 0.20 would have clipped the
+    #: worst cases outright.
+    window_frac: float = 0.25
     #: Wide low-amplitude survey window, used when the bank is unknown.
     survey_window_frac: float = 0.50
     survey_step_hz: float = 200_000.0
     #: Survey runs at this fraction of target peak, where Coss varies little.
     survey_peak_frac: float = 0.18
-    #: The small-signal resonance sits below the working one; bias the window up.
-    survey_upward_bias_frac: float = 0.03
+    #: The small-signal resonance sits below the working one; bias the window
+    #: up. Measured drift is +6.3% median from 200 V to 400 V, and the survey
+    #: sits far below 200 V, so this is an extrapolation beyond the data.
+    #: Precision is not critical: the window width dominates, and this only has
+    #: to put the true optimum comfortably inside it.
+    survey_upward_bias_frac: float = 0.08
     coarse_step_hz: float = 100_000.0
     fine_step_hz: float = 20_000.0
     fine_span_hz: float = 100_000.0
-    #: Warm-started window half-width around a known good frequency.
-    warm_window_hz: float = 300_000.0
+    #: Warm-started window half-width, as a fraction of the warm-start
+    #: frequency. Fractional rather than absolute because drift scales with the
+    #: band: a fixed 300 kHz is 5% at 6 MHz but only 1.1% at 27 MHz.
+    warm_window_frac: float = 0.05
     settle_s: float = 0.5
     #: Peak excursion tolerated while stepping frequency, before the bus is
     #: backed off. Distinct from the hard safety ceiling, which trips.
@@ -931,7 +940,7 @@ class Settings:
                 "coarse_step_hz",
                 "fine_step_hz",
                 "fine_span_hz",
-                "warm_window_hz",
+                "warm_window_frac",
                 "settle_s",
                 "soft_band_v",
                 "ceiling_margin_frac",
