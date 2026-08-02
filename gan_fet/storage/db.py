@@ -35,13 +35,22 @@ from gan_fet.storage.schema import (
 log = logging.getLogger(__name__)
 
 class Database:
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, *, allow_stale_takeover: bool = False):
+        """Open the store, taking the project lease for its directory.
+
+        ``allow_stale_takeover`` lets a dead or stale lease be reclaimed rather
+        than refused. Reserved for simulation: bench records are irreplaceable
+        and network clock skew makes "stale" an unreliable judgement, so live
+        data always requires an operator to confirm and remove one.
+        """
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
         from gan_fet.storage.network_lock import NetworkProjectLock
 
-        self._net_lock = NetworkProjectLock(self.path.parent)
+        self._net_lock = NetworkProjectLock(
+            self.path.parent, allow_stale_takeover=allow_stale_takeover
+        )
         self._lock = threading.RLock()
         self._transaction_depth = 0
         self._savepoint_counter = 0

@@ -239,7 +239,11 @@ def run_gui(settings: Settings, simulate: bool = False) -> int:
 
 
 def run_migration(settings: Settings, source: Path) -> int:
-    db = Database(settings.db_path)
+    # Simulation reclaims its own abandoned lease; live data never does.
+    db = Database(
+        settings.db_path,
+        allow_stale_takeover=settings.is_simulation_runtime,
+    )
     try:
         report = migrate_legacy_tree(db, source)
         print(report.summary())
