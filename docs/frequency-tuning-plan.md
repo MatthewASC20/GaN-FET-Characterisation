@@ -394,3 +394,62 @@ Phase 3 (foundations) ──┘        ↑
   history, not a property of the rig.
 - Silently characterise at a resonance far from nominal. Find it, use it,
   and flag that the bank is off design.
+
+#### First simulated run against the new model (2026-08-02)
+
+Confirms the change end to end, and turned up three things worth fixing.
+
+**It works.** The run settled at **6.8331 MHz, bus 55.41 V, Vds peak 200.03 V,
+P4 dwell 7.05**. The previous run, against the old model, settled at 5.2408 MHz
+with dwell 0.000. The no-ZVS warning correctly stays silent.
+
+**The escalation earned its place.** The warm start was 5,240,831 Hz — the
+previous run's no-ZVS answer. Its ±5% window (4.979–5.503 MHz) put the best
+point on an edge, so the warm start was discarded and a survey run at 18%
+amplitude (bus 10.95 V, peak 35.8 V) across 3–9 MHz located resonance near
+6.4 MHz. The wide re-sweep then found ZVS across 6.10–6.99 MHz. Without that
+escalation the run would have stayed in the dead region.
+
+##### Open: a 402 V transient at a 200 V target
+
+Returning to the winner from 8.59 MHz down to 6.77 MHz, P1 read **402.3 V**
+with the bus at 97.5652 V.
+
+That is the reachability guard behaving exactly as specified. `cap_for(gain)`
+is `ceiling_v / (gain × growth_factor)` = 429.75 / (4.19 × 1.05) = 97.68 V,
+matching the bus observed, and the resulting peak sits under both the 429.75 V
+cap and the 450 V interlock. No trip, by construction.
+
+The problem is that the cap is **absolute**. It bounds the peak against the
+interlock — which was set for the 400 V test — and not against *this run's*
+target. At a 400 V target that permits at most 7.5% over. At a 200 V target it
+permits 100% over, which is what happened. A device only ever intended for
+200 V would see 402 V during a routine return-to-winner.
+
+The 450 V interlock should not move. The fix is a second, tighter per-run bound
+— a jump cap of roughly `target + soft_band` — so an excursion is bounded by
+the operating point as well as by what the rig can survive.
+
+##### Open: 3 min 40 s for a six-second validation
+
+| phase | time |
+|---|---|
+| survey (ramp to 3 MHz, sweep to 9 MHz, return) | **89 s** |
+| wide coarse sweep | 70 s |
+| stale warm-start sweep, wasted | 21 s |
+| return to winner + fine sweep | 26 s |
+| the actual run | 6 s |
+
+Almost all of the survey is *travel*, not measurement. Every frequency move
+ramps at 10 kHz per ~55 ms, so one 200 kHz survey step costs 1.1 s in twenty
+wavegen writes, and the 6→3 MHz approach alone costs 16 s. The survey runs at
+18% amplitude precisely because the tank is near-linear there, so the slow ramp
+buys nothing — and it is crossing ground it is about to sweep anyway. Ramping
+at the survey step size would cut roughly 70 s.
+
+##### Open: a warm start with no ZVS should not be trusted
+
+21 s went into sweeping a window seeded by an answer already known to have zero
+dwell. Now that dwell is recorded at the winner, a stored frequency whose dwell
+was measured as zero is evidence the previous run converged in the wrong place,
+and is worth less than no warm start at all.
