@@ -38,6 +38,13 @@ from gan_fet.ui.run_request import (
     tuning_candidate,
 )
 from gan_fet.ui.operations.background import run_in_background
+from gan_fet.ui.operations.experiment_ops import (
+    APPLY_FIRST_PROMPT,
+    CancelTarget,
+    ExperimentAction,
+    cancel_target,
+    experiment_precondition,
+)
 from gan_fet.ui.operations.rig_ops import (
     ZvsAction,
     raise_if_aborted,
@@ -1976,36 +1983,36 @@ class MainWindow(tk.Tk):
             return None
 
     def _start_experiment(self) -> None:
-        if not self._ensure_hardware_online(
-            HARDWARE_OPERATION_LABELS["experiment"]
-        ):
+        decision = experiment_precondition(
+            hardware_offline=self.hardware_offline,
+            safety_tripped=self._safety_is_tripped(),
+            busy=self.operations.busy,
+        )
+        if decision.action is ExperimentAction.HARDWARE_OFFLINE:
+            self._ensure_hardware_online(HARDWARE_OPERATION_LABELS["experiment"])
             return
-        if self._safety_is_tripped():
-            messagebox.showwarning(
-                "Safety Interlock",
-                "Reset the latched safety trip before starting an experiment.",
-                parent=self,
-            )
+        if decision.action is ExperimentAction.REFUSE:
+            assert decision.refusal is not None
+            self._show_refusal(decision.refusal)
             return
-        if self.operations.busy:
+        if decision.action is ExperimentAction.REPORT_BUSY:
+            # Reports which operation holds the rig, and refuses to start.
             self._begin_operation("experiment")
             return
+
         params = self._build_params()
         if params is None:
             return
         if self.wavegen_controller.has_pending_changes(
             params.point.config, params.point.frequency_hz, params.point.duty_pct
         ):
-            if messagebox.askyesno(
-                "Wavegen Settings",
-                "The wavegen does not match the selected parameters.\n\nApply them now?",
-                parent=self,
-            ):
+            # Declining cancels the start rather than running on stale
+            # settings: a run recorded against parameters the wavegen was not
+            # using is worse than no run at all.
+            if messagebox.askyesno(*APPLY_FIRST_PROMPT, parent=self):
                 self._apply_wavegen(
                     after_success=partial(self._launch_experiment, params)
                 )
-            else:
-                return
             return
         self._launch_experiment(params)
 
@@ -2026,10 +2033,16 @@ class MainWindow(tk.Tk):
         self.engine.toggle_pause()
 
     def _cancel_experiment(self) -> None:
-        if self._request_zvs_stop():
+        if cancel_target(self.operations.active_kind) is CancelTarget.ZVS_SEARCH:
+            self._request_zvs_stop()
             return
         self.operations.cancel_active()
-        if self.operations.active_kind == "sequence":
+        # Re-read after cancelling: what to stop is decided from the kind that
+        # is still active, and cancel_active does not clear it.
+        if cancel_target(self.operations.active_kind) is CancelTarget.SEQUENCE:
+            # A sequence must be cancelled at the sequence level. Cancelling
+            # the engine would end the current point and let the sequence start
+            # the next one, which looks like Cancel not working.
             self.sequence.cancel()
             self.sequence_button.config(text="Stopping...", state="disabled")
         else:
