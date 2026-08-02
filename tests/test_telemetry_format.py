@@ -15,6 +15,7 @@ from gan_fet.ui.telemetry_format import (
     format_frequency,
     format_milliamps,
     format_volts,
+    last_current_text,
 )
 
 
@@ -77,3 +78,26 @@ def test_unusable_values_are_reported_as_missing(formatter, bad):
 def test_zero_current_is_distinguishable_from_no_current_reading():
     assert format_milliamps(0.0) != format_milliamps(None)
     assert format_amps(0.0) != format_amps(None)
+
+
+# -- the headline "Last Current" readout --------------------------------------
+
+
+def test_the_last_current_readout_keeps_six_decimal_places():
+    """This is the number an operator watches for the small changes that say a
+    frequency step helped. Rounding it to milliamps hides exactly that."""
+    assert last_current_text(0.032712) == "Last Current: 0.032712 A"
+
+
+def test_two_currents_a_microamp_apart_read_differently():
+    assert last_current_text(0.032712) != last_current_text(0.032713)
+
+
+def test_no_reading_yet_reads_as_a_dash():
+    assert last_current_text(None) == f"Last Current: {NO_READING}"
+
+
+def test_the_placeholder_and_the_cleared_state_agree():
+    """One rendering, so the startup label cannot say something different from
+    the label that replaces it when a device is cleared."""
+    assert last_current_text(None) == last_current_text(float("nan"))

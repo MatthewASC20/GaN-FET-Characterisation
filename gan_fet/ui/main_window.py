@@ -38,9 +38,11 @@ from gan_fet.ui.run_request import (
     tuning_candidate,
 )
 from gan_fet.ui.panels.device_bar import DeviceBar
+from gan_fet.ui.panels.run_controls import RunControls
 from gan_fet.ui.panels.smu_panel import SmuPanel
 from gan_fet.ui.panels.telemetry_panel import TelemetryPanel
 from gan_fet.ui.smu_status import smu_status_line
+from gan_fet.ui.telemetry_format import last_current_text
 from gan_fet.ui.param_options import (
     OPTION_KEYS as _OPTION_KEYS,
     default_label,
@@ -78,7 +80,6 @@ from gan_fet.ui.plot import LivePlot
 from gan_fet.ui.tracker_view import UpNextView
 from gan_fet.ui.widgets import (
     resolve_confirm_presentation,
-    ColorButton,
     OperationCoordinator,
     OperationToken,
     ParamButtonGroup,
@@ -297,7 +298,7 @@ class MainWindow(tk.Tk):
         self.ui_dispatcher.post(self.status_bar.set_message, event.message)
 
     def _on_sample_event(self, event: SampleAcquiredEvent) -> None:
-        self.last_current_label.config(text=f"Last Current: {event.amps:.6f} A")
+        self.last_current_label.config(text=last_current_text(event.amps))
         self.plot.append(event.elapsed_s, event.amps, event.smu_voltage)
         self.update_telemetry(
             freq_hz=event.frequency_hz,
@@ -344,18 +345,10 @@ class MainWindow(tk.Tk):
 
     def _apply_zvs_visibility(self) -> None:
         """Show or hide the voltage-only ZVS control per the Config setting."""
-        checkbox = getattr(self, "find_zvs_checkbox", None)
-        if checkbox is None:
+        controls = getattr(self, "run_controls", None)
+        if controls is None:
             return
-        if self.show_zvs_sweep_var.get():
-            checkbox.grid(
-                row=ExperimentRow.RUN_OPTIONS, column=2, sticky="w", padx=5
-            )
-        else:
-            checkbox.grid_remove()
-            # Hidden means inactive: a control the operator cannot see must
-            # not silently keep steering the run.
-            self.find_zvs_var.set(False)
+        controls.set_zvs_sweep_visible(bool(self.show_zvs_sweep_var.get()))
 
     def _first(self, key: str) -> Any:
         options = self.param_options.get(key) or []
@@ -542,68 +535,25 @@ class MainWindow(tk.Tk):
             self.param_groups[key] = group
 
     def _build_run_controls(self) -> None:
-        ttk.Label(self.main_frame, text="Duration (min):").grid(
-            row=ExperimentRow.RUN_OPTIONS,
-            column=0,
-            sticky="e",
-            padx=5,
-            pady=5,
-        )
-        self.duration_entry = ttk.Entry(self.main_frame, width=10)
-        self.duration_entry.insert(
-            0, str(self.settings.default_duration_minutes(self.voltage_var.get()))
-        )
-        self.duration_entry.grid(
-            row=ExperimentRow.RUN_OPTIONS, column=1, sticky="w"
-        )
-
-        # Frequency tuning is on by default and lives in Config > Advanced:
-        # it is part of establishing the operating point, not a per-run choice.
-        # The voltage-only ZVS sweep is kept mainly to exercise the frequency
-        # search independently, so it stays hidden unless revealed in Config.
-        self.find_zvs_checkbox = ttk.Checkbutton(
+        self.run_controls = RunControls(
             self.main_frame,
-            text="Find ZVS before run",
-            variable=self.find_zvs_var,
+            options_row=ExperimentRow.RUN_OPTIONS,
+            buttons_row=ExperimentRow.RUN_BUTTONS,
+            default_duration=str(
+                self.settings.default_duration_minutes(self.voltage_var.get())
+            ),
+            find_zvs_var=self.find_zvs_var,
+            on_apply_wavegen=self._apply_wavegen,
+            on_autotune=self._start_autotune,
         )
+        # Enabled state and confirm/autotune styling are resolved by the
+        # window, so these stay addressable from it.
+        self.duration_entry = self.run_controls.duration_entry
+        self.find_zvs_checkbox = self.run_controls.find_zvs_checkbox
+        self.last_current_label = self.run_controls.last_current_label
+        self.confirm_button = self.run_controls.confirm_button
+        self.autotune_button = self.run_controls.autotune_button
         self._apply_zvs_visibility()
-
-        self.last_current_label = ttk.Label(self.main_frame, text="Last Current: N/A")
-        self.last_current_label.grid(
-            row=ExperimentRow.RUN_BUTTONS,
-            column=0,
-            sticky="w",
-            padx=5,
-            pady=5,
-        )
-
-        self.confirm_button = ColorButton(
-            self.main_frame,
-            text="Apply Wavegen Settings",
-            command=self._apply_wavegen,
-            width=170, height=36, borderless=1, highlightthickness=1,
-        )
-        self.confirm_button.grid(
-            row=ExperimentRow.RUN_BUTTONS,
-            column=1,
-            sticky="w",
-            padx=5,
-            pady=5,
-        )
-
-        self.autotune_button = ColorButton(
-            self.main_frame,
-            text="Autotune Unavailable",
-            command=self._start_autotune,
-            width=170, height=36, borderless=1, highlightthickness=1,
-        )
-        self.autotune_button.grid(
-            row=ExperimentRow.RUN_BUTTONS,
-            column=2,
-            sticky="w",
-            padx=5,
-            pady=5,
-        )
 
     def _build_telemetry_panel(self) -> None:
         self.telemetry_panel = TelemetryPanel(self.main_frame)
@@ -1203,9 +1153,8 @@ class MainWindow(tk.Tk):
     def _on_voltage_changed(self) -> None:
         if not self._ui_ready:
             return
-        self.duration_entry.delete(0, tk.END)
-        self.duration_entry.insert(
-            0, str(self.settings.default_duration_minutes(self.voltage_var.get()))
+        self.run_controls.set_duration(
+            str(self.settings.default_duration_minutes(self.voltage_var.get()))
         )
         self._refresh_confirm_state()
         self.update_telemetry()
@@ -1252,7 +1201,7 @@ class MainWindow(tk.Tk):
         if hasattr(self, "plot"):
             self.plot.reset()
         if hasattr(self, "last_current_label"):
-            self.last_current_label.config(text="Last Current: —")
+            self.last_current_label.config(text=last_current_text(None))
         if hasattr(self, "status_bar"):
             self.status_bar.set_message("No device selected.")
         self._refresh_confirm_state()
@@ -1371,8 +1320,7 @@ class MainWindow(tk.Tk):
         assign(self.temperature_var, "temperature", "temperatures", int)
         assign(self.voltage_var, "voltage", "voltages", int)
         if "duration" in params:
-            self.duration_entry.delete(0, tk.END)
-            self.duration_entry.insert(0, str(params["duration"]))
+            self.run_controls.set_duration(str(params["duration"]))
         self.tracker.refresh()
 
     def _save_last_params(self) -> None:
@@ -2126,7 +2074,7 @@ class MainWindow(tk.Tk):
 
     def _on_sample(self, elapsed: float, amps: float) -> None:
         """Compatibility callback for older engines; not wired in this UI."""
-        self.last_current_label.config(text=f"Last Current: {amps:.6f} A")
+        self.last_current_label.config(text=last_current_text(amps))
         self.plot.append(elapsed, amps)
         self._update_smu_panel()
 

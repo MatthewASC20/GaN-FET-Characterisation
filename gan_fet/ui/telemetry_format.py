@@ -52,3 +52,15 @@ def format_amps(amps: Optional[float]) -> str:
     """RMS currents, shown in A: these run to several amps."""
     value = _finite(amps)
     return f"{NO_READING} A" if value is None else f"{value:.3f} A"
+
+
+def last_current_text(amps: Optional[float]) -> str:
+    """The headline "Last Current" readout.
+
+    Six decimal places rather than the card's three: this is the number an
+    operator watches for the small changes that say a frequency step helped,
+    and rounding it to milliamps hides exactly that.
+    """
+    value = _finite(amps)
+    reading = NO_READING if value is None else f"{value:.6f} A"
+    return f"Last Current: {reading}"
