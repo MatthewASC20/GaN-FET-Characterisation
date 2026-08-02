@@ -83,6 +83,23 @@ class TuneResult:
     survey_resonance_hz: Optional[float] = None
     clipped_at_edge: bool = False
     anomalies: int = 0
+    #: Fraction of the cycle Vds sat below the ZVS threshold at the chosen
+    #: frequency. ``None`` when the scope could not measure it, which is not
+    #: the same as a measured zero — see :attr:`no_zvs_at_winner`.
+    zvs_dwell_fraction: Optional[float] = None
+
+    @property
+    def no_zvs_at_winner(self) -> bool:
+        """Whether the search settled somewhere with no measured ZVS.
+
+        On this rig the minimum-input-power point and the ZVS point coincide,
+        so a winner with a *measured* zero dwell means the search converged in
+        the wrong region — the objective found a shoulder rather than the
+        basin. An unmeasurable dwell says nothing and is not reported here.
+        """
+        return self.zvs_dwell_fraction is not None and (
+            self.zvs_dwell_fraction <= 0.0
+        )
 
 
 class FrequencyTuner:
@@ -146,7 +163,7 @@ class FrequencyTuner:
         return self._read(lambda: self.scope.peak_voltage(), "scope peak")
 
     def _read_dwell(self) -> Optional[float]:
-        """ZVS dwell here, recorded but not yet acted on.
+        """ZVS dwell here, recorded per point and reported at the winner.
 
         A sweep already visits the whole window, so capturing the dwell at
         every point turns each ordinary search into a map of where ZVS
@@ -662,16 +679,15 @@ class FrequencyTuner:
                 f"{winner.frequency_hz / 1e6:.4f} MHz: {exc}"
             ) from exc
 
-        log.info(
-            "Frequency search: %.4f MHz, P_in %.3f W at bus %.1f V "
-            "(%d minima, %d anomalies)",
-            winner.frequency_hz / 1e6,
-            winner.input_power_w,
-            winner.bus_voltage_v,
-            len(minima),
-            anomalies,
-        )
-        return TuneResult(
+        # Re-read the dwell at the settled operating point rather than reusing
+        # the swept value: this is the frequency and bus the run will actually
+        # use. Fall back to what the sweep saw if the scope cannot answer now,
+        # so a single failed read does not erase a good measurement.
+        dwell = self._read_dwell()
+        if dwell is None:
+            dwell = winner.zvs_dwell_fraction
+
+        result = TuneResult(
             frequency_hz=winner.frequency_hz,
             input_power_w=winner.input_power_w,
             bus_voltage_v=float(self.smu.setpoint_v),
@@ -681,4 +697,31 @@ class FrequencyTuner:
             survey_resonance_hz=survey_hz,
             clipped_at_edge=clipped,
             anomalies=anomalies,
+            zvs_dwell_fraction=dwell,
         )
+
+        log.info(
+            "Frequency search: %.4f MHz, P_in %.3f W at bus %.1f V, "
+            "ZVS dwell %s (%d minima, %d anomalies)",
+            winner.frequency_hz / 1e6,
+            winner.input_power_w,
+            winner.bus_voltage_v,
+            "unmeasured" if dwell is None else f"{dwell:.3f}",
+            len(minima),
+            anomalies,
+        )
+        if result.no_zvs_at_winner:
+            # Worth stopping on rather than filing away: the operator's own
+            # method is to find ZVS first and minimise current around it, so a
+            # chosen point with no ZVS at all contradicts how this rig behaves.
+            # The usual cause is a search window that never reached the basin.
+            message = (
+                f"Chosen frequency {winner.frequency_hz / 1e6:.4f} MHz shows no "
+                "ZVS (dwell 0). Minimum input power and ZVS coincide on this "
+                "rig, so the search probably settled on a shoulder outside the "
+                "resonant basin — widen the window or check the P4 measurement."
+            )
+            log.warning("%s", message)
+            if status is not None:
+                status(message)
+        return result

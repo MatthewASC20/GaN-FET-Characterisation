@@ -494,11 +494,28 @@ class ExperimentEngine:
                     status=self._update_status,
                 )
                 bus_voltage = tune_result.bus_voltage_v
+                dwell = tune_result.zvs_dwell_fraction
+                dwell_text = (
+                    "ZVS unmeasured"
+                    if dwell is None
+                    else f"ZVS dwell {dwell:.3f}"
+                )
                 self._update_status(
                     f"Frequency: {tune_result.frequency_hz / 1e6:.4f} MHz "
                     f"(P_in {tune_result.input_power_w:.2f} W, "
-                    f"{len(tune_result.minima_hz)} minima)"
+                    f"{dwell_text}, {len(tune_result.minima_hz)} minima)"
                 )
+                if tune_result.no_zvs_at_winner:
+                    # Recorded against the run, not just logged: a point taken
+                    # with no ZVS is still valid data, but it is not the
+                    # operating point the search was asked to find.
+                    self.db.add_safety_event(
+                        self._run_id_for_audit,
+                        "frequency_tune_no_zvs",
+                        f"Chosen frequency {tune_result.frequency_hz / 1e6:.4f} "
+                        "MHz shows no ZVS; the search likely settled outside "
+                        "the resonant basin",
+                    )
                 if self._cancelled():
                     terminal_status = "cancelled"
                     message = "Cancelled after the frequency search."

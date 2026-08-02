@@ -144,3 +144,64 @@ separation. Schema 5 already carries `tuned_frequency_hz` and
 4. Should the software be allowed to write the threshold when the target
    voltage changes, or does the operator own it? This is a design-contract
    decision, not a technical one.
+
+## The simulated plant cannot validate the objective (2026-08-01)
+
+Investigating a `--simulate` log that settled at 5.2408 MHz, I swept the
+simulated plant from 4.6–7.4 MHz holding Vds peak at 200 V:
+
+| f (MHz) | gain | I (mA) | P_in (W) | dwell |
+|---|---|---|---|---|
+| 5.30 | 2.11 | 23.5 | **2.243** ← the search picks this | **0.000** |
+| 6.00 | 3.00 | 35.2 | 2.333 | 0.000 |
+| 6.50 | 4.19 | 65.2 | 3.113 | **0.170** ← best ZVS |
+
+**In the simulated plant, minimum `P_in` and ZVS are anti-correlated.** The ZVS
+point costs 39% more input power, so the search correctly minimises its
+objective and lands somewhere with no ZVS at all. Confirmed not to be a
+warm-start artefact: eight generations feeding each result forward are stable
+at 5.30–5.34 MHz, and a full ±25% window — which contains the model's
+resonance at 6.39 MHz — also chooses 5.31 MHz.
+
+The cause is in `SimulatedRigPlant._resonant_loss_a`. Its switching-loss term
+is shaped by a Lorentzian and a `(1 + 3.5·detuning)` tilt, which makes it
+*largest* on the high side — exactly where the same model's
+`zvs_dwell_fraction` is largest. Switching loss is the loss ZVS eliminates, so
+the two should move oppositely. Circulating loss (35 mA at resonance) also
+outweighs switching loss (10 mA maximum) by 3.5×, so total current simply
+peaks at resonance with nothing to pull the minimum back toward it.
+
+**The operator confirms that on the bench the two coincide** — the manual
+method is to find ZVS near the target peak and minimise current around it. The
+model is therefore wrong about this rig, and until it is fixed, `--simulate`
+validates the search's mechanics only: window coverage, peak holding, safety
+ordering, cancellation. It cannot catch a regression in the objective, and a
+simulated run that reports success has not demonstrated that the search finds
+ZVS. `tests/test_frequency_tune.py` already says as much in its docstring,
+which is why nothing flagged this.
+
+Two consequences, one addressed:
+
+- **Addressed.** `TuneResult` now carries the dwell measured at the settled
+  winner, and a *measured* zero raises a warning to the operator and a
+  `frequency_tune_no_zvs` safety event against the run. Because the two
+  coincide on this rig, a zero-dwell winner means the search converged on a
+  shoulder outside the resonant basin. `None` (unmeasurable) is deliberately
+  not treated as zero.
+- **Open.** Near the chosen point the objective is flat to within the
+  measurement noise: `P_in` spans 2.24–2.31 W across 5.2–5.5 MHz while
+  *adjacent* points differ by ~0.3%. Since `P_in ∝ V_peak²`, the ±2 V
+  peak-control tolerance is worth ~2% — larger than the signal being
+  discriminated. Normalising each `P_in` by `(target / achieved_peak)²` would
+  remove most of it. In simulation the peak lands at 201.5 V consistently so
+  this changes little; on the bench, where peak control will be less
+  repeatable, it is predicted to dominate.
+
+### Next, in order
+
+1. Tie the plant's switching-loss term to the dwell the model already
+   computes, so `P_in` dips where ZVS turns on. Without this the simulator
+   cannot validate the thing the search exists to do.
+2. Normalise `P_in` for peak error.
+3. Reduce wasted frequency travel: entering the window from its far floor and
+   two full-length returns to best cost ~10 s of the 28 s search in the log.

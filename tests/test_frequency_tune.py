@@ -339,3 +339,134 @@ def test_an_unclipped_warm_start_is_kept(plant):
     span = max(wavegen.frequencies) - min(wavegen.frequencies)
     warm_span = 2 * 6_950_000.0 * tuner.settings.warm_window_frac
     assert span <= warm_span * 1.5
+
+
+# -- ZVS dwell at the chosen frequency ---------------------------------------
+#
+# On this rig the minimum-input-power point and the ZVS point coincide: the
+# operator's own method is to find ZVS near the target peak and minimise
+# current around it. So a winner with no measured ZVS is evidence the search
+# converged on a shoulder outside the resonant basin, and it has to be visible
+# rather than filed away in the point list.
+
+
+class _DwellScope(_Scope):
+    """A scope whose ZVS dwell can be pinned or made unreadable."""
+
+    def __init__(self, plant, dwell) -> None:
+        super().__init__(plant)
+        self.dwell = dwell
+
+    def zvs_dwell_fraction(self):
+        if self.dwell == "unreadable":
+            raise OSError("P4 not configured")
+        return self.dwell
+
+
+def _tune_with_dwell(plant, dwell):
+    tuner, _smu, _wavegen, _safety = _build(plant)
+    tuner.scope = _DwellScope(plant, dwell)
+    tuner.peak_controller.scope = tuner.scope
+    messages: list[str] = []
+    result = tuner.find_minimum(
+        6_000_000.0,
+        200.0,
+        "Single Device",
+        warm_start_hz=6_950_000.0,
+        run_survey=False,
+        status=messages.append,
+    )
+    return result, messages
+
+
+def test_the_dwell_at_the_chosen_frequency_is_reported(plant):
+    result, _messages = _tune_with_dwell(plant, 0.18)
+    assert result.zvs_dwell_fraction == pytest.approx(0.18)
+    assert not result.no_zvs_at_winner
+
+
+def test_a_winner_with_no_zvs_is_flagged(plant):
+    result, messages = _tune_with_dwell(plant, 0.0)
+    assert result.zvs_dwell_fraction == 0.0
+    assert result.no_zvs_at_winner
+    assert any("no ZVS" in message for message in messages), (
+        "a zero-dwell winner must reach the operator, not just the log"
+    )
+
+
+def test_an_unmeasurable_dwell_is_not_reported_as_no_zvs(plant):
+    """None and 0.0 are different answers. A scope that cannot measure dwell
+    says nothing about ZVS, and must not be turned into an accusation that the
+    search converged in the wrong place."""
+    result, messages = _tune_with_dwell(plant, "unreadable")
+    assert result.zvs_dwell_fraction is None
+    assert not result.no_zvs_at_winner
+    assert not any("no ZVS" in message for message in messages)
+
+
+def test_dwell_is_measured_at_the_settled_point_not_reused_from_the_sweep(plant):
+    """The reported dwell describes the frequency and bus the run will use.
+
+    The sweep reads dwell mid-convergence, before the bus has settled back onto
+    the target peak. Marking every swept point with a sentinel that the scope
+    never returns shows which of the two the result carries.
+    """
+    tuner, _smu, _wavegen, _safety = _build(plant)
+    scope = _DwellScope(plant, 0.77)
+    tuner.scope = scope
+    tuner.peak_controller.scope = scope
+
+    original = tuner._evaluate
+
+    def stamp(*args, **kwargs):
+        point = original(*args, **kwargs)
+        point.zvs_dwell_fraction = 0.11  # never produced by the scope
+        return point
+
+    tuner._evaluate = stamp  # type: ignore[method-assign]
+    result = tuner.find_minimum(
+        6_000_000.0, 200.0, "Single Device",
+        warm_start_hz=6_950_000.0, run_survey=False,
+    )
+    assert result.zvs_dwell_fraction == pytest.approx(0.77)
+
+
+def test_a_failed_final_read_falls_back_to_what_the_sweep_saw(plant):
+    """One unlucky read must not erase a good measurement."""
+    tuner, _smu, _wavegen, _safety = _build(plant)
+    scope = _DwellScope(plant, 0.31)
+    tuner.scope = scope
+    tuner.peak_controller.scope = scope
+
+    original = tuner._evaluate
+
+    def stamp_then_break(*args, **kwargs):
+        point = original(*args, **kwargs)
+        point.zvs_dwell_fraction = 0.11
+        return point
+
+    tuner._evaluate = stamp_then_break  # type: ignore[method-assign]
+    tuner.find_minimum(
+        6_000_000.0, 200.0, "Single Device",
+        warm_start_hz=6_950_000.0, run_survey=False,
+    )
+    # Same search, but with the scope failing by the time the winner settles.
+    tuner2, _s2, _w2, _sa2 = _build(plant)
+    scope2 = _DwellScope(plant, 0.31)
+    tuner2.scope = scope2
+    tuner2.peak_controller.scope = scope2
+    original2 = tuner2._evaluate
+
+    def stamp_and_disable(*args, **kwargs):
+        point = original2(*args, **kwargs)
+        point.zvs_dwell_fraction = 0.11
+        scope2.dwell = "unreadable"
+        return point
+
+    tuner2._evaluate = stamp_and_disable  # type: ignore[method-assign]
+    result = tuner2.find_minimum(
+        6_000_000.0, 200.0, "Single Device",
+        warm_start_hz=6_950_000.0, run_survey=False,
+    )
+    assert result.zvs_dwell_fraction == pytest.approx(0.11)
+    assert not result.no_zvs_at_winner
