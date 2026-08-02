@@ -99,6 +99,34 @@ apart is what created the current tangle.
 
 Roughly 700 lines out. Highest GUI risk — do one panel per commit.
 
+### What Phase 2 actually did
+
+All four panels exist, one commit each. Two deviations worth recording.
+
+**Only `DeviceBar` took its refresh with it.** `SmuPanel` and `RunControls`
+expose their widgets and the window still applies `resolve_rig_control_state`
+to them. The reason is the constraint at the top of this document: several
+`test_ui_logic.py` tests address those widgets directly — `window.zvs_button =
+_FakeWidget()` and then assert on its options — and moving the seam means
+rewriting tests that cannot be executed in a headless environment. Rewriting a
+test you cannot run, to match a refactor you cannot run, is not a check; it is
+two unverified changes agreeing with each other. Moving that seam is the first
+item of Phase 3, to be done where `pytest -q` can include `test_ui_logic.py`.
+
+**About 160 lines out, not 700.** The estimate counted the parameter groups
+and option editors, which already live in `ParamButtonGroup` and
+`ParameterListEditor` — `_build_parameter_groups` is a ten-line loop over
+them. The Tk-free extractions were the larger share of the value:
+`telemetry_format.py`, `device_actions.py` and `smu_status.py` are 65 new
+headless tests over decisions that previously needed a display, including the
+device-removal guards, which stand in front of the most destructive action in
+the UI.
+
+Three placeholder inconsistencies fell out of the moves and were fixed, each
+a case of one label contradicting the label that replaced it: the telemetry
+frequency card's hardcoded `13.00 MHz`, the SMU line's `Bus:` versus
+`Bus setpoint:`, and `Last Current: N/A` versus `Last Current: —`.
+
 ## Phase 3 — Operation controllers
 
 The behaviour, separated from the widgets that trigger it:
