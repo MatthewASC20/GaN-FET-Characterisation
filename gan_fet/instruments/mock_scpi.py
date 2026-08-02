@@ -39,6 +39,7 @@ class SimulatedRigPlant:
         resonant_peak_gain: float = 4.2,
         coss_shift_frac: float = 0.045,
         zvs_onset_gain: float = 3.2,
+        off_resonance_gain: float = 1.15,
     ):
         self.lock = threading.RLock()
         self.peak_gain = float(peak_gain)
@@ -60,6 +61,12 @@ class SimulatedRigPlant:
         # Below it the dwell is exactly zero, which is what makes ZVS onset
         # a crossing rather than a minimum.
         self.zvs_onset_gain = float(zvs_onset_gain)
+        # Gain far from resonance. Never below unity: with the switch off the
+        # choke holds current and the drain flies up to at least the bus, so
+        # the resonant boost adds to that floor rather than replacing it. A
+        # bare Lorentzian decays to zero instead, which invents a regime where
+        # the bus must exceed the peak it is producing.
+        self.off_resonance_gain = float(off_resonance_gain)
         # Latched when the gates are armed: a physical bank does not retune
         # itself mid-run, so a frequency sweep must see a fixed resonance.
         self.tank_nominal_hz: Optional[float] = None
@@ -124,13 +131,16 @@ class SimulatedRigPlant:
         frequency = max(1.0, float(self.wavegen_frequency_hz))
         f_small = self._small_signal_resonance_hz()
 
+        floor = self.off_resonance_gain
+        boost = max(0.0, self.resonant_peak_gain - floor)
         gain = self.resonant_peak_gain
         detuning = 0.0
         for _ in range(6):
             peak = gain * bus_voltage
             f_res = f_small * (1.0 + self.coss_shift_frac * min(1.0, peak / 400.0))
             detuning = (frequency - f_res) / f_res
-            gain = self.resonant_peak_gain / math.sqrt(
+            # The resonant boost decays with detuning; the floor does not.
+            gain = floor + boost / math.sqrt(
                 1.0 + (2.0 * self.tank_q * detuning) ** 2
             )
         return gain, detuning

@@ -249,13 +249,13 @@ def test_edge_clipping_is_reported(plant):
     """A window that excludes the true optimum must say so rather than
     silently returning its boundary."""
     tuner, _smu, _wavegen, _safety = _build(plant)
-    # Force a window entirely below resonance, where P_in still falls at the
-    # upper edge.
+    # A window entirely below the lowest basin, so P_in is still falling at
+    # the upper edge and the best point is the boundary itself.
     result = tuner.find_minimum(
         6_000_000.0,
         200.0,
         "Single Device",
-        warm_start_hz=5_200_000.0,
+        warm_start_hz=4_600_000.0,
         run_survey=False,
     )
     assert result.clipped_at_edge
@@ -271,3 +271,33 @@ def test_anomalous_step_is_flagged_not_silently_accepted():
     tuner, _smu, _wavegen, _safety = _build(plant)
     assert tuner._flag_anomaly(points) is True
     assert points[-1].anomaly is True
+
+
+def test_tank_gain_never_falls_below_unity(plant):
+    """The bus must never have to exceed the peak it is producing.
+
+    With the switch off the choke holds current and the drain flies up to at
+    least the bus, so detuning erodes the resonant boost but not that floor.
+    A bare Lorentzian decays to zero and invents a regime the rig cannot
+    reach - which then feeds an unphysically loose reachability bound, since
+    the bound is ceiling/gain.
+    """
+    frequency = 4_000_000.0
+    while frequency <= 10_000_000.0:
+        plant.wavegen_frequency_hz = frequency
+        plant.smu_voltage_setpoint_v = 50.0
+        gain, _detuning = plant._tank_state()
+        assert gain >= 1.0, f"gain {gain:.3f} below unity at {frequency / 1e6:.2f} MHz"
+        assert plant.vds_peak_v() >= plant.bus_voltage_v
+        frequency += 250_000.0
+
+
+def test_gain_still_peaks_near_the_built_resonance(plant):
+    """The floor must not flatten the response it is protecting."""
+    plant.smu_voltage_setpoint_v = 50.0
+    gains = {}
+    for mhz in (5.0, 6.4, 8.0):
+        plant.wavegen_frequency_hz = mhz * 1e6
+        gains[mhz], _ = plant._tank_state()
+    assert gains[6.4] > gains[5.0]
+    assert gains[6.4] > gains[8.0]
