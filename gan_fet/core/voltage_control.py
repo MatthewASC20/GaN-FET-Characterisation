@@ -107,20 +107,100 @@ class PeakVoltageController:
             self.safety.record_read_success("SMU current (peak control)")
             self.safety.check_sample(dc_current=numeric_current)
 
+    def _gain_estimate(
+        self,
+        history: Optional[tuple[float, float]],
+        setpoint: float,
+        peak: float,
+    ) -> Optional[float]:
+        """Local ``dVds_peak/dV_bus``, or ``None`` when it cannot be trusted.
+
+        Prefers the secant slope between the last two points. Falls back to the
+        chord through the origin, which is available from the very first
+        reading — the step *before* any history exists is exactly the one that
+        can overshoot, so some estimate is needed immediately.
+        """
+        cfg = self.settings
+        if history is not None:
+            previous_setpoint, previous_peak = history
+            delta_v = setpoint - previous_setpoint
+            if abs(delta_v) >= cfg.secant_min_delta_v:
+                gain = (peak - previous_peak) / delta_v
+                if math.isfinite(gain) and gain > 0.0:
+                    return gain
+        if setpoint > cfg.secant_min_delta_v and peak > 0.0:
+            chord = peak / setpoint
+            if math.isfinite(chord) and chord > 0.0:
+                return chord
+        return None
+
+    def _secant_step_v(
+        self,
+        error: float,
+        history: Optional[tuple[float, float]],
+        setpoint: float,
+        peak: float,
+        max_step: float,
+    ) -> float:
+        """Signed bus correction from a local gain estimate.
+
+        Loop gain ``dVds_peak/dV_bus`` varies by an order of magnitude across
+        the resonance curve, so a fixed proportional gain either crawls or
+        hunts. The secant estimate adapts to whatever the local slope is, and
+        falls back to proportional control whenever that estimate cannot be
+        trusted: too small a bus separation (mostly measurement noise), a
+        non-positive slope, or no history yet.
+        """
+        cfg = self.settings
+        proportional = max(
+            cfg.min_step_v, min(max_step, cfg.proportional_gain * abs(error))
+        )
+        if history is not None:
+            previous_setpoint, previous_peak = history
+            delta_v = setpoint - previous_setpoint
+            delta_peak = peak - previous_peak
+            if abs(delta_v) >= cfg.secant_min_delta_v:
+                gain = delta_peak / delta_v
+                # A non-positive slope means the plant is not responding the
+                # way the secant assumes; proportional control is safer there.
+                if gain > 0.0 and math.isfinite(gain):
+                    magnitude = abs(error) / gain
+                    if math.isfinite(magnitude) and magnitude > 0.0:
+                        bounded = min(
+                            magnitude, cfg.secant_max_step_v, max_step
+                        )
+                        return math.copysign(
+                            max(cfg.min_step_v, bounded), error
+                        )
+        return math.copysign(proportional, error)
+
     def achieve_peak(
         self,
         target_v: float,
         *,
         cancel_check: Optional[Callable[[], bool]] = None,
         status: Optional[Callable[[str], None]] = None,
+        max_setpoint_v: Optional[float] = None,
+        peak_ceiling_v: Optional[float] = None,
     ) -> float:
         """Drive the SMU until Vds peak = target ±tolerance.
+
+        ``max_setpoint_v`` bounds what the loop may command. Callers use it to
+        make an over-voltage operating point *unreachable* rather than relying
+        on detecting one after the fact: tank gain can rise faster between
+        iterations than polling can follow. Hitting the bound raises
+        PeakControlError, which callers treat as "not reachable here" rather
+        than as a failure.
 
         Returns the final SMU setpoint. Raises PeakControlError when it cannot
         converge, SafetyTrip if a limit is hit along the way.
         """
         cfg = self.settings
         max_step = self.smu.ramp_step_v
+        history: Optional[tuple[float, float]] = None
+        ceiling_v = self.smu.max_voltage_v
+        if max_setpoint_v is not None:
+            ceiling_v = min(ceiling_v, max(0.0, max_setpoint_v))
 
         for iteration in range(cfg.max_iterations):
             if self._cancelled(cancel_check):
@@ -146,10 +226,33 @@ class PeakVoltageController:
                 )
                 return self.smu.setpoint_v
 
-            # Clamped proportional step, always smaller than the remaining error
-            # scale so we approach the target without hunting.
-            step = max(cfg.min_step_v, min(max_step, cfg.proportional_gain * abs(error)))
-            new_setpoint = self.smu.setpoint_v + (step if error > 0 else -step)
+            setpoint = self.smu.setpoint_v
+            step = self._secant_step_v(error, history, setpoint, peak, max_step)
+
+            # Predictive ceiling guard. Near resonance one bus step can move
+            # the peak by tens of volts, so a step is only safe if the peak it
+            # is predicted to produce stays below the ceiling. Checking after
+            # the fact would already have applied the excursion.
+            if peak_ceiling_v is not None and step > 0.0:
+                gain = self._gain_estimate(history, setpoint, peak)
+                headroom = peak_ceiling_v - peak
+                if headroom <= 0.0:
+                    raise PeakControlError(
+                        f"Vds peak {peak:.1f} V is already at the "
+                        f"{peak_ceiling_v:.1f} V search ceiling"
+                    )
+                if gain is not None:
+                    step = min(step, headroom / gain)
+
+            history = (setpoint, peak)
+            new_setpoint = setpoint + step
+            if new_setpoint > ceiling_v:
+                if setpoint >= ceiling_v - 1e-9:
+                    raise PeakControlError(
+                        f"Vds peak {peak:.1f} V needs more bus than the "
+                        f"{ceiling_v:.1f} V reachability cap allows"
+                    )
+                new_setpoint = ceiling_v
 
             if status is not None:
                 status(

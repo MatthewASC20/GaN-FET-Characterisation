@@ -119,7 +119,7 @@ def build_instrument_rig(settings: Settings, *, simulate: bool = False) -> Instr
     from gan_fet.instruments.scpi import ScpiTcpClient
 
     roles = resolve_instrument_roles(settings)
-    plant = SimulatedRigPlant() if simulate else None
+    plant = SimulatedRigPlant(resonant_model=True) if simulate else None
     clients: list[Any] = []
 
     def make_client(name: str, *, is_smu: bool = False) -> Any:

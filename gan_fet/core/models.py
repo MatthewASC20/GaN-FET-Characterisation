@@ -37,6 +37,8 @@ class ExperimentParams:
     point: MatrixPoint
     duration_minutes: float
     find_zvs: bool = False
+    #: Search the gate frequency for minimum input power before sampling.
+    find_frequency: bool = False
 
 
 @dataclass
@@ -62,6 +64,29 @@ class RunRecord:
     v_zvs: Optional[float] = None
     readings: FinalReadings = field(default_factory=FinalReadings)
     screenshot_path: Optional[str] = None
+    #: Gate frequency chosen by the frequency search, and the input power it
+    #: achieved. ``None`` when the run did not tune.
+    tuned_frequency_hz: Optional[float] = None
+    tuned_input_power_w: Optional[float] = None
+    #: Direction the frequency window was swept. Recorded because the plant is
+    #: not strictly single-valued; without it, path dependence is undetectable
+    #: after the fact.
+    sweep_direction: Optional[str] = None
+
+
+@dataclass
+class TripContext:
+    """Operating point captured at the moment a safety event fires.
+
+    Trips during manual bench work carry no run association, which historically
+    left them undiagnosable. Every field is optional: telemetry is frequently
+    the thing that has just failed.
+    """
+
+    frequency_hz: Optional[float] = None
+    bus_setpoint_v: Optional[float] = None
+    vds_peak_v: Optional[float] = None
+    dc_current_a: Optional[float] = None
 
 
 def freq_label(freq_hz: float) -> str:

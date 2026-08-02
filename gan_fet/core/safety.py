@@ -13,6 +13,7 @@ from collections import defaultdict
 from typing import Callable, Optional
 
 from gan_fet.core.events import SafetyTripEvent, bus
+from gan_fet.core.models import TripContext
 from gan_fet.instruments.base import SmuInterface, WavegenInterface
 from gan_fet.settings import SafetySettings
 from gan_fet.storage.db import Database
@@ -55,6 +56,12 @@ class SafetyMonitor:
         self._trip_detail: Optional[str] = None
         self._trip_generation = 0
         self._active_run_id: Optional[int] = None
+        # Last-known telemetry, cached as it flows past.  A trip must never
+        # perform fresh I/O to describe itself: the latch is set before any
+        # shutdown I/O begins, and querying instruments here would delay it.
+        self._last_vds_peak_v: Optional[float] = None
+        self._last_dc_current_a: Optional[float] = None
+        self._last_frequency_hz: Optional[float] = None
 
     # -- watchdog ---------------------------------------------------------
 
@@ -170,11 +177,46 @@ class SafetyMonitor:
 
     # -- limit checks -------------------------------------------------------
 
+    def note_frequency(self, frequency_hz: Optional[float]) -> None:
+        """Record the gate frequency currently commanded.
+
+        Pushed by whoever sets it rather than read back at trip time, so the
+        trip path stays free of instrument I/O.
+        """
+        with self._lock:
+            self._last_frequency_hz = frequency_hz
+
+    def trip_context(self) -> TripContext:
+        """Describe the present operating point without touching hardware.
+
+        ``smu.setpoint_v`` is an in-memory attribute, not a query; everything
+        else comes from values cached as they passed through the monitor.
+        """
+        with self._lock:
+            vds_peak = self._last_vds_peak_v
+            dc_current = self._last_dc_current_a
+            frequency = self._last_frequency_hz
+        try:
+            setpoint = float(self.smu.setpoint_v)
+        except Exception:  # pragma: no cover - defensive
+            setpoint = None
+        return TripContext(
+            frequency_hz=frequency,
+            bus_setpoint_v=setpoint,
+            vds_peak_v=vds_peak,
+            dc_current_a=dc_current,
+        )
+
     def check_sample(
         self,
         dc_current: Optional[float] = None,
         vds_peak: Optional[float] = None,
     ) -> None:
+        with self._lock:
+            if dc_current is not None:
+                self._last_dc_current_a = dc_current
+            if vds_peak is not None:
+                self._last_vds_peak_v = vds_peak
         reason = self.trip_reason
         if reason is not None:
             raise SafetyTrip(*reason)
@@ -237,7 +279,7 @@ class SafetyMonitor:
                 detail = latched_detail
         if first_trip:
             try:
-                self.db.add_safety_event(run_id, kind, detail)
+                self.db.add_safety_event(run_id, kind, detail, self.trip_context())
             except Exception:
                 log.exception("could not record safety event")
             bus.publish(
@@ -287,7 +329,7 @@ class SafetyMonitor:
         if not first_trip:
             return shutdown_ok
         try:
-            self.db.add_safety_event(run_id, kind, detail)
+            self.db.add_safety_event(run_id, kind, detail, self.trip_context())
         except Exception:
             log.exception("could not record emergency-stop event")
         bus.publish(SafetyTripEvent(reason=f"{kind}: {detail}", value=0.0))

@@ -40,6 +40,7 @@ from gan_fet.core.models import (
     freq_label,
     sanitize_device_name,
 )
+from gan_fet.core.frequency_tune import FrequencyTuner
 from gan_fet.core.safety import SafetyMonitor, SafetyTrip
 from gan_fet.core.voltage_control import PeakControlError, PeakVoltageController
 from gan_fet.core.zvs import ZvsMeasurementError, ZvsTuner
@@ -130,6 +131,15 @@ class ExperimentEngine:
             smu, scope, settings.peak_control, safety
         )
         self.zvs_tuner = ZvsTuner(smu, settings.zvs, safety, scope=scope)
+        self.frequency_tuner = FrequencyTuner(
+            wavegen,
+            smu,
+            scope,
+            self.peak_controller,
+            settings.frequency_tune,
+            settings.safety,
+            safety,
+        )
 
         self._state = ExperimentState.IDLE
         self._state_lock = threading.Lock()
@@ -464,6 +474,31 @@ class ExperimentEngine:
                 status=self._update_status,
             )
 
+            # The frequency search runs before the ZVS voltage search: it
+            # holds the peak on target throughout, so it leaves a well-defined
+            # operating point for anything that follows.
+            tune_result = None
+            if params.find_frequency:
+                self._update_status("Searching gate frequency for minimum P_in...")
+                tune_result = self.frequency_tuner.find_minimum(
+                    float(point.frequency_hz),
+                    float(point.voltage_v),
+                    point.config,
+                    warm_start_hz=self._prior_tuned_frequency_hz(point),
+                    cancel_check=self._cancelled,
+                    status=self._update_status,
+                )
+                bus_voltage = tune_result.bus_voltage_v
+                self._update_status(
+                    f"Frequency: {tune_result.frequency_hz / 1e6:.4f} MHz "
+                    f"(P_in {tune_result.input_power_w:.2f} W, "
+                    f"{len(tune_result.minima_hz)} minima)"
+                )
+                if self._cancelled():
+                    terminal_status = "cancelled"
+                    message = "Cancelled after the frequency search."
+                    return
+
             v_zvs: Optional[float] = None
             if params.find_zvs:
                 self._update_status("Searching for ZVS point...")
@@ -532,6 +567,15 @@ class ExperimentEngine:
                 bus_voltage_v=bus_voltage,
                 v_zvs=v_zvs,
                 screenshot_path=str(screenshot) if screenshot else None,
+                tuned_frequency_hz=(
+                    None if tune_result is None else tune_result.frequency_hz
+                ),
+                tuned_input_power_w=(
+                    None if tune_result is None else tune_result.input_power_w
+                ),
+                sweep_direction=(
+                    None if tune_result is None else tune_result.direction
+                ),
             )
             success = True
             terminal_status = "completed"
@@ -640,6 +684,30 @@ class ExperimentEngine:
                     record=record,
                 )
             )
+
+    def _prior_tuned_frequency_hz(self, point) -> Optional[float]:
+        """Warm start from an earlier successful search, if there is one.
+
+        Only a tuned result for this exact point is used. Coss(V) moves the
+        resonance between voltage points, so borrowing across them would seed
+        the search in the wrong place — the coarse sweep can find it anyway,
+        and a wrong warm start narrows the window around the wrong centre.
+        """
+        try:
+            record = self.db.find_run(point)
+        except Exception:
+            log.exception("could not look up a prior tuned frequency")
+            return None
+        if record is None or record.status != "completed":
+            return None
+        tuned = record.tuned_frequency_hz
+        if tuned is None:
+            return None
+        try:
+            value = float(tuned)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value > 0.0 else None
 
     def _sampling_loop(self, run_id: int, params: ExperimentParams) -> list[float]:
         duration_s = params.duration_minutes * 60.0

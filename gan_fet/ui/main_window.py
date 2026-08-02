@@ -295,6 +295,32 @@ class MainWindow(tk.Tk):
         self.temperature_var = tk.IntVar(value=self._first("temperatures"))
         self.voltage_var = tk.IntVar(value=self._first("voltages"))
         self.find_zvs_var = tk.BooleanVar(value=self.settings.find_zvs_before_run)
+        self.find_frequency_var = tk.BooleanVar(
+            value=self.settings.find_frequency_before_run
+        )
+        self.show_zvs_sweep_var = tk.BooleanVar(
+            value=self.settings.show_zvs_voltage_sweep
+        )
+
+    def _on_show_zvs_sweep_toggled(self) -> None:
+        self.settings.show_zvs_voltage_sweep = bool(self.show_zvs_sweep_var.get())
+        self._apply_zvs_visibility()
+        self._refresh_control_states()
+
+    def _apply_zvs_visibility(self) -> None:
+        """Show or hide the voltage-only ZVS control per the Config setting."""
+        checkbox = getattr(self, "find_zvs_checkbox", None)
+        if checkbox is None:
+            return
+        if self.show_zvs_sweep_var.get():
+            checkbox.grid(
+                row=ExperimentRow.RUN_OPTIONS, column=3, sticky="w", padx=5
+            )
+        else:
+            checkbox.grid_remove()
+            # Hidden means inactive: a control the operator cannot see must
+            # not silently keep steering the run.
+            self.find_zvs_var.set(False)
 
     def _first(self, key: str) -> Any:
         options = self.param_options.get(key) or []
@@ -548,14 +574,23 @@ class MainWindow(tk.Tk):
             row=ExperimentRow.RUN_OPTIONS, column=1, sticky="w"
         )
 
+        self.find_frequency_checkbox = ttk.Checkbutton(
+            self.main_frame,
+            text="Find frequency before run",
+            variable=self.find_frequency_var,
+        )
+        self.find_frequency_checkbox.grid(
+            row=ExperimentRow.RUN_OPTIONS, column=2, sticky="w", padx=5
+        )
+
+        # The voltage-only ZVS sweep is kept mainly to exercise the frequency
+        # search independently, so it stays hidden unless revealed in Config.
         self.find_zvs_checkbox = ttk.Checkbutton(
             self.main_frame,
             text="Find ZVS before run",
             variable=self.find_zvs_var,
         )
-        self.find_zvs_checkbox.grid(
-            row=ExperimentRow.RUN_OPTIONS, column=2, sticky="w", padx=5
-        )
+        self._apply_zvs_visibility()
 
         self.last_current_label = ttk.Label(self.main_frame, text="Last Current: N/A")
         self.last_current_label.grid(
@@ -781,6 +816,7 @@ class MainWindow(tk.Tk):
             point=point,
             duration_minutes=SIMULATION_VALIDATION_DURATION_MINUTES,
             find_zvs=bool(self.find_zvs_var.get()),
+            find_frequency=bool(self.find_frequency_var.get()),
         )
 
         def launch() -> None:
@@ -913,6 +949,24 @@ class MainWindow(tk.Tk):
         RampRatesSliderEditor(side, self.settings, self._on_settings_applied).pack(
             fill="x", pady=(0, 10))
         SmuLimitsEditor(side, self.settings, self._on_settings_applied).pack(fill="x")
+
+        advanced = ttk.LabelFrame(side, text="Advanced")
+        advanced.pack(fill="x", pady=(10, 0))
+        ttk.Checkbutton(
+            advanced,
+            text="Show voltage-only ZVS sweep",
+            variable=self.show_zvs_sweep_var,
+            command=self._on_show_zvs_sweep_toggled,
+        ).pack(anchor="w", padx=8, pady=6)
+        ttk.Label(
+            advanced,
+            text=(
+                "The frequency search holds Vds peak on target.\n"
+                "The ZVS sweep moves the bus off it, and is kept\n"
+                "mainly to exercise the two independently."
+            ),
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 6))
 
         self.configuration_tab.grid_columnconfigure(0, weight=3)
         self.configuration_tab.grid_columnconfigure(1, weight=1)
@@ -1403,6 +1457,12 @@ class MainWindow(tk.Tk):
             "duration": self.duration_entry.get(),
         }
         self.settings.find_zvs_before_run = bool(self.find_zvs_var.get())
+        self.settings.find_frequency_before_run = bool(
+            self.find_frequency_var.get()
+        )
+        self.settings.show_zvs_voltage_sweep = bool(
+            self.show_zvs_sweep_var.get()
+        )
         self.settings.save()
 
     # ------------------------------------------------------------------
@@ -2023,6 +2083,7 @@ class MainWindow(tk.Tk):
             point=point,
             duration_minutes=duration,
             find_zvs=bool(self.find_zvs_var.get()),
+            find_frequency=bool(self.find_frequency_var.get()),
         )
 
     def _start_experiment(self) -> None:

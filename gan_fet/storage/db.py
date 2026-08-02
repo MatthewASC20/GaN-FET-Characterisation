@@ -16,8 +16,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from gan_fet.core.models import FinalReadings, MatrixPoint, RunRecord
+from gan_fet.core.models import (
+    FinalReadings,
+    MatrixPoint,
+    RunRecord,
+    TripContext,
+)
 from gan_fet.storage.schema import (
+    ADDED_COLUMNS,
     RUN_COLUMNS,
     RUN_NATURAL_KEY_COLUMNS,
     RUNS_WITHOUT_LEGACY_UNIQUE,
@@ -125,6 +131,8 @@ class Database:
         if "elapsed_s" not in sample_columns:
             self._migrate_samples_add_elapsed()
 
+        self._migrate_added_columns()
+
         with self._conn:
             # Early migration builds marked every parseable legacy CSV complete,
             # even when no FINAL_READINGS row existed. Those imports have a
@@ -144,6 +152,41 @@ class Database:
                 (SCHEMA_VERSION,),
             )
             self._net_lock.assert_owned()
+
+    def _migrate_added_columns(self) -> None:
+        """Add later nullable columns in place, idempotently.
+
+        ``ALTER TABLE ... ADD COLUMN`` is atomic in SQLite and leaves existing
+        rows NULL, which is the correct "was never recorded" value for both the
+        tuning result and the trip context. Re-running this is a no-op, so a
+        database at any prior version converges without a rebuild.
+        """
+        self._net_lock.assert_owned()
+        for table, additions in ADDED_COLUMNS.items():
+            existing = {
+                row[1]
+                for row in self._conn.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()
+            }
+            missing = [
+                (name, sql_type)
+                for name, sql_type in additions
+                if name not in existing
+            ]
+            if not missing:
+                continue
+            with self._conn:
+                for name, sql_type in missing:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}"
+                    )
+                self._net_lock.assert_owned()
+            log.info(
+                "migrated %s: added %s",
+                table,
+                ", ".join(name for name, _ in missing),
+            )
 
     def _migrate_samples_add_elapsed(self) -> None:
         """Add nullable active elapsed time without rewriting legacy samples."""
@@ -428,14 +471,20 @@ class Database:
         v_zvs: Optional[float] = None,
         screenshot_path: Optional[str] = None,
         completed_at: Optional[str] = None,
+        tuned_frequency_hz: Optional[float] = None,
+        tuned_input_power_w: Optional[float] = None,
+        sweep_direction: Optional[str] = None,
     ) -> None:
         self._execute(
             "UPDATE runs SET status='completed', completed_at=?, bus_voltage_v=?,"
             " v_zvs=?, vin=?, iin=?, fsw_hz=?, irms=?, vds_pk=?, isw_rms=?,"
-            " screenshot_path=COALESCE(?, screenshot_path) WHERE id=?",
+            " screenshot_path=COALESCE(?, screenshot_path),"
+            " tuned_frequency_hz=?, tuned_input_power_w=?, sweep_direction=?"
+            " WHERE id=?",
             (completed_at or time.strftime("%Y-%m-%d %H:%M:%S"), bus_voltage_v,
              v_zvs, readings.vin, readings.iin, readings.fsw_hz, readings.irms,
-             readings.vds_pk, readings.isw_rms, screenshot_path, run_id),
+             readings.vds_pk, readings.isw_rms, screenshot_path,
+             tuned_frequency_hz, tuned_input_power_w, sweep_direction, run_id),
         )
 
     def set_run_status(self, run_id: int, status: str) -> None:
@@ -675,10 +724,33 @@ class Database:
 
     # -- safety ---------------------------------------------------------
 
-    def add_safety_event(self, run_id: Optional[int], kind: str, detail: str) -> None:
+    def add_safety_event(
+        self,
+        run_id: Optional[int],
+        kind: str,
+        detail: str,
+        context: Optional[TripContext] = None,
+    ) -> None:
+        """Record a safety event, with the operating point where possible.
+
+        A trip during manual bench work has no ``run_id`` to hang diagnosis on,
+        so the instantaneous frequency, bus setpoint, Vds peak and DC current
+        are stored alongside the event itself. Any of them may be ``None`` —
+        telemetry is often exactly what has just failed.
+        """
         self._execute(
-            "INSERT INTO safety_events(run_id, kind, detail) VALUES (?,?,?)",
-            (run_id, kind, detail),
+            "INSERT INTO safety_events("
+            "run_id, kind, detail, ctx_frequency_hz, ctx_bus_setpoint_v, "
+            "ctx_vds_peak_v, ctx_dc_current_a) VALUES (?,?,?,?,?,?,?)",
+            (
+                run_id,
+                kind,
+                detail,
+                None if context is None else context.frequency_hz,
+                None if context is None else context.bus_setpoint_v,
+                None if context is None else context.vds_peak_v,
+                None if context is None else context.dc_current_a,
+            ),
         )
 
     def latest_safety_event_id(self) -> int:

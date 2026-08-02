@@ -308,6 +308,49 @@ class PeakControlSettings:
     max_iterations: int = 200
     min_step_v: float = 0.5
     proportional_gain: float = 0.4
+    #: Minimum bus separation before a secant gain estimate is trusted. Below
+    #: this the finite difference is mostly measurement noise.
+    secant_min_delta_v: float = 0.4
+    #: Largest single bus correction the secant loop may command.
+    secant_max_step_v: float = 10.0
+
+
+@dataclass
+class FrequencyTuneSettings:
+    """Search for the gate frequency that minimises input power.
+
+    The objective is ``P_in = V_bus x I_dc`` at a held Vds peak, not DC input
+    current: because the bus voltage varies along the constant-peak curve,
+    the two have different minima.
+    """
+
+    #: Working window as a fraction of nominal when no warm start exists.
+    window_frac: float = 0.20
+    #: Wide low-amplitude survey window, used when the bank is unknown.
+    survey_window_frac: float = 0.50
+    survey_step_hz: float = 200_000.0
+    #: Survey runs at this fraction of target peak, where Coss varies little.
+    survey_peak_frac: float = 0.18
+    #: The small-signal resonance sits below the working one; bias the window up.
+    survey_upward_bias_frac: float = 0.03
+    coarse_step_hz: float = 100_000.0
+    fine_step_hz: float = 20_000.0
+    fine_span_hz: float = 100_000.0
+    #: Warm-started window half-width around a known good frequency.
+    warm_window_hz: float = 300_000.0
+    settle_s: float = 0.5
+    #: Peak excursion tolerated while stepping frequency, before the bus is
+    #: backed off. Distinct from the hard safety ceiling, which trips.
+    soft_band_v: float = 10.0
+    #: Fraction of the hard ceiling used when computing the reachability cap.
+    ceiling_margin_frac: float = 0.955
+    #: Headroom above the largest observed tank gain. A 400 V target under a
+    #: 450 V ceiling leaves only 12% room, so this must stay near unity.
+    gain_growth_factor: float = 1.05
+    #: A step change exceeding this multiple of the locally predicted change is
+    #: recorded as an anomaly rather than as smooth data.
+    anomaly_ratio: float = 4.0
+    max_points: int = 400
 
 
 @dataclass
@@ -459,6 +502,9 @@ class Settings:
     smu: SmuSettings = field(default_factory=SmuSettings)
     wavegen: WavegenSettings = field(default_factory=WavegenSettings)
     zvs: ZvsSettings = field(default_factory=ZvsSettings)
+    frequency_tune: FrequencyTuneSettings = field(
+        default_factory=FrequencyTuneSettings
+    )
     peak_control: PeakControlSettings = field(default_factory=PeakControlSettings)
     safety: SafetySettings = field(default_factory=SafetySettings)
     google: GoogleSettings = field(default_factory=GoogleSettings)
@@ -486,6 +532,12 @@ class Settings:
     # UI state persisted between sessions (replaces last_params.json)
     last_params: dict[str, Any] = field(default_factory=dict)
     find_zvs_before_run: bool = False
+    #: Frequency search before a run. Off by default: it energises the rig
+    #: while stepping the gate frequency, so it is opted into deliberately.
+    find_frequency_before_run: bool = False
+    #: The voltage-only ZVS sweep is retained mainly to exercise the frequency
+    #: search independently, so its control is hidden unless revealed here.
+    show_zvs_voltage_sweep: bool = False
 
     _settings_path: Path = field(
         default=DEFAULT_SETTINGS_PATH, init=False, repr=False, compare=False
@@ -764,6 +816,7 @@ class Settings:
             "smu": (SmuSettings, settings.smu),
             "wavegen": (WavegenSettings, settings.wavegen),
             "zvs": (ZvsSettings, settings.zvs),
+            "frequency_tune": (FrequencyTuneSettings, settings.frequency_tune),
             "peak_control": (PeakControlSettings, settings.peak_control),
             "safety": (SafetySettings, settings.safety),
             "google": (GoogleSettings, settings.google),
@@ -823,8 +876,13 @@ class Settings:
                 pass
         if isinstance(raw.get("last_params"), dict):
             settings.last_params = dict(raw["last_params"])
-        if isinstance(raw.get("find_zvs_before_run"), bool):
-            settings.find_zvs_before_run = raw["find_zvs_before_run"]
+        for flag in (
+            "find_zvs_before_run",
+            "find_frequency_before_run",
+            "show_zvs_voltage_sweep",
+        ):
+            if isinstance(raw.get(flag), bool):
+                setattr(settings, flag, raw[flag])
 
         cls._validate_numeric_settings(settings)
         return settings
@@ -862,6 +920,24 @@ class Settings:
                 "max_iterations",
                 "min_step_v",
                 "proportional_gain",
+                "secant_min_delta_v",
+                "secant_max_step_v",
+            ),
+            "frequency_tune": (
+                "window_frac",
+                "survey_window_frac",
+                "survey_step_hz",
+                "survey_peak_frac",
+                "coarse_step_hz",
+                "fine_step_hz",
+                "fine_span_hz",
+                "warm_window_hz",
+                "settle_s",
+                "soft_band_v",
+                "ceiling_margin_frac",
+                "gain_growth_factor",
+                "anomaly_ratio",
+                "max_points",
             ),
             "safety": (
                 "max_dc_current_a",
@@ -873,6 +949,7 @@ class Settings:
             ("zvs", "samples_per_point"),
             ("zvs", "max_steps"),
             ("peak_control", "max_iterations"),
+            ("frequency_tune", "max_points"),
             ("safety", "watchdog_consecutive_failures"),
         }
         for section_name, field_names in positive_fields.items():

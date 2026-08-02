@@ -25,15 +25,39 @@ log = logging.getLogger(__name__)
 class SimulatedRigPlant:
     """Deterministic shared state for an entire simulated GaN test rig."""
 
+    #: Nominal matrix frequencies the simulated tank can be built for.
+    NOMINAL_BANDS_HZ = (6_000_000.0, 13_000_000.0, 27_000_000.0)
+
     def __init__(
         self,
         *,
         peak_gain: float = 3.0,
         zvs_voltage_v: float = 95.0,
+        resonant_model: bool = False,
+        resonance_offset_frac: float = 0.065,
+        tank_q: float = 8.0,
+        resonant_peak_gain: float = 4.2,
+        coss_shift_frac: float = 0.045,
     ):
         self.lock = threading.RLock()
         self.peak_gain = float(peak_gain)
         self.zvs_voltage_v = float(zvs_voltage_v)
+
+        # -- optional resonant pathology ---------------------------------
+        # Off by default so the historical smooth plant is unchanged.  When
+        # enabled the tank gains a frequency response, an amplitude-dependent
+        # resonance shift, and two competing loss terms.  This is *not* a
+        # circuit model; it exists so frequency-search code paths, their
+        # interlocks and their minimum-selection logic can be exercised
+        # without bench hardware.
+        self.resonant_model = bool(resonant_model)
+        self.resonance_offset_frac = float(resonance_offset_frac)
+        self.tank_q = float(tank_q)
+        self.resonant_peak_gain = float(resonant_peak_gain)
+        self.coss_shift_frac = float(coss_shift_frac)
+        # Latched when the gates are armed: a physical bank does not retune
+        # itself mid-run, so a frequency sweep must see a fixed resonance.
+        self.tank_nominal_hz: Optional[float] = None
 
         self.smu_output_on = False
         self.smu_voltage_setpoint_v = 0.0
@@ -54,6 +78,71 @@ class SimulatedRigPlant:
     def gates_armed(self) -> bool:
         return self.wavegen_c1_on
 
+    # -- resonant tank model (only when ``resonant_model`` is set) ---------
+
+    def latch_tank_nominal(self) -> None:
+        """Fix the simulated bank to the nearest nominal band.
+
+        Called when the gates are armed. A real inductor and capacitor bank is
+        built for one nominal frequency and does not change during a sweep, so
+        the resonance must not follow the wavegen around the window.
+        """
+        if not self.resonant_model:
+            return
+        frequency = max(1.0, float(self.wavegen_frequency_hz))
+        self.tank_nominal_hz = min(
+            self.NOMINAL_BANDS_HZ, key=lambda band: abs(band - frequency)
+        )
+
+    def _small_signal_resonance_hz(self) -> float:
+        nominal = self.tank_nominal_hz
+        if nominal is None:
+            nominal = min(
+                self.NOMINAL_BANDS_HZ,
+                key=lambda band: abs(band - max(1.0, self.wavegen_frequency_hz)),
+            )
+        # The built bank never lands exactly on nominal — that is the whole
+        # reason a frequency search exists.
+        return nominal * (1.0 + self.resonance_offset_frac)
+
+    def _tank_state(self) -> tuple[float, float]:
+        """Return ``(gain, detuning)`` for the present operating point.
+
+        Coss falls as Vds rises, so the resonance moves *up* with amplitude.
+        Amplitude in turn depends on gain, so the two are solved by a short
+        fixed-point iteration — that coupling is the nonlinearity being
+        simulated.
+        """
+        bus_voltage = max(0.0, self.bus_voltage_v)
+        frequency = max(1.0, float(self.wavegen_frequency_hz))
+        f_small = self._small_signal_resonance_hz()
+
+        gain = self.resonant_peak_gain
+        detuning = 0.0
+        for _ in range(6):
+            peak = gain * bus_voltage
+            f_res = f_small * (1.0 + self.coss_shift_frac * min(1.0, peak / 400.0))
+            detuning = (frequency - f_res) / f_res
+            gain = self.resonant_peak_gain / math.sqrt(
+                1.0 + (2.0 * self.tank_q * detuning) ** 2
+            )
+        return gain, detuning
+
+    def _resonant_loss_a(self) -> float:
+        """Two competing loss terms, giving two minima either side of resonance.
+
+        Circulating current peaks sharply at resonance, so conduction loss has
+        a local *maximum* there. Switching loss falls broadly as resonance is
+        approached. Their sum therefore dips on both shoulders, which is the
+        multi-minimum structure the search must cope with. A slight tilt makes
+        the two minima unequal so there is a well-defined global answer.
+        """
+        _gain, detuning = self._tank_state()
+        lorentz = 1.0 / (1.0 + (2.0 * self.tank_q * detuning) ** 2)
+        circulating = 0.035 * lorentz**2
+        switching = 0.010 * (1.0 - 0.86 * lorentz) * (1.0 + 3.5 * detuning)
+        return circulating + max(0.0, switching)
+
     def dc_current_a(self) -> float:
         if not self.smu_output_on:
             return 0.0
@@ -61,12 +150,18 @@ class SimulatedRigPlant:
         # default 1 V search step must exceed the tuner's minimum-improvement
         # threshold, while the normal envelope remains below 100 mA.
         delta_v = self.bus_voltage_v - self.zvs_voltage_v
-        return 0.020 + 2e-4 * (math.sqrt(delta_v**2 + 1.0) - 1.0)
+        current = 0.020 + 2e-4 * (math.sqrt(delta_v**2 + 1.0) - 1.0)
+        if self.resonant_model and self.gates_armed:
+            current += self._resonant_loss_a()
+        return current
 
     def vds_peak_v(self) -> float:
         if not self.gates_armed:
             return 0.0
-        return self.peak_gain * self.bus_voltage_v
+        if not self.resonant_model:
+            return self.peak_gain * self.bus_voltage_v
+        gain, _detuning = self._tank_state()
+        return gain * self.bus_voltage_v
 
     def rms_current_a(self) -> float:
         """Return a plausible deterministic P2 reading for the virtual rig.
@@ -563,6 +658,9 @@ class MockScpiTcpClient:
             if re.search(r"(^|:)OUTP(?:UT)?\s+(?:ON|1)$", upper):
                 if upper.startswith("C1:"):
                     plant.wavegen_c1_on = True
+                    # The bank is fixed once the rig is energised; latch the
+                    # simulated resonance so a sweep cannot drag it along.
+                    plant.latch_tank_nominal()
                 elif upper.startswith("C2:"):
                     plant.wavegen_c2_on = True
                 else:

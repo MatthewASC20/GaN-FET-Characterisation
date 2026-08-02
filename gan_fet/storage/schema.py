@@ -10,7 +10,7 @@ import sqlite3
 
 from gan_fet.core.models import FinalReadings, MatrixPoint, RunRecord
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -41,7 +41,10 @@ CREATE TABLE IF NOT EXISTS runs (
     v_zvs REAL,
     vin REAL, iin REAL, fsw_hz REAL, irms REAL, vds_pk REAL, isw_rms REAL,
     screenshot_path TEXT,
-    attempt_no INTEGER NOT NULL DEFAULT 1
+    attempt_no INTEGER NOT NULL DEFAULT 1,
+    tuned_frequency_hz REAL,
+    tuned_input_power_w REAL,
+    sweep_direction TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_point
     ON runs(device_id, config, frequency_hz, duty_pct, temperature_c, voltage_v, id);
@@ -65,9 +68,32 @@ CREATE TABLE IF NOT EXISTS safety_events (
     run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
     ts TEXT NOT NULL DEFAULT (datetime('now')),
     kind TEXT NOT NULL,
-    detail TEXT
+    detail TEXT,
+    -- Trip context. A trip outside a run has no run_id to hang diagnosis on,
+    -- so the instantaneous operating point is captured with the event itself.
+    ctx_frequency_hz REAL,
+    ctx_bus_setpoint_v REAL,
+    ctx_vds_peak_v REAL,
+    ctx_dc_current_a REAL
 );
 """
+
+#: Columns added after the original table definitions, migrated in place with
+#: ``ALTER TABLE ... ADD COLUMN``. SQLite makes that atomic and leaves existing
+#: rows NULL, which is exactly the "not recorded" semantics wanted here.
+ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "runs": (
+        ("tuned_frequency_hz", "REAL"),
+        ("tuned_input_power_w", "REAL"),
+        ("sweep_direction", "TEXT"),
+    ),
+    "safety_events": (
+        ("ctx_frequency_hz", "REAL"),
+        ("ctx_bus_setpoint_v", "REAL"),
+        ("ctx_vds_peak_v", "REAL"),
+        ("ctx_dc_current_a", "REAL"),
+    ),
+}
 
 RUNS_WITHOUT_LEGACY_UNIQUE = """
 CREATE TABLE runs_v2 (
@@ -94,7 +120,8 @@ RUN_COLUMNS = (
     "r.id, d.name, r.config, r.frequency_hz, r.duty_pct, r.temperature_c, "
     "r.voltage_v, r.duration_minutes, r.started_at, r.completed_at, r.status, "
     "r.bus_voltage_v, r.v_zvs, r.vin, r.iin, r.fsw_hz, r.irms, r.vds_pk, "
-    "r.isw_rms, r.screenshot_path, r.attempt_no"
+    "r.isw_rms, r.screenshot_path, r.attempt_no, "
+    "r.tuned_frequency_hz, r.tuned_input_power_w, r.sweep_direction"
 )
 
 RUN_NATURAL_KEY_COLUMNS = (
@@ -135,4 +162,7 @@ def row_to_run(row: sqlite3.Row | tuple) -> RunRecord:
             isw_rms=row[18],
         ),
         screenshot_path=row[19],
+        tuned_frequency_hz=row[21],
+        tuned_input_power_w=row[22],
+        sweep_direction=row[23],
     )
