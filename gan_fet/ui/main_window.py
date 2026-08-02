@@ -37,6 +37,7 @@ from gan_fet.ui.run_request import (
     require_populated_options,
     tuning_candidate,
 )
+from gan_fet.ui.operations.background import run_in_background
 from gan_fet.ui.operations.rig_ops import ZvsAction, zvs_precondition
 from gan_fet.ui.operations.worker_pool import WorkerPool
 from gan_fet.ui.panels.device_bar import DeviceBar
@@ -898,6 +899,26 @@ class MainWindow(tk.Tk):
         """Start a tracked, non-daemon worker."""
         return self._worker_pool.start(target, name=name)
 
+    def _run_operation(
+        self,
+        work: Callable[[], None],
+        on_done: Callable[[Optional[BaseException]], None],
+        *,
+        name: str,
+        on_error: Optional[
+            Callable[[BaseException], Optional[BaseException]]
+        ] = None,
+    ) -> threading.Thread:
+        """Run one rig operation off the Tk thread and report how it ended."""
+        return run_in_background(
+            pool=self._worker_pool,
+            dispatcher=self.ui_dispatcher,
+            work=work,
+            on_done=on_done,
+            name=name,
+            on_error=on_error,
+        )
+
     def _join_workers(self, timeout: float) -> bool:
         return self._worker_pool.join_all(timeout)
 
@@ -1075,15 +1096,11 @@ class MainWindow(tk.Tk):
         if token is None:
             return
 
-        def worker() -> None:
-            error: Optional[BaseException] = None
-            try:
-                self.safety.reset_trip()
-            except BaseException as exc:
-                error = exc
-            self.ui_dispatcher.post(self._on_reset_safety_done, token, error)
-
-        self._start_worker(worker, name="reset-safety")
+        self._run_operation(
+            self.safety.reset_trip,
+            partial(self._on_reset_safety_done, token),
+            name="reset-safety",
+        )
 
     def _on_reset_safety_done(
         self, token: OperationToken, error: Optional[BaseException]
@@ -1432,34 +1449,32 @@ class MainWindow(tk.Tk):
         duty = int(self.duty_var.get())
         self.status_bar.set_message("Applying wavegen settings...")
 
-        def worker() -> None:
-            error: Optional[BaseException] = None
-            try:
-                self.wavegen_controller.apply(
-                    config,
-                    frequency,
-                    duty,
-                    duty_rate_pct_s=self.settings.wavegen.duty_ramp_rate_pct_s,
-                    freq_rate_khz_s=self.settings.wavegen.freq_ramp_rate_khz_s,
-                    cancel_check=token.cancel_event.is_set,
-                    status=self._status_async,
-                )
-                if token.cancel_event.is_set():
-                    raise InterruptedError("wavegen configuration cancelled")
-            except BaseException as exc:
-                error = exc
-            self.ui_dispatcher.post(
-                self._on_apply_wavegen_done, token, error, after_success
+        def work() -> None:
+            self.wavegen_controller.apply(
+                config,
+                frequency,
+                duty,
+                duty_rate_pct_s=self.settings.wavegen.duty_ramp_rate_pct_s,
+                freq_rate_khz_s=self.settings.wavegen.freq_ramp_rate_khz_s,
+                cancel_check=token.cancel_event.is_set,
+                status=self._status_async,
             )
+            if token.cancel_event.is_set():
+                raise InterruptedError("wavegen configuration cancelled")
 
-        self._start_worker(worker, name="apply-wavegen")
+        self._run_operation(
+            work,
+            partial(self._on_apply_wavegen_done, token, after_success=after_success),
+            name="apply-wavegen",
+        )
         return True
 
     def _on_apply_wavegen_done(
         self,
         token: OperationToken,
         error: Optional[BaseException],
-        after_success: Optional[Callable[[], None]],
+        *,
+        after_success: Optional[Callable[[], object]] = None,
     ) -> None:
         self._finish_operation(token)
         if error is not None:
@@ -1794,30 +1809,30 @@ class MainWindow(tk.Tk):
         if token is None:
             return
 
-        def worker() -> None:
-            error: Optional[BaseException] = None
-            try:
-                self.smu.ramp_to(0.0, cancel_check=token.cancel_event.is_set)
-                if not self.smu.output_off():
-                    raise RuntimeError("SMU output-off was not acknowledged")
-                self.wavegen_controller.disarm_outputs()
-                if self.smu.output_is_on or self.wavegen_controller.outputs_armed:
-                    raise RuntimeError(
-                        "Output readback did not confirm the rig is safe"
-                    )
-            except BaseException as exc:
-                error = exc
-                try:
-                    if not self.safety.shutdown_outputs():
-                        if not self.safety.emergency_stop():
-                            error = RuntimeError(
-                                f"{error}; emergency output-off was unconfirmed"
-                            )
-                except Exception:
-                    log.exception("Emergency fallback failed during Bus Off")
-            self.ui_dispatcher.post(self._on_bus_off_done, token, error)
+        def work() -> None:
+            self.smu.ramp_to(0.0, cancel_check=token.cancel_event.is_set)
+            if not self.smu.output_off():
+                raise RuntimeError("SMU output-off was not acknowledged")
+            self.wavegen_controller.disarm_outputs()
+            if self.smu.output_is_on or self.wavegen_controller.outputs_armed:
+                raise RuntimeError("Output readback did not confirm the rig is safe")
 
-        self._start_worker(worker, name="bus-off")
+        def fall_back(error: BaseException) -> Optional[BaseException]:
+            """Take the emergency path, on the worker thread, while the rig is
+            still in whatever state the failure left it."""
+            if not self.safety.shutdown_outputs():
+                if not self.safety.emergency_stop():
+                    return RuntimeError(
+                        f"{error}; emergency output-off was unconfirmed"
+                    )
+            return None
+
+        self._run_operation(
+            work,
+            partial(self._on_bus_off_done, token),
+            name="bus-off",
+            on_error=fall_back,
+        )
         self.status_bar.set_message("Ramping bus to 0 V...")
 
     def _on_bus_off_done(
