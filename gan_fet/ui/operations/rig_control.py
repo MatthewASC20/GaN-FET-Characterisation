@@ -14,13 +14,19 @@ imports tkinter.
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional, Protocol
+import threading
+from typing import Any, Callable, Optional, Protocol
 
 from gan_fet.ui.operations.background import Dispatcher, run_in_background
 from gan_fet.ui.operations.worker_pool import WorkerPool
 from gan_fet.ui.widgets import OperationCoordinator, OperationToken
 
 log = logging.getLogger(__name__)
+
+#: How long emergency stop waits for each worker it is trying to stop. Long
+#: enough for an instrument conversation to finish, short enough that a stuck
+#: one is reported rather than waited on indefinitely.
+_EMERGENCY_JOIN_S = 10.0
 
 
 def high_risk_warnings(
@@ -126,6 +132,7 @@ class RigOperations:
         smu,
         wavegen_controller,
         settings,
+        engine,
         hardware_labels: dict[str, str],
     ) -> None:
         self.ui = ui
@@ -136,6 +143,11 @@ class RigOperations:
         self.smu = smu
         self.wavegen_controller = wavegen_controller
         self.settings = settings
+        self.engine = engine
+        # Bound after construction: AutoSequence needs the engine, which needs
+        # this. Only emergency stop uses it, and only after the UI exists.
+        self.sequence: Any = None
+        self._emergency_worker: Optional[threading.Thread] = None
         self._hardware_labels = hardware_labels
 
     # -- operation lifecycle ------------------------------------------------
@@ -363,3 +375,73 @@ class RigOperations:
         # chose.
         if after_success is not None and not self.ui.is_closing():
             after_success()
+
+    # -- emergency stop -------------------------------------------------------
+
+    def emergency_stop(self) -> None:
+        """Latch the interlock and bring both outputs down, now.
+
+        **Deliberately does not claim the rig.** Every other operation goes
+        through :meth:`begin`, which refuses when something else is running —
+        and something else running is precisely when this is needed. The one
+        thing it will not do is start a second time while the first is still
+        going, because that would race two shutdown sequences against each
+        other.
+        """
+        if self._emergency_worker is not None and self._emergency_worker.is_alive():
+            return
+
+        self.ui.set_status(
+            "EMERGENCY STOP requested — shutting outputs down..."
+        )
+        self.ui.refresh_controls()
+        sequence_was_active = self.operations.active_kind == "sequence" or bool(
+            self.sequence is not None and self.sequence.active
+        )
+
+        def work() -> None:
+            # These APIs latch the interlock *before* exposing cancellation to
+            # the experiment worker. Cancelling first would race a real E-stop
+            # into an ordinary "cancelled" run outcome, losing the record that
+            # the rig tripped.
+            owner = (
+                self.sequence
+                if sequence_was_active and self.sequence is not None
+                else self.engine
+            )
+            shutdown_thread = owner.request_emergency_stop()
+            self.operations.cancel_active()
+            shutdown_thread.join(timeout=_EMERGENCY_JOIN_S)
+
+            # Every confirmation is collected rather than raising at the first
+            # failure: after an emergency stop the operator needs to know
+            # everything that could not be confirmed, not just the first thing.
+            problems = []
+            if shutdown_thread.is_alive():
+                problems.append("emergency output shutdown did not finish")
+            if not self.safety.is_tripped:
+                problems.append("emergency-stop safety latch was not confirmed")
+            if self.sequence is not None and not self.sequence.join(
+                timeout=_EMERGENCY_JOIN_S
+            ):
+                problems.append("auto-sequence worker did not stop")
+            self.engine.join(timeout=_EMERGENCY_JOIN_S)
+            if self.engine.is_busy():
+                problems.append("experiment worker did not stop")
+            if self.smu.output_is_on or self.wavegen_controller.outputs_armed:
+                problems.append("output shutdown could not be confirmed")
+            if problems:
+                raise RuntimeError("; ".join(problems))
+
+        self._emergency_worker = self.run(
+            work, self.on_emergency_stop_done, name="emergency-stop"
+        )
+
+    def on_emergency_stop_done(self, error: Optional[BaseException]) -> None:
+        self.ui.set_status(
+            "EMERGENCY STOP complete. Outputs are OFF; safety is latched."
+            if error is None
+            else f"EMERGENCY STOP encountered an error: {error}"
+        )
+        self.ui.smu_state_changed()
+        self.ui.refresh_controls()

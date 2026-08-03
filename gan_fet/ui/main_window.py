@@ -228,9 +228,9 @@ class MainWindow(tk.Tk):
             smu=smu,
             wavegen_controller=wavegen_controller,
             settings=settings,
+            engine=engine,
             hardware_labels=HARDWARE_OPERATION_LABELS,
         )
-        self._emergency_worker: Optional[threading.Thread] = None
         self._event_unsubscribers: list[Callable[[], None]] = []
 
         self.default_param_options = {
@@ -261,6 +261,7 @@ class MainWindow(tk.Tk):
                 prompt_operator=self._prompt_operator,
             ),
         )
+        self.rig.sequence = self.sequence
         self.safety.on_trip = self._on_safety_trip
 
         self._build_ui()
@@ -1749,64 +1750,8 @@ class MainWindow(tk.Tk):
         self.rig.bus_off()
 
     def _emergency_stop(self) -> None:
-        if self._emergency_worker is not None and self._emergency_worker.is_alive():
-            return
+        self.rig.emergency_stop()
 
-        self.status_bar.set_message("EMERGENCY STOP requested — shutting outputs down...")
-        self._refresh_control_states()
-        sequence_was_active = (
-            self.operations.active_kind == "sequence" or self.sequence.active
-        )
-
-        def worker() -> None:
-            error: Optional[BaseException] = None
-            try:
-                # These APIs latch the interlock before exposing cancellation
-                # to the experiment worker.  Calling cancel() first can race a
-                # real E-stop into an ordinary "cancelled" run outcome.
-                shutdown_thread = (
-                    self.sequence.request_emergency_stop()
-                    if sequence_was_active
-                    else self.engine.request_emergency_stop()
-                )
-                self.operations.cancel_active()
-                shutdown_thread.join(timeout=10.0)
-                problems = []
-                if shutdown_thread.is_alive():
-                    problems.append("emergency output shutdown did not finish")
-                if not self.safety.is_tripped:
-                    problems.append("emergency-stop safety latch was not confirmed")
-                if not self.sequence.join(timeout=10.0):
-                    problems.append("auto-sequence worker did not stop")
-                self.engine.join(timeout=10.0)
-                if self.engine.is_busy():
-                    problems.append("experiment worker did not stop")
-                if self.smu.output_is_on or self.wavegen_controller.outputs_armed:
-                    problems.append("output shutdown could not be confirmed")
-                if problems:
-                    raise RuntimeError("; ".join(problems))
-            except BaseException as exc:
-                error = exc
-                log.exception("Emergency-stop worker failed")
-            self.ui_dispatcher.post(self._on_emergency_stop_done, error)
-
-        self._emergency_worker = self._start_worker(
-            worker, name="emergency-stop"
-        )
-
-    def _on_emergency_stop_done(
-        self, error: Optional[BaseException]
-    ) -> None:
-        if error is None:
-            self.status_bar.set_message(
-                "EMERGENCY STOP complete. Outputs are OFF; safety is latched."
-            )
-        else:
-            self.status_bar.set_message(
-                f"EMERGENCY STOP encountered an error: {error}"
-            )
-        self._update_smu_panel()
-        self._refresh_control_states()
 
     def _on_safety_trip(self, kind: str, detail: str) -> None:
         self.operations.cancel_active()

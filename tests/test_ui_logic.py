@@ -687,50 +687,6 @@ def test_smu_limits_do_not_expose_legacy_ramp_delay() -> None:
     assert "ramp_delay_s" not in {attr for _label, _section, attr, _cast in SmuLimitsEditor.FIELDS}
 
 
-def test_ui_estop_requests_latch_before_cancelling_active_operation() -> None:
-    order = []
-
-    class _FinishedThread:
-        def join(self, timeout=None) -> None:
-            order.append("shutdown_join")
-
-        def is_alive(self) -> bool:
-            return False
-
-    window = _headless_window()
-    window._emergency_worker = None
-    window.status_bar = SimpleNamespace(set_message=lambda _message: None)
-    window._refresh_control_states = lambda: None
-    window.operations = SimpleNamespace(
-        active_kind="experiment",
-        cancel_active=lambda: order.append("operation_cancel"),
-    )
-    window.sequence = SimpleNamespace(
-        active=False,
-        join=lambda timeout=None: True,
-    )
-    window.engine = SimpleNamespace(
-        request_emergency_stop=lambda: (
-            order.append("estop_latch_request") or _FinishedThread()
-        ),
-        join=lambda timeout=None: None,
-        is_busy=lambda: False,
-    )
-    window.safety = SimpleNamespace(is_tripped=True)
-    window.smu = SimpleNamespace(output_is_on=False)
-    window.wavegen_controller = SimpleNamespace(outputs_armed=False)
-    window.ui_dispatcher = SimpleNamespace(post=lambda *_args, **_kwargs: None)
-
-    def run_synchronously(target, *, name):
-        assert name == "emergency-stop"
-        target()
-        return _FinishedThread()
-
-    window._start_worker = run_synchronously
-
-    MainWindow._emergency_stop(window)
-
-    assert order.index("estop_latch_request") < order.index("operation_cancel")
 
 
 def test_rendered_log_row_overflow_is_bounded() -> None:

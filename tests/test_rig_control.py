@@ -159,12 +159,55 @@ class _Safety:
         return self.estop_ok
 
 
+class _Engine:
+    """The experiment engine, as far as emergency stop is concerned."""
+
+    def __init__(self, *, busy_after_stop: bool = False, order=None) -> None:
+        self.busy_after_stop = busy_after_stop
+        self.order = order if order is not None else []
+
+    def request_emergency_stop(self):
+        self.order.append("latch")
+        return _FinishedThread()
+
+    def join(self, timeout=None) -> None:
+        pass
+
+    def is_busy(self) -> bool:
+        return self.busy_after_stop
+
+
+class _Sequence:
+    def __init__(self, *, active: bool = False, stops: bool = True, order=None):
+        self.active = active
+        self.stops = stops
+        self.order = order if order is not None else []
+
+    def request_emergency_stop(self):
+        self.order.append("latch")
+        return _FinishedThread()
+
+    def join(self, timeout=None) -> bool:
+        return self.stops
+
+
+class _FinishedThread:
+    def __init__(self, *, finishes: bool = True) -> None:
+        self.finishes = finishes
+
+    def join(self, timeout=None) -> None:
+        pass
+
+    def is_alive(self) -> bool:
+        return not self.finishes
+
+
 SETTINGS = SimpleNamespace(
     wavegen=SimpleNamespace(duty_ramp_rate_pct_s=5.0, freq_ramp_rate_khz_s=200.0)
 )
 
 
-def _build(ui=None, smu=None, wavegen=None, safety=None):
+def _build(ui=None, smu=None, wavegen=None, safety=None, engine=None):
     ui = ui or _Ui()
     rig = RigOperations(
         ui=ui,
@@ -175,6 +218,7 @@ def _build(ui=None, smu=None, wavegen=None, safety=None):
         smu=smu or _Smu(),
         wavegen_controller=wavegen or _Wavegen(),
         settings=SETTINGS,
+        engine=engine or _Engine(),
         hardware_labels=LABELS,
     )
     return rig, ui
@@ -492,3 +536,133 @@ def test_nothing_queued_runs_while_the_window_is_closing():
     later = []
     rig2.on_apply_wavegen_done(token, None, after_success=lambda: later.append(True))
     assert later == []
+
+
+# -- emergency stop ------------------------------------------------------------
+
+
+def _estop(ui=None, engine=None, safety=None, smu=None, wavegen=None,
+           sequence=None):
+    rig, ui = _build(
+        ui=ui,
+        engine=engine,
+        safety=safety or _Safety(is_tripped=True),
+        smu=smu or _Smu(really_off=True),
+        wavegen=wavegen,
+    )
+    if smu is None:
+        rig.smu.output_is_on = False
+    if wavegen is None:
+        rig.wavegen_controller.outputs_armed = False
+    rig.sequence = sequence
+    rig.emergency_stop()
+    rig.pool.join_all(3.0)
+    return rig, ui
+
+
+def test_emergency_stop_reports_success_when_everything_confirms():
+    rig, ui = _estop()
+    assert _said(ui, "EMERGENCY STOP complete. Outputs are OFF; safety is latched.")
+
+
+def test_the_latch_is_requested_before_cancellation_becomes_visible():
+    """These APIs latch the interlock before exposing cancellation to the
+    experiment worker. Cancelling first would race a real E-stop into an
+    ordinary "cancelled" run outcome, losing the record that the rig tripped.
+    """
+    order: list[str] = []
+    engine = _Engine(order=order)
+    rig, _ui = _build(engine=engine, safety=_Safety(is_tripped=True))
+    rig.smu.output_is_on = False
+    rig.wavegen_controller.outputs_armed = False
+    original = rig.operations.cancel_active
+    rig.operations.cancel_active = lambda: (  # type: ignore[method-assign]
+        order.append("cancel"), original()
+    )[1]
+    rig.emergency_stop()
+    rig.pool.join_all(3.0)
+    assert order.index("latch") < order.index("cancel")
+
+
+def test_emergency_stop_does_not_claim_the_rig():
+    """Every other operation goes through begin(), which refuses when
+    something else is running — and something else running is exactly when
+    this is needed."""
+    rig, _ui = _build(safety=_Safety(is_tripped=True))
+    rig.smu.output_is_on = False
+    rig.wavegen_controller.outputs_armed = False
+    held = rig.begin("bus_off")
+    assert held is not None
+    rig.emergency_stop()
+    rig.pool.join_all(3.0)
+    assert rig._emergency_worker is not None
+
+
+def test_a_second_press_while_one_is_running_is_ignored():
+    """Two shutdown sequences racing each other is worse than one.
+
+    The first press is held inside request_emergency_stop so that the second
+    genuinely lands while it is still in flight — otherwise the first would
+    finish first and the second would legitimately start a new one.
+    """
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+    latches: list[str] = []
+
+    class _SlowEngine(_Engine):
+        def request_emergency_stop(self):
+            latches.append("latch")
+            started.set()
+            release.wait(3.0)
+            return _FinishedThread()
+
+    rig, _ui = _build(engine=_SlowEngine(), safety=_Safety(is_tripped=True))
+    rig.smu.output_is_on = False
+    rig.wavegen_controller.outputs_armed = False
+    rig.emergency_stop()
+    assert started.wait(3.0), "the first press should have reached the engine"
+    rig.emergency_stop()
+    release.set()
+    rig.pool.join_all(3.0)
+    assert latches == ["latch"], "the second press started another shutdown"
+
+
+def test_an_unlatched_safety_is_reported():
+    """The whole point of an emergency stop is that the interlock is set
+    afterwards. If it is not, nothing else about the outcome matters."""
+    rig, ui = _estop(safety=_Safety(is_tripped=False))
+    assert _said(ui, "safety latch was not confirmed")
+
+
+def test_an_output_still_on_is_reported():
+    smu = _Smu()
+    smu.output_is_on = True
+    rig, ui = _estop(smu=smu)
+    assert _said(ui, "output shutdown could not be confirmed")
+
+
+def test_every_unconfirmed_thing_is_reported_not_just_the_first():
+    """After an emergency stop the operator needs to know everything that
+    could not be confirmed."""
+    smu = _Smu()
+    smu.output_is_on = True
+    rig, ui = _estop(safety=_Safety(is_tripped=False), smu=smu)
+    problems = [m for m in ui.status if "encountered an error" in m]
+    assert problems
+    assert "safety latch was not confirmed" in problems[0]
+    assert "output shutdown could not be confirmed" in problems[0]
+
+
+def test_an_active_sequence_is_stopped_at_the_sequence_level():
+    """Stopping the engine alone would let the sequence start the next point
+    after an emergency stop."""
+    order: list[str] = []
+    sequence = _Sequence(active=True, order=order)
+    rig, ui = _estop(sequence=sequence)
+    assert order == ["latch"], "the sequence, not the engine, was asked to stop"
+
+
+def test_a_sequence_that_will_not_stop_is_reported():
+    rig, ui = _estop(sequence=_Sequence(active=True, stops=False))
+    assert _said(ui, "auto-sequence worker did not stop")
