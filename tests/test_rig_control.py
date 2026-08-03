@@ -10,11 +10,18 @@ from __future__ import annotations
 
 from typing import Optional
 
-from gan_fet.ui.operations.rig_control import RigOperations, reset_confirmation
+from types import SimpleNamespace
+
+from gan_fet.ui.operations.rig_control import (
+    RigOperations,
+    high_risk_warnings,
+    reset_confirmation,
+)
 from gan_fet.ui.operations.worker_pool import WorkerPool
 from gan_fet.ui.widgets import OperationCoordinator
 
 LABELS = {
+    "apply_wavegen": "apply wavegen settings",
     "bus_off": "control the bus output",
     "zvs": "run a ZVS search",
     "reset_safety": "reset the safety interlock",
@@ -70,6 +77,9 @@ class _Ui:
     def smu_state_changed(self) -> None:
         self.smu_updates += 1
 
+    def set_status_async(self, message: str) -> None:
+        self.status.append(message)
+
 
 class _Dispatcher:
     def post(self, func, *args, **kwargs):
@@ -93,13 +103,27 @@ class _Smu:
 
 
 class _Wavegen:
-    def __init__(self, *, really_disarms: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        really_disarms: bool = True,
+        applied_duty: Optional[int] = None,
+        apply_error: Optional[BaseException] = None,
+    ) -> None:
         self.outputs_armed = True
         self.really_disarms = really_disarms
+        self.applied_duty = applied_duty
+        self.apply_error = apply_error
+        self.applied: list[tuple] = []
 
     def disarm_outputs(self) -> None:
         if self.really_disarms:
             self.outputs_armed = False
+
+    def apply(self, config, frequency, duty, **kwargs) -> None:
+        self.applied.append((config, frequency, duty))
+        if self.apply_error is not None:
+            raise self.apply_error
 
 
 class _Safety:
@@ -135,6 +159,11 @@ class _Safety:
         return self.estop_ok
 
 
+SETTINGS = SimpleNamespace(
+    wavegen=SimpleNamespace(duty_ramp_rate_pct_s=5.0, freq_ramp_rate_khz_s=200.0)
+)
+
+
 def _build(ui=None, smu=None, wavegen=None, safety=None):
     ui = ui or _Ui()
     rig = RigOperations(
@@ -145,6 +174,7 @@ def _build(ui=None, smu=None, wavegen=None, safety=None):
         safety=safety or _Safety(),
         smu=smu or _Smu(),
         wavegen_controller=wavegen or _Wavegen(),
+        settings=SETTINGS,
         hardware_labels=LABELS,
     )
     return rig, ui
@@ -357,3 +387,108 @@ def test_the_confirmation_text_is_built_from_the_reason():
     assert "inspected and both outputs are OFF" in message
     assert "overcurrent — 1.2 A" in message
     assert "Latched reason" not in reset_confirmation(None)[1]
+
+
+# -- applying the wavegen settings --------------------------------------------
+
+
+def _apply(ui=None, wavegen=None, **kwargs):
+    wavegen = wavegen or _Wavegen()
+    rig, ui = _build(ui=ui, wavegen=wavegen)
+    request = {"config": "Single Device", "frequency_hz": 6_000_000, "duty_pct": 50}
+    request.update(kwargs)
+    started = rig.apply_wavegen(**request)
+    rig.pool.join_all(2.0)
+    return rig, ui, wavegen, started
+
+
+def test_applying_pushes_the_selected_settings():
+    rig, ui, wavegen, started = _apply()
+    assert started
+    assert wavegen.applied == [("Single Device", 6_000_000, 50)]
+    assert _said(ui, "Wavegen parameters applied.")
+
+
+def test_an_unchanged_duty_asks_nothing():
+    """Warning on every apply teaches the operator to dismiss the dialog
+    without reading it."""
+    rig, ui, _wavegen, _started = _apply(wavegen=_Wavegen(applied_duty=50))
+    assert ui.confirmations == []
+
+
+def test_a_duty_change_is_confirmed_first():
+    """Duty changes how long the switch conducts each cycle, so it changes the
+    thermal load on a device that may already be at temperature."""
+    rig, ui, wavegen, _started = _apply(wavegen=_Wavegen(applied_duty=40))
+    assert ui.confirmations, "a duty change must be confirmed"
+    _title, message, dangerous = ui.confirmations[0]
+    assert "40% to 50%" in message
+    assert dangerous
+
+
+def test_declining_a_duty_change_applies_nothing():
+    ui = _Ui()
+    ui.answer = False
+    rig, ui, wavegen, started = _apply(ui=ui, wavegen=_Wavegen(applied_duty=40))
+    assert not started
+    assert wavegen.applied == []
+    assert rig.operations.active_kind is None
+
+
+def test_the_first_apply_after_startup_is_not_a_change():
+    """Nothing to compare against yet."""
+    assert high_risk_warnings(None, 50) == []
+    assert high_risk_warnings(50, 50) == []
+    assert high_risk_warnings(40, 50)
+
+
+def test_a_failed_apply_is_reported_and_releases_the_rig():
+    wavegen = _Wavegen(apply_error=RuntimeError("wavegen did not answer"))
+    rig, ui, _wavegen, _started = _apply(wavegen=wavegen)
+    assert ui.errors and "wavegen did not answer" in ui.errors[0][1]
+    assert _said(ui, "Wavegen configuration failed.")
+    assert rig.operations.active_kind is None
+
+
+def test_a_cancelled_apply_is_not_reported_as_an_error():
+    """The operator stopped it. A dialog would be telling them what they just
+    did."""
+    wavegen = _Wavegen(apply_error=InterruptedError("cancelled"))
+    rig, ui, _wavegen, _started = _apply(wavegen=wavegen)
+    assert ui.errors == []
+    assert _said(ui, "Wavegen configuration cancelled.")
+
+
+def test_what_was_queued_behind_a_successful_apply_runs():
+    ran = []
+    rig, ui, _wavegen, _started = _apply(after_success=lambda: ran.append(True))
+    assert ran == [True]
+
+
+def test_nothing_queued_runs_after_a_failed_apply():
+    """It assumed the wavegen now holds the selected settings. If it does not,
+    running it would drive the rig from parameters nobody chose."""
+    ran = []
+    wavegen = _Wavegen(apply_error=RuntimeError("nope"))
+    rig, ui, _wavegen, _started = _apply(
+        wavegen=wavegen, after_success=lambda: ran.append(True)
+    )
+    assert ran == []
+
+
+def test_nothing_queued_runs_while_the_window_is_closing():
+    ran = []
+    ui = _Ui()
+    rig, _ui, wavegen, _started = _apply(
+        ui=ui, after_success=lambda: ran.append(True)
+    )
+    assert ran == [True]
+    # Same again, but the window went away while the ramp was in flight.
+    ui2 = _Ui()
+    rig2, _ui2 = _build(ui=ui2, wavegen=_Wavegen())
+    token = rig2.begin("apply_wavegen")
+    assert token is not None
+    ui2.closing = True
+    later = []
+    rig2.on_apply_wavegen_done(token, None, after_success=lambda: later.append(True))
+    assert later == []

@@ -227,6 +227,7 @@ class MainWindow(tk.Tk):
             safety=safety,
             smu=smu,
             wavegen_controller=wavegen_controller,
+            settings=settings,
             hardware_labels=HARDWARE_OPERATION_LABELS,
         )
         self._emergency_worker: Optional[threading.Thread] = None
@@ -1005,6 +1006,9 @@ class MainWindow(tk.Tk):
     def smu_state_changed(self) -> None:
         self._update_smu_panel()
 
+    def set_status_async(self, message: str) -> None:
+        self._status_async(message)
+
     def _safety_is_tripped(self) -> bool:
         return bool(getattr(self.safety, "is_tripped", False))
 
@@ -1413,85 +1417,32 @@ class MainWindow(tk.Tk):
                     state="disabled",
                 )
 
-    def _confirm_high_risk(self) -> bool:
-        warnings = []
-        previous_duty = self.wavegen_controller.applied_duty
-        new_duty = int(self.duty_var.get())
-        if previous_duty is not None and new_duty != previous_duty:
-            warnings.append(f"Duty cycle change from {previous_duty}% to {new_duty}%.")
-        if not warnings:
-            return True
-        return messagebox.askyesno(
-            "Confirm High-Risk Change",
-            "The following high-risk changes were detected:\n\n"
-            + "\n".join(f"- {w}" for w in warnings)
-            + "\n\nThese changes may damage the device. Proceed?",
-            icon="warning",
-        )
 
     def _apply_wavegen(
         self, after_success: Optional[Callable[[], object]] = None
     ) -> bool:
-        # ``after_success`` returns ``object`` so callbacks that report a value
-        # (e.g. ``_launch_experiment``) can be passed without a wrapper; the
-        # result is deliberately discarded.
-        if not self._ensure_hardware_online(
-            HARDWARE_OPERATION_LABELS["apply_wavegen"]
-        ):
-            return False
-        if not self._confirm_high_risk():
-            return False
-        token = self._begin_operation("apply_wavegen")
-        if token is None:
-            return False
-        config = self.config_var.get()
-        frequency = int(self.frequency_var.get())
-        duty = int(self.duty_var.get())
-        self.status_bar.set_message("Applying wavegen settings...")
-
-        def work() -> None:
-            self.wavegen_controller.apply(
-                config,
-                frequency,
-                duty,
-                duty_rate_pct_s=self.settings.wavegen.duty_ramp_rate_pct_s,
-                freq_rate_khz_s=self.settings.wavegen.freq_ramp_rate_khz_s,
-                cancel_check=token.cancel_event.is_set,
-                status=self._status_async,
-            )
-            if token.cancel_event.is_set():
-                raise InterruptedError("wavegen configuration cancelled")
-
-        self._run_operation(
-            work,
-            partial(self._on_apply_wavegen_done, token, after_success=after_success),
-            name="apply-wavegen",
-        )
-        return True
-
-    def _on_apply_wavegen_done(
-        self,
-        token: OperationToken,
-        error: Optional[BaseException],
-        *,
-        after_success: Optional[Callable[[], object]] = None,
-    ) -> None:
-        self._finish_operation(token)
-        if error is not None:
-            if isinstance(error, InterruptedError):
-                self.status_bar.set_message("Wavegen configuration cancelled.")
-            else:
-                messagebox.showerror(
-                    "Wavegen Error",
-                    f"Failed to configure wavegen: {error}",
-                    parent=self,
+        try:
+            config = self.config_var.get()
+            frequency = int(self.frequency_var.get())
+            duty = int(self.duty_var.get())
+        except (ValueError, tk.TclError):
+            # Unreadable inputs cannot be applied, and reporting that here is
+            # better than pushing a partial configuration to the gate.
+            self._show_refusal(
+                Refusal(
+                    "Wavegen Settings",
+                    "The selected parameters could not be read.",
+                    severity="error",
                 )
-                self.status_bar.set_message("Wavegen configuration failed.")
-            return
-        self.status_bar.set_message("Wavegen parameters applied.")
-        self._refresh_confirm_state()
-        if after_success is not None and not self._closing:
-            after_success()
+            )
+            return False
+        return self.rig.apply_wavegen(
+            config=config,
+            frequency_hz=frequency,
+            duty_pct=duty,
+            after_success=after_success,
+        )
+
 
     def _start_autotune(self) -> None:
         if not self._ensure_hardware_online(

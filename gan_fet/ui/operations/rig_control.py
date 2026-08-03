@@ -14,13 +14,42 @@ imports tkinter.
 from __future__ import annotations
 
 import logging
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 from gan_fet.ui.operations.background import Dispatcher, run_in_background
 from gan_fet.ui.operations.worker_pool import WorkerPool
 from gan_fet.ui.widgets import OperationCoordinator, OperationToken
 
 log = logging.getLogger(__name__)
+
+
+def high_risk_warnings(
+    previous_duty: Optional[int], new_duty: int
+) -> list[str]:
+    """Changes worth stopping the operator for before they are applied.
+
+    Duty cycle is here because it changes how long the switch conducts each
+    cycle, which changes the thermal load on a device that may already be at
+    temperature — and unlike frequency or configuration, it is easy to alter
+    by one keystroke without meaning to.
+
+    An unknown previous duty is not a change. The first apply after startup
+    has nothing to compare against, and warning about it every time would
+    teach the operator to dismiss the dialog without reading it.
+    """
+    if previous_duty is None or new_duty == previous_duty:
+        return []
+    return [f"Duty cycle change from {previous_duty}% to {new_duty}%."]
+
+
+def high_risk_prompt(warnings: list[str]) -> tuple[str, str]:
+    """The confirmation shown for the changes in ``warnings``."""
+    return (
+        "Confirm High-Risk Change",
+        "The following high-risk changes were detected:\n\n"
+        + "\n".join(f"- {w}" for w in warnings)
+        + "\n\nThese changes may damage the device. Proceed?",
+    )
 
 
 def reset_confirmation(trip_reason) -> tuple[str, str]:
@@ -79,6 +108,9 @@ class RigUi(Protocol):
     def smu_state_changed(self) -> None:
         """Re-read the SMU status line and telemetry."""
 
+    def set_status_async(self, message: str) -> None:
+        """Set the status line from a worker thread."""
+
 
 class RigOperations:
     """Starts, tracks and completes the operator's rig actions."""
@@ -93,6 +125,7 @@ class RigOperations:
         safety,
         smu,
         wavegen_controller,
+        settings,
         hardware_labels: dict[str, str],
     ) -> None:
         self.ui = ui
@@ -102,6 +135,7 @@ class RigOperations:
         self.safety = safety
         self.smu = smu
         self.wavegen_controller = wavegen_controller
+        self.settings = settings
         self._hardware_labels = hardware_labels
 
     # -- operation lifecycle ------------------------------------------------
@@ -243,3 +277,89 @@ class RigOperations:
         else:
             self.ui.set_status("Safety latch reset. Rig remains disarmed.")
         self.ui.smu_state_changed()
+
+    # -- apply the wavegen settings -----------------------------------------
+
+    def apply_wavegen(
+        self,
+        *,
+        config: str,
+        frequency_hz: int,
+        duty_pct: int,
+        after_success: Optional[Callable[[], object]] = None,
+    ) -> bool:
+        """Push the selected gate settings to the wavegen.
+
+        ``after_success`` lets a caller queue what it actually wanted to do —
+        start a run, launch a search — behind the apply, so the operator
+        answers one prompt instead of two. It returns ``object`` rather than
+        ``None`` so callbacks that report a value can be passed unwrapped; the
+        result is deliberately discarded.
+
+        Returns whether the operation started, not whether it succeeded.
+        """
+        if not self.ui.hardware_online(self._hardware_labels["apply_wavegen"]):
+            return False
+        warnings = high_risk_warnings(
+            self.wavegen_controller.applied_duty, duty_pct
+        )
+        if warnings and not self.ui.confirm(
+            *high_risk_prompt(warnings), dangerous=True
+        ):
+            return False
+        token = self.begin("apply_wavegen")
+        if token is None:
+            return False
+        self.ui.set_status("Applying wavegen settings...")
+
+        def work() -> None:
+            self.wavegen_controller.apply(
+                config,
+                frequency_hz,
+                duty_pct,
+                duty_rate_pct_s=self.settings.wavegen.duty_ramp_rate_pct_s,
+                freq_rate_khz_s=self.settings.wavegen.freq_ramp_rate_khz_s,
+                cancel_check=token.cancel_event.is_set,
+                status=self.ui.set_status_async,
+            )
+            # A cancelled ramp leaves the wavegen part-way between the old
+            # settings and the new ones, so it has not been applied even
+            # though nothing raised.
+            if token.cancel_event.is_set():
+                raise InterruptedError("wavegen configuration cancelled")
+
+        self.run(
+            work,
+            lambda error: self.on_apply_wavegen_done(
+                token, error, after_success=after_success
+            ),
+            name="apply-wavegen",
+        )
+        return True
+
+    def on_apply_wavegen_done(
+        self,
+        token: OperationToken,
+        error: Optional[BaseException],
+        *,
+        after_success: Optional[Callable[[], object]] = None,
+    ) -> None:
+        self.finish(token)
+        if error is not None:
+            if isinstance(error, InterruptedError):
+                # The operator stopped it. Nothing to report but the fact.
+                self.ui.set_status("Wavegen configuration cancelled.")
+            else:
+                self.ui.show_error(
+                    "Wavegen Error", f"Failed to configure wavegen: {error}"
+                )
+                self.ui.set_status("Wavegen configuration failed.")
+            return
+        self.ui.set_status("Wavegen parameters applied.")
+        self.ui.refresh_confirm()
+        # Only on success, and not while closing. Whatever was queued behind
+        # the apply assumed the wavegen now holds the selected settings; if it
+        # does not, running it would drive the rig from parameters nobody
+        # chose.
+        if after_success is not None and not self.ui.is_closing():
+            after_success()
