@@ -13,6 +13,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from gan_fet.core.models import MatrixPoint, freq_label, sanitize_device_name
 from gan_fet.core.sequence import PlanSummary, build_matrix_plan
 from gan_fet.storage.db import Database
+from gan_fet.storage.schema import PLAN_SLOT_DRAFT
+from gan_fet.ui.plan_table import (
+    PLAN_COLUMN_IDS,
+    configure_plan_tree,
+    fill_plan_tree,
+)
 from gan_fet.ui.tracker_view import TrackerView
 from gan_fet.ui.widgets import parse_positive_duration
 
@@ -250,26 +256,9 @@ class PlannerTab(ttk.Frame):
         table_frame = ttk.LabelFrame(plan_tab, text="Test Execution Point Listing")
         table_frame.pack(fill="both", expand=True, padx=5, pady=5)
 
-        columns = ("step", "temp", "config", "freq", "duty", "voltage", "status", "duration")
-        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=10)
-
-        self.tree.heading("step", text="#")
-        self.tree.heading("temp", text="Temp (°C)")
-        self.tree.heading("config", text="Configuration")
-        self.tree.heading("freq", text="Frequency")
-        self.tree.heading("duty", text="Duty (%)")
-        self.tree.heading("voltage", text="Voltage (V)")
-        self.tree.heading("status", text="Status")
-        self.tree.heading("duration", text="Est. Time (min)")
-
-        self.tree.column("step", width=50, anchor="center")
-        self.tree.column("temp", width=90, anchor="center")
-        self.tree.column("config", width=140, anchor="w")
-        self.tree.column("freq", width=110, anchor="center")
-        self.tree.column("duty", width=80, anchor="center")
-        self.tree.column("voltage", width=90, anchor="center")
-        self.tree.column("status", width=110, anchor="center")
-        self.tree.column("duration", width=110, anchor="center")
+        self.tree = ttk.Treeview(
+            table_frame, columns=PLAN_COLUMN_IDS, show="headings", height=10
+        )
 
         tree_scroll_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         tree_scroll_x = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
@@ -279,8 +268,7 @@ class PlannerTab(ttk.Frame):
         tree_scroll_x.pack(side="bottom", fill="x")
         self.tree.pack(side="left", fill="both", expand=True)
 
-        self.tree.tag_configure("completed", foreground="#666666", background="#f0f0f0")
-        self.tree.tag_configure("pending", foreground="#0d47a1")
+        configure_plan_tree(self.tree)
 
         # Action Buttons
         actions_frame = ttk.Frame(plan_tab)
@@ -396,6 +384,7 @@ class PlannerTab(ttk.Frame):
         self.lbl_temp_prompts.config(text="Thermal Chamber Prompts: —")
 
         self.tree.delete(*self.tree.get_children())
+        self._clear_draft()
         self.run_btn.config(state="disabled")
         self.export_btn.config(state="disabled")
 
@@ -417,32 +406,39 @@ class PlannerTab(ttk.Frame):
             text=f"Thermal Chamber Prompts: {plan.temperature_changes} transition(s)"
         )
 
-        # Clear and populate table
-        self.tree.delete(*self.tree.get_children())
-        for idx, item in enumerate(plan.points, start=1):
-            pt = item.point
-            status_str = "Completed" if item.is_completed else "Pending"
-            tag = "completed" if item.is_completed else "pending"
-
-            self.tree.insert(
-                "",
-                "end",
-                values=(
-                    idx,
-                    f"{pt.temperature_c} °C",
-                    pt.config,
-                    freq_label(pt.frequency_hz),
-                    f"{pt.duty_pct} %",
-                    f"{pt.voltage_v} V",
-                    status_str,
-                    f"{duration:.1f}",
-                ),
-                tags=(tag,),
-            )
+        # ``PlannedTestPoint`` already has the ``point``/``is_completed`` shape
+        # the shared renderer wants, so this listing and the Experiment tab's
+        # Planned Tests table are drawn by the same code.
+        fill_plan_tree(self.tree, plan.points, duration)
+        self._save_draft(plan)
 
         has_runnable_points = len(plan.points) > 0
         self.run_btn.config(state="normal" if has_runnable_points else "disabled")
         self.export_btn.config(state="normal" if has_runnable_points else "disabled")
+
+    def _save_draft(self, plan: PlanSummary) -> None:
+        """Persist the listing as it stands, on every selection change.
+
+        Best effort, and deliberately silent on failure: this is the working
+        plan, not the applied one, and interrupting parameter selection with
+        an error dialog would be worse than losing a draft that is one click
+        from being rebuilt.
+        """
+        try:
+            self.db.save_plan(
+                PLAN_SLOT_DRAFT,
+                plan.all_points,
+                source="Planner draft",
+                device_name=sanitize_device_name(self.get_device_name().strip()),
+            )
+        except Exception:
+            log.exception("Could not save the planner draft")
+
+    def _clear_draft(self) -> None:
+        try:
+            self.db.clear_plan(PLAN_SLOT_DRAFT)
+        except Exception:
+            log.exception("Could not clear the planner draft")
 
     def _apply_plan(self) -> None:
         """Make the current plan the one the rig is working from."""

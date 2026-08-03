@@ -100,7 +100,7 @@ this is a worthwhile change.
 
 ## Storage
 
-- `storage/schema.py` holds `SCHEMA_VERSION` (currently 4) and the canonical
+- `storage/schema.py` holds `SCHEMA_VERSION` (currently 7) and the canonical
   run-row projection. **Never duplicate a positional run projection.** To evolve
   persistence, add an idempotent structural migration and raise the version.
 - `runs` is **append-only**. Each execution appends an attempt; a failed retry
@@ -108,6 +108,34 @@ this is a worthwhile change.
   `cancelled`, `tripped`, `interrupted`, `legacy_partial`.
 - Reports and the UI select the newest *successful* attempt. CSV export
   deliberately uses the separate all-attempts query.
+
+### Test plans
+
+Two slots in `plan_points` / `plan_meta`, from schema 7. They are separate
+stores, not two views of one:
+
+- `draft` — the whole matrix the planner is showing, completed points
+  included. Rewritten on every selection change; backs the "Sequence Execution
+  Plan Listing".
+- `applied` — the outstanding work, written by "Apply Test Plan" and
+  **drained**: `PlanStore.complete_point()` deletes a point as its run
+  succeeds. Backs "Planned Tests" and is what the sequence runs.
+
+- Only a *successful* run drains a point (`plan_store.measured_point`). A
+  failed or tripped attempt records itself in `runs` without producing a
+  measurement, so the point stays queued.
+- A slot with a meta row and no points means **complete**; no meta row means
+  **no plan applied**. `load_plan` returns `None` only for the latter.
+  Conflating the two is what made a finished plan render as a blank table.
+- `plan_meta.total_count` survives the last point being drained, so a finished
+  plan can still report how big it was.
+- The queue is **not** recomputed by subtracting `runs` from the plan. That
+  cannot express a deliberate re-test — "Include Completed Runs" queues points
+  that already have runs, and subtracting would empty the plan on apply.
+- Both tables render through `ui/plan_table.py`. Columns, formatting and tags
+  live there so the two cannot drift apart, as they previously had.
+- A failed plan write is logged, never raised: losing persistence costs the
+  operator next session, whereas refusing to apply blocks them at the bench.
 - Shared data directories use a tokenized, fail-closed heartbeat lease. A
   stale-looking lock is **never** auto-removed — network clock skew makes that
   unsafe. Operators must verify and remove it manually.

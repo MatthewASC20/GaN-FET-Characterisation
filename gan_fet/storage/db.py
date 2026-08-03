@@ -719,6 +719,101 @@ class Database:
                 return float(row[0]), config, temp
         return None
 
+    # -- test plans ----------------------------------------------------
+
+    def save_plan(
+        self,
+        slot: str,
+        points: Iterable[MatrixPoint],
+        *,
+        source: str,
+        device_name: str,
+        total_count: Optional[int] = None,
+    ) -> None:
+        """Replace the whole of ``slot`` with ``points``, in order.
+
+        Wholesale replacement rather than a diff. A plan is one statement of
+        intent, and a partially-updated one is a plan nobody asked for — the
+        exact failure mode that made three independent plan lists so hard to
+        reason about. Position is stored explicitly because the run order is
+        part of what was applied, not an artefact of row insertion.
+
+        The meta row is written even when ``points`` is empty, so a plan
+        drained to its last point still reports as complete rather than as
+        absent. ``total_count`` defaults to the number of points, which is
+        right at apply time; a draining caller passes the original total.
+
+        The delete and the insert share a transaction, so a crash mid-save
+        leaves the previous plan intact rather than half of two.
+        """
+        rows = [
+            (
+                slot, position, point.device_name, point.config,
+                point.frequency_hz, point.duty_pct, point.temperature_c,
+                point.voltage_v,
+            )
+            for position, point in enumerate(points)
+        ]
+        if total_count is None:
+            total_count = len(rows)
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM plan_points WHERE slot=?", (slot,))
+            conn.execute("DELETE FROM plan_meta WHERE slot=?", (slot,))
+            if rows:
+                conn.executemany(
+                    "INSERT INTO plan_points(slot, position, device_name,"
+                    " config, frequency_hz, duty_pct, temperature_c,"
+                    " voltage_v) VALUES (?,?,?,?,?,?,?,?)",
+                    rows,
+                )
+            conn.execute(
+                "INSERT INTO plan_meta(slot, source, device_name, total_count)"
+                " VALUES (?,?,?,?)",
+                (slot, source, device_name, int(total_count)),
+            )
+
+    def load_plan(
+        self, slot: str
+    ) -> Optional[tuple[list[MatrixPoint], str, str, int]]:
+        """``(points, source, device_name, total_count)``, or None if unset.
+
+        None and an empty point list are deliberately different: no plan is
+        not the same as a plan with nothing left in it, and conflating them is
+        what made a finished plan look like a broken table.
+        """
+        with self._lock:
+            meta = self._conn.execute(
+                "SELECT source, device_name, total_count FROM plan_meta"
+                " WHERE slot=?",
+                (slot,),
+            ).fetchone()
+            if meta is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT device_name, config, frequency_hz, duty_pct,"
+                " temperature_c, voltage_v FROM plan_points"
+                " WHERE slot=? ORDER BY position",
+                (slot,),
+            ).fetchall()
+        points = [
+            MatrixPoint(
+                device_name=row[0],
+                config=row[1],
+                frequency_hz=int(row[2]),
+                duty_pct=int(row[3]),
+                temperature_c=int(row[4]),
+                voltage_v=int(row[5]),
+            )
+            for row in rows
+        ]
+        return points, str(meta[0]), str(meta[1]), int(meta[2])
+
+    def clear_plan(self, slot: str) -> None:
+        """Forget ``slot`` entirely, so loading it returns None."""
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM plan_points WHERE slot=?", (slot,))
+            conn.execute("DELETE FROM plan_meta WHERE slot=?", (slot,))
+
     # -- samples -------------------------------------------------------
 
     def add_sample(

@@ -143,7 +143,7 @@ def test_an_empty_plan_is_refused_even_mid_sequence():
 def test_with_no_applied_plan_the_queue_says_to_build_one():
     """There is no computed fallback any more. An empty queue means nothing
     has been asked for, which is different from having finished."""
-    heading = queue_heading(None, 0, 0)
+    heading = queue_heading(None, 0)
     assert "No test plan applied" in heading
     assert "Test Planner" in heading
 
@@ -151,24 +151,47 @@ def test_with_no_applied_plan_the_queue_says_to_build_one():
 def test_an_applied_plan_names_where_it_came_from():
     store = PlanStore()
     applied = store.apply([_point()] * 10, source="Planner")
-    assert "Planner" in queue_heading(applied, 7, 5)
+    assert "Planner" in queue_heading(applied, 7)
 
 
-def test_a_truncated_view_distinguishes_shown_from_remaining_from_planned():
-    """Three different numbers, and confusing them is how the operator ends up
-    believing a plan is smaller than it is."""
+def test_a_partly_drained_plan_reports_both_numbers():
+    """"3 left" alone loses the size of the job; "10 planned" alone hides the
+    progress. The operator is deciding whether to leave it running."""
     store = PlanStore()
     applied = store.apply([_point()] * 10, source="Planner")
-    heading = queue_heading(applied, 7, 5)
-    assert "Showing 5 of 7" in heading
-    assert "10 planned" in heading
+    heading = queue_heading(applied, 7)
+    assert "7 of 10" in heading
+    assert "3 completed" in heading
+
+
+def test_an_untouched_plan_does_not_claim_zero_completed():
+    """Saying "0 completed and removed" reads as though something was lost."""
+    store = PlanStore()
+    applied = store.apply([_point()] * 4, source="Planner")
+    heading = queue_heading(applied, 4)
+    assert "4 test(s) to run" in heading
+    assert "completed" not in heading
 
 
 def test_a_finished_applied_plan_says_it_is_complete():
     """Not "0 remaining", which reads like something went wrong."""
     store = PlanStore()
     applied = store.apply([_point()] * 4, source="Planner")
-    assert "complete" in queue_heading(applied, 0, 0)
+    heading = queue_heading(applied, 0)
+    assert "complete" in heading
+    assert "4" in heading, "a drained plan must still say how big it was"
+
+
+def test_a_drained_plan_still_knows_its_original_size():
+    """The count comes from the stored total, not from the rows that are left,
+    so the heading survives the last point being removed."""
+    store = PlanStore()
+    store.apply([_point(200), _point(300)], source="Planner")
+    store.complete_point(_point(200))
+    store.complete_point(_point(300))
+    assert store.applied.total_count == 2
+    assert store.applied.completed_count == 2
+    assert "all 2 points measured" in queue_heading(store.applied, 0)
 
 
 # -- what is left of an applied plan ------------------------------------------
@@ -184,43 +207,78 @@ def _key(point):
     )
 
 
-def test_nothing_measured_leaves_the_whole_plan():
+def test_the_queue_is_the_stored_plan():
+    """No longer recomputed by subtracting the run table: the plan is drained
+    as runs finish, so what is stored is what is left."""
     store = PlanStore()
     applied = store.apply([_point(200), _point(300)], source="Planner")
-    assert len(pending_points(applied, set())) == 2
+    assert len(pending_points(applied)) == 2
 
 
-def test_measured_points_are_dropped_from_the_queue():
-    """A plan half-finished in an earlier session must not look like it is
-    about to repeat itself."""
+def test_completing_a_point_removes_it():
+    """A plan half-finished must not look like it is about to repeat itself."""
     done, todo = _point(200), _point(300)
     store = PlanStore()
-    applied = store.apply([done, todo], source="Planner")
-    remaining = pending_points(applied, {_key(done)})
-    assert remaining == [todo]
+    store.apply([done, todo], source="Planner")
+    assert store.complete_point(done) is True
+    assert pending_points(store.applied) == [todo]
 
 
-def test_a_fully_measured_plan_leaves_nothing():
+def test_completing_every_point_leaves_an_empty_but_present_plan():
+    """Empty is not the same as absent: the operator finished the job, and
+    "no plan applied" would misreport that."""
     store = PlanStore()
     points = [_point(200), _point(300)]
-    applied = store.apply(points, source="Planner")
-    assert pending_points(applied, {_key(p) for p in points}) == []
+    store.apply(points, source="Planner")
+    for point in points:
+        store.complete_point(point)
+    assert store.is_applied
+    assert pending_points(store.applied) == []
 
 
 def test_order_is_preserved_so_the_queue_matches_the_run_order():
     """The queue is a promise about what happens next, in what order."""
     a, b, c = _point(200), _point(300), _point(400)
     store = PlanStore()
-    applied = store.apply([a, b, c], source="Planner")
-    assert pending_points(applied, {_key(b)}) == [a, c]
+    store.apply([a, b, c], source="Planner")
+    store.complete_point(b)
+    assert pending_points(store.applied) == [a, c]
 
 
 def test_a_point_differing_only_in_voltage_is_not_treated_as_done():
     """Every field of the key matters; matching on too few would silently skip
     measurements the operator asked for."""
     store = PlanStore()
-    applied = store.apply([_point(300)], source="Planner")
-    assert len(pending_points(applied, {_key(_point(200))})) == 1
+    store.apply([_point(300)], source="Planner")
+    assert store.complete_point(_point(200)) is False
+    assert len(pending_points(store.applied)) == 1
+
+
+def test_completing_a_point_that_is_not_in_the_plan_changes_nothing():
+    """Manual runs happen alongside a plan. One must not be able to shrink a
+    queue it was never part of."""
+    store = PlanStore()
+    store.apply([_point(200)], source="Planner")
+    assert store.complete_point(_point(999)) is False
+    assert len(store.applied) == 1
+
+
+def test_completing_with_no_plan_applied_is_harmless():
+    """Ordinary one-off runs go through the same completion path."""
+    store = PlanStore()
+    assert store.complete_point(_point()) is False
+    assert not store.is_applied
+
+
+def test_applying_does_not_filter_out_points_that_already_have_runs():
+    """"Include Completed Runs (Re-test)" means the operator asked for them
+    deliberately. Filtering here would drain a re-test plan to nothing before
+    it could start."""
+    store = PlanStore()
+    points = [_point(200), _point(300)]
+    applied = store.apply(points, source="Planner")
+    assert len(applied) == 2
+    assert applied.total_count == 2
 
 
 # -- clearing the applied plan -------------------------------------------------
@@ -283,21 +341,9 @@ def test_an_applied_queue_shows_the_pending_points_in_order():
     a, b, c = _point(200), _point(300), _point(400)
     store = PlanStore()
     applied = store.apply([a, b, c], source="Planner")
-    contents = applied_queue(applied, set())
-    assert contents.rows == [a, b, c]
+    contents = applied_queue(applied)
+    assert [row.point for row in contents.rows] == [a, b, c]
     assert "3 test(s) to run, in order" in contents.heading
-
-
-def test_an_explicit_cap_still_reports_the_true_total():
-    """The cap is no longer the default, but if anything asks for one the
-    heading must not let it look like the whole plan."""
-    from gan_fet.ui.plan_store import applied_queue
-
-    store = PlanStore()
-    applied = store.apply([_point(v) for v in range(100, 900, 100)], source="Planner")
-    contents = applied_queue(applied, set(), limit=5)
-    assert len(contents.rows) == 5
-    assert "Showing 5 of 8" in contents.heading
 
 
 def test_a_fully_measured_applied_queue_says_complete_rather_than_going_blank():
@@ -307,8 +353,10 @@ def test_a_fully_measured_applied_queue_says_complete_rather_than_going_blank():
 
     points = [_point(200), _point(300)]
     store = PlanStore()
-    applied = store.apply(points, source="Planner")
-    contents = applied_queue(applied, {_key(p) for p in points})
+    store.apply(points, source="Planner")
+    for point in points:
+        store.complete_point(point)
+    contents = applied_queue(store.applied)
     assert contents.rows == []
     assert "complete" in contents.heading
     assert contents.heading, "an empty queue must still say something"
@@ -369,29 +417,22 @@ def test_starting_a_finished_plan_says_so_rather_than_offering_the_planner():
 # -- how much of the plan is shown ---------------------------------------------
 
 
-def test_the_table_shows_every_remaining_point_by_default():
+def test_the_table_shows_every_remaining_point():
     """A plan you can only see the first five of does not answer "what did I
     just apply"."""
     from gan_fet.ui.plan_store import applied_queue
 
     store = PlanStore()
     applied = store.apply([_point(v) for v in range(100, 2100, 100)], source="Planner")
-    contents = applied_queue(applied, set())
+    contents = applied_queue(applied)
     assert len(contents.rows) == 20
 
 
-def test_showing_everything_says_so_rather_than_counting_twice():
+def test_every_queued_row_is_pending():
+    """Measured points are deleted from the queue, not marked in it, so a
+    "Completed" row here would mean something has gone wrong upstream."""
     from gan_fet.ui.plan_store import applied_queue
 
     store = PlanStore()
     applied = store.apply([_point(200), _point(300)], source="Planner")
-    assert "2 test(s) to run, in order" in applied_queue(applied, set()).heading
-
-
-def test_a_capped_view_says_it_is_showing_only_some():
-    from gan_fet.ui.plan_store import applied_queue
-
-    store = PlanStore()
-    applied = store.apply([_point(v) for v in range(100, 900, 100)], source="Planner")
-    heading = applied_queue(applied, set(), limit=3).heading
-    assert "Showing 3 of 8" in heading
+    assert all(not row.is_completed for row in applied_queue(applied).rows)

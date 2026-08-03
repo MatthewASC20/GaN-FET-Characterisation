@@ -11,41 +11,101 @@ that queue the moment the sequence started.
 So there is now one applied plan. The queue displays it and the sequence runs
 it, and when nothing is applied both fall back to the live matrix as before.
 
+It is stored in SQLite rather than held only in memory. A plan is a statement
+of intent about hours of bench time, and losing it to a restart meant
+rebuilding it from memory and hoping the selections matched.
+
 No tkinter: the window renders what this decides.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Protocol, Sequence
 
 from gan_fet.core.models import MatrixPoint
+from gan_fet.storage.schema import PLAN_SLOT_APPLIED
+
+log = logging.getLogger(__name__)
+
+
+class PlanBackend(Protocol):
+    """The three operations :class:`PlanStore` needs from storage.
+
+    Narrower than :class:`~gan_fet.storage.db.Database` so the store can be
+    exercised without one.
+    """
+
+    def save_plan(
+        self,
+        slot: str,
+        points: Sequence[MatrixPoint],
+        *,
+        source: str,
+        device_name: str,
+        total_count: Optional[int] = None,
+    ) -> None: ...
+
+    def load_plan(
+        self, slot: str
+    ) -> Optional[tuple[list[MatrixPoint], str, str, int]]: ...
+
+    def clear_plan(self, slot: str) -> None: ...
 
 
 @dataclass(frozen=True)
 class AppliedPlan:
-    """A plan the operator deliberately chose, and where it came from."""
+    """A plan the operator deliberately chose, and where it came from.
+
+    ``points`` is what is *left*. Each one is removed as its run completes,
+    so this is a work queue that drains rather than a static list with a
+    status column — which is why ``total_count`` is carried separately.
+    """
 
     points: tuple[MatrixPoint, ...]
     #: Shown in the queue heading, so it is obvious the list is not the live
     #: matrix. e.g. "Planner: 3 frequencies".
     source: str
+    #: The device the plan was built for. Held explicitly rather than read
+    #: from the Experiment tab's selector: a persisted plan outlives the
+    #: selection that made it, and a plan drained against the wrong device
+    #: would discard points that were never measured on this part.
+    device_name: str = ""
+    #: How many points were applied originally. Without it a fully drained
+    #: plan could only say "0 remaining", which reads as a fault rather than
+    #: as the job being finished.
+    total_count: int = 0
 
     def __len__(self) -> int:
         return len(self.points)
 
+    @property
+    def completed_count(self) -> int:
+        return max(0, self.total_count - len(self.points))
+
 
 class PlanStore:
-    """Holds the applied plan, if there is one.
+    """Holds the applied plan, if there is one, and persists it.
 
     Deliberately not a plan *builder*. Building is
     :func:`gan_fet.core.sequence.build_plan`; this only remembers which result
     the operator committed to.
+
+    ``backend`` is optional so the decision logic below can be tested without
+    a database. In the application it is always the live :class:`Database`.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        backend: Optional[PlanBackend] = None,
+        *,
+        slot: str = PLAN_SLOT_APPLIED,
+    ) -> None:
         self._applied: Optional[AppliedPlan] = None
+        self._backend = backend
+        self._slot = slot
 
     @property
     def applied(self) -> Optional[AppliedPlan]:
@@ -55,14 +115,120 @@ class PlanStore:
     def is_applied(self) -> bool:
         return self._applied is not None
 
-    def apply(self, points: Sequence[MatrixPoint], *, source: str) -> AppliedPlan:
-        """Commit to ``points``, replacing whatever was applied before."""
-        self._applied = AppliedPlan(tuple(points), source)
+    def apply(
+        self,
+        points: Sequence[MatrixPoint],
+        *,
+        source: str,
+        device_name: str = "",
+    ) -> AppliedPlan:
+        """Commit to ``points``, replacing whatever was applied before.
+
+        Stored exactly as the planner produced it. In particular, points that
+        already have runs are *not* filtered out here — the planner has
+        already decided that, and "Include Completed Runs (Re-test)" means the
+        operator asked for them deliberately. Filtering again here would make
+        a re-test plan drain to nothing the moment it was applied.
+        """
+        if not device_name and points:
+            device_name = points[0].device_name
+        self._applied = AppliedPlan(
+            tuple(points), source, device_name, total_count=len(points)
+        )
+        self._persist(self._applied)
         return self._applied
 
     def clear(self) -> None:
-        """Go back to following the Experiment tab's selectors."""
+        """Forget the applied plan, here and on disk."""
         self._applied = None
+        self._persist(None)
+
+    def complete_point(self, point: Optional[MatrixPoint]) -> bool:
+        """Drop ``point`` from the queue now that it has been measured.
+
+        Called when a run finishes, so the stored plan is the outstanding work
+        and nothing else. Persisting the drain rather than recomputing it is
+        what lets a sequence interrupted by a crash resume where it stopped
+        instead of re-deciding from the run table — which would re-run any
+        point the operator had deliberately queued for a re-test.
+
+        Returns whether anything was removed, so a caller can skip a redraw.
+        """
+        if point is None or self._applied is None:
+            return False
+        key = _key(point)
+        remaining = tuple(
+            candidate
+            for candidate in self._applied.points
+            if _key(candidate) != key
+        )
+        if len(remaining) == len(self._applied.points):
+            return False
+        self._applied = AppliedPlan(
+            remaining,
+            self._applied.source,
+            self._applied.device_name,
+            total_count=self._applied.total_count,
+        )
+        self._persist(self._applied)
+        return True
+
+    def restore(self) -> Optional[AppliedPlan]:
+        """Reload the plan saved by a previous session, if any.
+
+        Called once at startup. A stored plan drained to nothing is restored
+        as such rather than discarded: "every point is measured" is a real
+        state the operator reached, and dropping it back to "no plan applied"
+        would misreport what happened.
+        """
+        if self._backend is None:
+            return None
+        try:
+            stored = self._backend.load_plan(self._slot)
+        except Exception:
+            log.exception("Could not load the saved test plan")
+            return None
+        if stored is None:
+            return None
+        points, source, device_name, total_count = stored
+        self._applied = AppliedPlan(
+            tuple(points), source, device_name, total_count=total_count
+        )
+        log.info(
+            "Restored applied test plan: %d of %d point(s) left for %s (%s)",
+            len(points),
+            total_count,
+            device_name or "unknown device",
+            source,
+        )
+        return self._applied
+
+    def _persist(self, plan: Optional[AppliedPlan]) -> None:
+        """Mirror the in-memory state to storage, best effort.
+
+        A failed write must not refuse the apply. The operator is at the bench
+        with a plan in front of them; losing persistence is an inconvenience
+        next session, whereas refusing to apply blocks them now. Logged at
+        error level so the divergence is not silent.
+        """
+        if self._backend is None:
+            return
+        try:
+            if plan is None:
+                self._backend.clear_plan(self._slot)
+            else:
+                self._backend.save_plan(
+                    self._slot,
+                    plan.points,
+                    total_count=plan.total_count,
+                    source=plan.source,
+                    device_name=plan.device_name,
+                )
+        except Exception:
+            log.exception(
+                "Could not save the test plan; it is applied for this session "
+                "only and will not survive a restart"
+            )
 
 
 class ApplyAction(Enum):
@@ -129,56 +295,86 @@ def apply_plan_decision(
     return ApplyDecision(ApplyAction.APPLY)
 
 
-def pending_points(
-    applied: AppliedPlan, completed: set
-) -> list[MatrixPoint]:
-    """The applied plan minus what has already been measured.
+def _key(point: MatrixPoint) -> tuple:
+    """The identity of a matrix point, matching ``build_matrix_plan``.
 
-    Completed points are dropped rather than shown struck through: this is a
-    queue of what is left to run, and a plan half-finished in an earlier
-    session should not look like it is about to repeat itself.
-
-    ``completed`` holds ``(frequency_hz, config, duty_pct, voltage_v,
-    temperature_c)`` tuples, matching ``build_matrix_plan``.
+    Every field matters: matching on fewer would silently mark points done
+    that were never measured.
     """
-    return [
-        point
-        for point in applied.points
-        if (
-            point.frequency_hz,
-            point.config,
-            point.duty_pct,
-            point.voltage_v,
-            point.temperature_c,
-        )
-        not in completed
-    ]
+    return (
+        point.frequency_hz,
+        point.config,
+        point.duty_pct,
+        point.voltage_v,
+        point.temperature_c,
+    )
+
+
+def measured_point(outcome: Any, success: bool) -> Optional[MatrixPoint]:
+    """The point a finished run measured, or None if the queue must not shrink.
+
+    Only a successful run takes work off the queue. ``runs`` is append-only and
+    a failed or tripped attempt records itself without producing a measurement,
+    so removing the point would quietly drop it from a sequence that had not
+    actually done it — and on this rig the operator would only find out when
+    the characterisation set came up short.
+
+    Reads defensively because the outcome comes from the engine and may be
+    absent entirely (a run that never started has no record).
+    """
+    if not success:
+        return None
+    return getattr(getattr(outcome, "record", None), "point", None)
+
+
+def pending_points(applied: AppliedPlan) -> list[MatrixPoint]:
+    """What the sequence has left to run.
+
+    Now simply the stored plan: points are removed as their runs complete, so
+    the queue *is* the outstanding work. It used to be recomputed by
+    subtracting the run table from the plan on every read, which meant a
+    re-test plan — points deliberately queued again despite already having
+    runs — filtered itself down to nothing before it could start.
+    """
+    return list(applied.points)
+
+
+@dataclass(frozen=True)
+class PlanRow:
+    """One row of a plan table: the point, and whether it has been measured."""
+
+    point: MatrixPoint
+    is_completed: bool
 
 
 @dataclass(frozen=True)
 class QueueContents:
-    """What the Auto Testing Queue should show right now."""
+    """What the Planned Tests table should show right now."""
 
-    rows: list[MatrixPoint]
+    rows: list[PlanRow]
     heading: str
 
 
-def applied_queue(
-    applied: AppliedPlan, completed: set, *, limit: Optional[int] = None
-) -> QueueContents:
-    """Rows and heading for an applied plan.
+def plan_rows(applied: AppliedPlan) -> list[PlanRow]:
+    """The outstanding points, in run order.
 
-    Every remaining point by default. The table exists to show what the plan
-    is, and a plan you can only see the first five of is not much of an
-    answer to "what did I just apply".
+    All pending by construction: a measured point is deleted from the stored
+    plan rather than marked. The flag is carried anyway so these rows render
+    through the same table code as the planner's listing, where completed
+    points *are* shown.
+    """
+    return [PlanRow(point, False) for point in applied.points]
+
+
+def applied_queue(applied: AppliedPlan) -> QueueContents:
+    """Rows and heading for an applied plan.
 
     Extracted from the widget because a blank table is indistinguishable from
     a broken one on screen, and a bug in here could only be found by running
     the application. Now it can be exercised without a display.
     """
-    pending = pending_points(applied, completed)
-    shown = pending if limit is None else pending[:limit]
-    return QueueContents(shown, queue_heading(applied, len(pending), len(shown)))
+    rows = plan_rows(applied)
+    return QueueContents(rows, queue_heading(applied, len(rows)))
 
 
 #: Shown when no plan has been applied. The queue is empty because nothing has
@@ -189,30 +385,32 @@ NO_PLAN_HEADING = (
 )
 
 
-def queue_heading(
-    applied: Optional[AppliedPlan], pending: int, shown: int
-) -> str:
-    """The queue's heading.
+def queue_heading(applied: Optional[AppliedPlan], pending: int) -> str:
+    """The Planned Tests heading.
 
-    There is no computed fallback. The queue shows the plan the operator
+    There is no computed fallback. The table shows the plan the operator
     applied and nothing else: a cross-product assembled from whatever options
     happened to be configured is a guess at what someone wants, and it looked
     enough like a real plan that "Clear Plan" appeared broken when it correctly
     reported there was none.
+
+    The three states are worded so they cannot be confused for one another: an
+    empty table now means "no plan", and only that.
     """
     if applied is None:
         return NO_PLAN_HEADING
+    total = applied.total_count
+    if total == 0:
+        return f"Applied plan is empty ({applied.source}) — nothing to run."
     if pending <= 0:
-        return f"Applied plan complete — all {len(applied)} points measured."
-    if shown >= pending:
+        return f"Applied plan complete — all {total} points measured."
+    done = total - pending
+    if done > 0:
         return (
-            f"{pending} test(s) to run, in order "
-            f"({applied.source}, {len(applied)} planned)."
+            f"{pending} of {total} points left to run ({applied.source}); "
+            f"{done} completed and removed from this list."
         )
-    return (
-        f"Showing {shown} of {pending} remaining "
-        f"({applied.source}, {len(applied)} planned)."
-    )
+    return f"{pending} test(s) to run, in order ({applied.source})."
 
 
 class ClearAction(Enum):

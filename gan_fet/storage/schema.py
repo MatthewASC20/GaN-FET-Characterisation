@@ -10,7 +10,7 @@ import sqlite3
 
 from gan_fet.core.models import FinalReadings, MatrixPoint, RunRecord
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -77,7 +77,55 @@ CREATE TABLE IF NOT EXISTS safety_events (
     ctx_vds_peak_v REAL,
     ctx_dc_current_a REAL
 );
+
+-- Test plans, from schema 7. Two independent slots:
+--
+--   'draft'   -- the whole matrix, rewritten by the planner on every
+--                selection change. Backs the Sequence Execution Plan
+--                Listing, which shows completed points as well as pending
+--                ones so the operator can see the shape of the job.
+--   'applied' -- the outstanding work, written by "Apply Test Plan" and
+--                *drained*: each point is deleted as its run completes.
+--                Backs Planned Tests and is what the sequence runs.
+--
+-- The two are stored separately rather than derived from one another because
+-- they answer different questions ("what did I ask for" vs "what is left"),
+-- and because the applied slot must survive a crash mid-sequence. Recomputing
+-- the remainder from the run table instead cannot express a deliberate
+-- re-test: those points already have runs.
+--
+-- Deliberately not referencing devices(id): a plan is a statement of intent
+-- about a named device, and deleting that device's runs should not silently
+-- empty the plan that asked for them.
+CREATE TABLE IF NOT EXISTS plan_points (
+    slot TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    device_name TEXT NOT NULL,
+    config TEXT NOT NULL,
+    frequency_hz INTEGER NOT NULL,
+    duty_pct INTEGER NOT NULL,
+    temperature_c INTEGER NOT NULL,
+    voltage_v INTEGER NOT NULL,
+    PRIMARY KEY (slot, position)
+);
+
+-- Survives the last point being drained, so a finished plan can still report
+-- how big it was. A slot with a meta row and no points means "complete";
+-- no meta row at all means "no plan applied". Conflating those two is what
+-- made a finished plan look like a broken table.
+CREATE TABLE IF NOT EXISTS plan_meta (
+    slot TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    device_name TEXT NOT NULL,
+    total_count INTEGER NOT NULL DEFAULT 0,
+    saved_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
+
+#: The applied plan: what the queue shows and the sequence runs.
+PLAN_SLOT_APPLIED = "applied"
+#: The planner's working plan, rewritten as parameters are selected.
+PLAN_SLOT_DRAFT = "draft"
 
 #: Columns added after the original table definitions, migrated in place with
 #: ``ALTER TABLE ... ADD COLUMN``. SQLite makes that atomic and leaves existing

@@ -13,6 +13,11 @@ from typing import Callable, List, Optional, Tuple
 from gan_fet.core.models import MatrixPoint, RunRecord, freq_label
 from gan_fet.storage.db import Database
 from gan_fet.ui.plan_store import NO_PLAN_HEADING, applied_queue
+from gan_fet.ui.plan_table import (
+    PLAN_COLUMN_IDS,
+    configure_plan_tree,
+    fill_plan_tree,
+)
 
 log = logging.getLogger(__name__)
 
@@ -415,9 +420,14 @@ class TrackerView(tk.Frame):
 class UpNextView(ttk.LabelFrame):
     """The applied test plan, in the order it will run.
 
-    Every remaining point, scrollable. This is where the operator confirms
-    that what they applied is what they meant, so showing a truncated five
-    would answer the wrong question.
+    Every point, scrollable, rendered exactly as the planner's own "Sequence
+    Execution Plan Listing" renders it — same columns, same formatting, same
+    greyed-out completed rows — because they are two views of one stored plan
+    and any visible difference between them is a bug. See
+    :mod:`gan_fet.ui.plan_table`.
+
+    This is where the operator confirms that what they applied is what they
+    meant, so a truncated five would answer the wrong question.
     """
 
     def __init__(
@@ -450,28 +460,14 @@ class UpNextView(ttk.LabelFrame):
         table_frame = ttk.Frame(self)
         table_frame.pack(fill="both", expand=True, padx=10, pady=(0, 5))
 
-        columns = ("step", "temp", "config", "freq", "duty", "voltage")
         self.tree = ttk.Treeview(
-            table_frame, columns=columns, show="headings", height=10
+            table_frame, columns=PLAN_COLUMN_IDS, show="headings", height=10
         )
         scrollbar = ttk.Scrollbar(
             table_frame, orient="vertical", command=self.tree.yview
         )
         self.tree.configure(yscrollcommand=scrollbar.set)
-
-        self.tree.heading("step", text="#")
-        self.tree.heading("temp", text="Temp (°C)")
-        self.tree.heading("config", text="Configuration")
-        self.tree.heading("freq", text="Frequency")
-        self.tree.heading("duty", text="Duty (%)")
-        self.tree.heading("voltage", text="Voltage (V)")
-
-        self.tree.column("step", width=50, anchor="center")
-        self.tree.column("temp", width=90, anchor="center")
-        self.tree.column("config", width=160, anchor="w")
-        self.tree.column("freq", width=100, anchor="center")
-        self.tree.column("duty", width=80, anchor="center")
-        self.tree.column("voltage", width=90, anchor="center")
+        configure_plan_tree(self.tree)
 
         self.tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
@@ -493,20 +489,16 @@ class UpNextView(ttk.LabelFrame):
 
 
     def _show_applied(self, applied) -> None:
-        """Render the applied plan, skipping points already measured.
+        """Render the outstanding points of the applied plan.
 
-        Completed points are dropped rather than struck through: this is a
-        queue of what is left to run, and a plan half-finished from a previous
-        session should not look like it is about to repeat itself.
+        No run-table lookup: the stored plan is already the remaining work,
+        because each point is deleted as its run completes. Subtracting the
+        run table here as well would hide the one case the planner's re-test
+        option exists for — points deliberately queued again despite already
+        having runs.
         """
         try:
-            completed: set = set()
-            for frequency in {pt.frequency_hz for pt in applied.points}:
-                for config, duty, voltage, temp in self.db.completed_points(
-                    self.get_device_name().strip(), frequency
-                ):
-                    completed.add((frequency, config, duty, voltage, temp))
-            contents = applied_queue(applied, completed)
+            contents = applied_queue(applied)
         except Exception:
             # A blank table and an unchanged heading is what this used to look
             # like, which reads as "the plan is empty" rather than "something
@@ -521,19 +513,4 @@ class UpNextView(ttk.LabelFrame):
             )
             return
         self.status_lbl.config(text=contents.heading)
-        self._fill(contents.rows)
-
-    def _fill(self, points) -> None:
-        for idx, pt in enumerate(points, start=1):
-            self.tree.insert(
-                "",
-                "end",
-                values=(
-                    f"#{idx}",
-                    f"{pt.temperature_c} °C",
-                    pt.config,
-                    freq_label(pt.frequency_hz),
-                    f"{pt.duty_pct} %",
-                    f"{pt.voltage_v} V",
-                ),
-            )
+        fill_plan_tree(self.tree, contents.rows)

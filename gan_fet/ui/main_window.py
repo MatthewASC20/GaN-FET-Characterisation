@@ -99,6 +99,7 @@ from gan_fet.ui.plan_store import (
     PlanStore,
     apply_plan_decision,
     clear_plan_decision,
+    measured_point,
     pending_points,
     start_sequence_decision,
 )
@@ -226,7 +227,11 @@ class MainWindow(tk.Tk):
         self._closing = False
         self._resources_closed = False
         self.operations = OperationCoordinator()
-        self.plan_store = PlanStore()
+        # Backed by the database, so a plan applied before a restart — or
+        # before a crash mid-sequence — comes back with the points already
+        # measured removed from it.
+        self.plan_store = PlanStore(self.db)
+        self.plan_store.restore()
         self._worker_pool = WorkerPool()
         # Built before the UI: it holds the operation lifecycle, so anything
         # that can claim the rig has to go through it from the start.
@@ -1770,8 +1775,12 @@ class MainWindow(tk.Tk):
         # tracker was last set to by hand: a sequence working through a
         # multi-frequency plan otherwise ticks off points out of view.
         outcome = self.engine.last_outcome
-        finished_at = getattr(getattr(outcome, "record", None), "frequency_hz", None)
+        record = getattr(outcome, "record", None)
+        finished_at = getattr(record, "frequency_hz", None)
         self.tracker.follow_frequency(finished_at)
+        # Take the measured point out of the applied plan, and persist that.
+        # ``measured_point`` decides whether this attempt counts.
+        self.plan_store.complete_point(measured_point(outcome, success))
         if hasattr(self, "up_next_view"):
             self.up_next_view.refresh()
         self.planner_tab.generate_plan(show_errors=False)
@@ -1834,12 +1843,10 @@ class MainWindow(tk.Tk):
             self._begin_operation("sequence")
             return
         # The queue is the plan, and the plan comes from the Test Planner.
+        # It is already the outstanding work: completed points were removed
+        # as their runs finished.
         applied = self.plan_store.applied
-        plan = (
-            pending_points(applied, self._completed_keys(applied))
-            if applied is not None
-            else []
-        )
+        plan = pending_points(applied) if applied is not None else []
         decision = start_sequence_decision(applied=applied, pending=len(plan))
         if decision.action is StartAction.OFFER_PLANNER:
             if messagebox.askyesno(
@@ -1881,17 +1888,6 @@ class MainWindow(tk.Tk):
                 "Auto Sequence", "The sequence could not start.", parent=self
             )
 
-    def _completed_keys(self, applied) -> set:
-        """Which points of ``applied`` the database already has runs for."""
-        device = self.device_name_var.get().strip()
-        keys: set = set()
-        for frequency in {pt.frequency_hz for pt in applied.points}:
-            for config, duty, voltage, temp in self.db.completed_points(
-                device, frequency
-            ):
-                keys.add((frequency, config, duty, voltage, temp))
-        return keys
-
     def _apply_test_plan(self, plan_summary: Any) -> bool:
         """Make the planner's plan the one the queue shows and the rig runs."""
         points = [item.point for item in getattr(plan_summary, "points", [])]
@@ -1916,7 +1912,11 @@ class MainWindow(tk.Tk):
             # Stop before storing, so the queue never describes a plan the
             # running sequence is not executing.
             self._cancel_experiment()
-        self.plan_store.apply(points, source="Planner")
+        self.plan_store.apply(
+            points,
+            source="Planner",
+            device_name=self.device_name_var.get().strip(),
+        )
         if hasattr(self, "up_next_view"):
             self.up_next_view.refresh()
         self.status_bar.set_message(
