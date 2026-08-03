@@ -154,6 +154,55 @@ What remains: construct panels and controllers, wire callbacks, own the
 lifecycle (`_on_closing`, worker joins). Target **under 400 lines**, doing the
 one job the name implies.
 
+### Where this actually stands (2026-08-02)
+
+Phases 1–3 are done and verified — 385 headless tests, and a `gan-fet
+--simulate` pass after each. `main_window.py` is **2,434 lines**, of which
+`MainWindow` is **101 methods and 2,118 lines**. It started at 2,633 / 2,498.
+
+That is a much smaller reduction than the line counts suggest, and the reason
+is worth stating: **the value of Phases 1–3 was not lines moved, it was
+untested logic becoming tested logic.** Roughly 240 tests now cover decisions
+that previously could only be exercised with a display attached — the
+device-removal guards, the ZVS interlock ordering, the operation-token release,
+the control-state slices, the end-of-run reporting. Several of those turned up
+real gaps: the guard in front of `enable_bus` whose *placement* nothing tested,
+and the ZVS stop path that a careless reorder broke.
+
+What is left, by responsibility:
+
+| group | methods | lines |
+|---|---|---|
+| rig operations (wavegen, autotune, ZVS, bus off, e-stop, reset) | 17 | 518 |
+| widget construction and layout | 14 | 388 |
+| experiment and sequence | 20 | 374 |
+| device and parameter options | 15 | 229 |
+| control state and confirm presentation | 9 | 189 |
+| reports, export, shutdown | 7 | 148 |
+| operation lifecycle | 7 | 74 |
+| other | 12 | 198 |
+
+**The 400-line target is not reachable by extracting decisions.** Everything
+separable that way has been separated. Getting under 400 means moving the rig
+and experiment operations *wholesale* — 892 lines — into controller objects
+holding the window's collaborators, with dialogs injected as callbacks.
+
+That is a legitimate change, but it is a different kind of change from what
+came before, and the trade should be made deliberately:
+
+- It moves working, now partly-tested code rather than covering untested code,
+  so it adds little coverage.
+- It is the largest single structural move in the plan, on the module with the
+  most GUI surface.
+- The 700-line estimate for Phase 2 turned out to be 160. Treat 400 as a
+  direction, not a number.
+
+A smaller version worth considering on its own: `ui/operations/rig_ops.py`
+already exists and holds the preconditions. Moving the five rig operations and
+their completion handlers into it — the single largest and most cohesive group
+— would take `MainWindow` under about 1,900 lines without touching the
+experiment engine wiring.
+
 ---
 
 ## Sequencing and risk
