@@ -44,6 +44,7 @@ from gan_fet.ui.operations.experiment_ops import (
     ExperimentAction,
     cancel_target,
     experiment_precondition,
+    run_finished_report,
 )
 from gan_fet.ui.operations.rig_ops import (
     ZvsAction,
@@ -2074,39 +2075,27 @@ class MainWindow(tk.Tk):
             self.up_next_view.refresh()
         self.planner_tab.generate_plan(show_errors=False)
         self.analytics_tab.refresh()
-        status_message = message or (
-            "Experiment complete!" if success else "Stopped."
-        )
+        sample_count = 0
+        screenshot_path = None
         if validation_run and success:
             outcome = self.engine.last_outcome
-            sample_count = 0
-            screenshot_path = None
             if outcome is not None and outcome.run_id is not None:
                 sample_count = len(self.db.samples_for_run(outcome.run_id))
                 if outcome.record is not None:
                     screenshot_path = outcome.record.screenshot_path
-            status_message = (
-                f"Simulation validation complete: {sample_count} samples saved "
-                f"under {self.db.path.parent}."
-            )
+
+        report = run_finished_report(
+            success=success,
+            message=message,
+            validation=validation_run,
+            sample_count=sample_count,
+            data_dir=str(self.db.path.parent),
+            has_screenshot=bool(screenshot_path),
+        )
+        if report.dialog is not None:
             self.notebook.select(self.analytics_tab)
-            screenshot_note = (
-                "A synthetic HDO4054 screen capture was saved and can be opened "
-                "from the completed point's right-click menu."
-                if screenshot_path
-                else "No simulated scope capture was stored."
-            )
-            messagebox.showinfo(
-                "Simulation Validation Complete",
-                "The normal experiment procedure completed using virtual "
-                f"instruments and stored {sample_count} samples.\n\n"
-                f"{screenshot_note}\n\n"
-                "Review results in Analytics, or return to Experiment and "
-                "right-click the completed matrix point for details and plots.\n\n"
-                f"Isolated data: {self.db.path.parent}",
-                parent=self,
-            )
-        self.status_bar.set_message(status_message)
+            messagebox.showinfo(*report.dialog, parent=self)
+        self.status_bar.set_message(report.status)
         self._refresh_confirm_state()
         self._refresh_control_states()
 

@@ -105,3 +105,66 @@ def cancel_target(active_kind: Optional[str]) -> CancelTarget:
     if active_kind == "sequence":
         return CancelTarget.SEQUENCE
     return CancelTarget.EXPERIMENT
+
+
+# -- what the operator is told when a run ends --------------------------------
+
+
+@dataclass(frozen=True)
+class RunReport:
+    """The status line after a run, and a dialog if one is warranted."""
+
+    status: str
+    dialog: Optional[tuple[str, str]] = None
+
+
+def run_finished_report(
+    *,
+    success: bool,
+    message: str,
+    validation: bool = False,
+    sample_count: int = 0,
+    data_dir: str = "",
+    has_screenshot: bool = False,
+) -> RunReport:
+    """Describe how a run ended.
+
+    A message from the engine always wins: it knows why the run ended — which
+    point, which trip, which instrument stopped answering — and the generic
+    text does not. The fallback distinguishes only the two cases the engine
+    leaves silent.
+
+    "Stopped." rather than "Failed." on the unsuccessful path, because the
+    common way for a run to end without success is the operator cancelling it,
+    and reporting that as a failure would be wrong.
+    """
+    status = message or ("Experiment complete!" if success else "Stopped.")
+
+    # A validation run that did *not* succeed gets the ordinary report. There
+    # is nothing to celebrate and no sample count to quote, and announcing
+    # "validation complete" after a failure is the one outcome here that could
+    # actually mislead someone about whether the rig works.
+    if not (validation and success):
+        return RunReport(status)
+
+    screenshot_note = (
+        "A synthetic HDO4054 screen capture was saved and can be opened "
+        "from the completed point's right-click menu."
+        if has_screenshot
+        else "No simulated scope capture was stored."
+    )
+    return RunReport(
+        status=(
+            f"Simulation validation complete: {sample_count} samples saved "
+            f"under {data_dir}."
+        ),
+        dialog=(
+            "Simulation Validation Complete",
+            "The normal experiment procedure completed using virtual "
+            f"instruments and stored {sample_count} samples.\n\n"
+            f"{screenshot_note}\n\n"
+            "Review results in Analytics, or return to Experiment and "
+            "right-click the completed matrix point for details and plots.\n\n"
+            f"Isolated data: {data_dir}"
+        ),
+    )

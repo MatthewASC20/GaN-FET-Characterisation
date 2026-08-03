@@ -13,6 +13,7 @@ from gan_fet.ui.operations.experiment_ops import (
     ExperimentAction,
     cancel_target,
     experiment_precondition,
+    run_finished_report,
 )
 
 
@@ -99,3 +100,89 @@ def test_anything_else_falls_through_to_the_engine(kind):
     harmless, and guessing otherwise would leave a real run unstoppable if a
     new operation kind were added and this were not updated."""
     assert cancel_target(kind) is CancelTarget.EXPERIMENT
+
+
+# -- how a finished run is reported -------------------------------------------
+
+def test_an_engine_message_wins_over_the_generic_text():
+    """The engine knows which point, which trip, which instrument stopped
+    answering. The fallback knows none of that."""
+    report = run_finished_report(
+        success=False, message="Tripped: overcurrent at 6.83 MHz"
+    )
+    assert report.status == "Tripped: overcurrent at 6.83 MHz"
+
+
+def test_a_silent_success_reads_as_complete():
+    assert run_finished_report(success=True, message="").status == (
+        "Experiment complete!"
+    )
+
+
+def test_a_silent_failure_reads_as_stopped_not_failed():
+    """The common way for a run to end without success is the operator
+    cancelling it. Reporting that as a failure would be wrong."""
+    assert run_finished_report(success=False, message="").status == "Stopped."
+
+
+def test_an_ordinary_run_raises_no_dialog():
+    assert run_finished_report(success=True, message="").dialog is None
+
+
+# -- the simulated validation run ---------------------------------------------
+
+
+def _validation(**overrides):
+    fields = {
+        "success": True,
+        "message": "",
+        "validation": True,
+        "sample_count": 42,
+        "data_dir": "/data/simulation",
+        "has_screenshot": True,
+    }
+    fields.update(overrides)
+    return run_finished_report(**fields)
+
+
+def test_a_successful_validation_reports_what_was_saved_and_where():
+    report = _validation()
+    assert "42 samples" in report.status
+    assert "/data/simulation" in report.status
+    assert report.dialog is not None
+    title, body = report.dialog
+    assert title == "Simulation Validation Complete"
+    assert "42 samples" in body and "/data/simulation" in body
+
+
+def test_a_failed_validation_is_not_announced_as_complete():
+    """The one outcome here that could actually mislead someone about whether
+    the rig works. It gets the ordinary report and no dialog."""
+    report = _validation(success=False, message="")
+    assert report.dialog is None
+    assert report.status == "Stopped."
+    assert "validation" not in report.status.lower()
+
+
+def test_a_failed_validation_still_shows_why_it_failed():
+    report = _validation(success=False, message="Tripped: overcurrent")
+    assert report.status == "Tripped: overcurrent"
+
+
+def test_the_screenshot_note_says_which_way_it_went():
+    assert "was saved" in _validation(has_screenshot=True).dialog[1]
+    assert "No simulated scope capture" in (
+        _validation(has_screenshot=False).dialog[1]
+    )
+
+
+def test_a_validation_that_stored_nothing_says_zero_rather_than_nothing():
+    """Silence about the sample count would read as success."""
+    report = _validation(sample_count=0)
+    assert "0 samples" in report.status
+
+
+def test_a_non_validation_run_never_gets_the_validation_dialog():
+    assert run_finished_report(
+        success=True, message="", validation=False, sample_count=42
+    ).dialog is None
