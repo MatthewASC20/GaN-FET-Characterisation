@@ -54,7 +54,11 @@ sources or measurement types at run time.
 pip install -e .            # core
 pip install -e ".[sheets]"  # + optional Google Sheets mirror
 pip install -e ".[macos]"   # + native-looking coloured buttons on macOS
+pip install -e ".[qt]"      # + PyQt6 interface preview (GPLv3 — see below)
 ```
+
+The `[qt]` extra installs PyQt6, which is GPLv3-licensed; installing it places
+the combined work under GPLv3.
 
 Requires Python ≥ 3.10 with tkinter available (`python3-tk` on Debian/Ubuntu).
 
@@ -64,6 +68,7 @@ Requires Python ≥ 3.10 with tkinter available (`python3-tk` on Debian/Ubuntu).
 gan-fet                 # GUI with live bench hardware
 gan-fet --simulate      # GUI with isolated virtual instruments and data
 gan-fet --diagnose      # hardware connectivity self-test
+gan-fet --qt --simulate # PyQt6 interface preview (simulation only for now)
 ```
 
 On macOS, you can also double-click `RUN-GAN-FET-SIMULATION.command` in the

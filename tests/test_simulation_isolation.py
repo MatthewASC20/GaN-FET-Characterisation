@@ -113,7 +113,7 @@ def test_simulation_cli_does_not_save_the_live_settings(monkeypatch, settings):
     def fail_live_save(*_args, **_kwargs):
         raise AssertionError("simulation CLI attempted to save live settings")
 
-    def fake_run_gui(received, simulate=False):
+    def fake_run_gui(received, simulate=False, use_qt=False):
         calls["run_gui"] = (received, simulate)
         return 17
 

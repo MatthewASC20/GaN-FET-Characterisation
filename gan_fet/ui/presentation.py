@@ -1,0 +1,20 @@
+"""Toolkit-free presentation policy shared by every UI front-end.
+
+The mode banner is a safety identity, not decoration: both the Tk and the Qt
+window must show byte-identical text so an operator can never mistake a
+simulation for the bench. Keeping the policy here means neither toolkit owns
+it.
+"""
+
+from __future__ import annotations
+
+
+def mode_banner_presentation(is_simulated: bool) -> tuple[str, str]:
+    """Return the persistent operator-facing mode identity and colour."""
+    if is_simulated:
+        return (
+            "SIMULATION — VIRTUAL INSTRUMENTS — NO BENCH I/O — "
+            "NOT MEASURED DATA",
+            "#6a1b9a",
+        )
+    return ("LIVE HARDWARE — REAL BENCH OUTPUTS", "#b71c1c")

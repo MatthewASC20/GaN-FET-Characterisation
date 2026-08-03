@@ -23,7 +23,13 @@ sheets = [
 macos = [
     "tkmacosx>=1.0.5",
 ]
+qt = [
+    # NOTE: PyQt6 is GPLv3; installing this extra places the combined work
+    # under GPLv3.
+    "PyQt6>=6.6",
+]
 dev = [
+    "PyQt6>=6.6",
     "pytest>=7.4,<9",
     "ruff>=0.6,<0.17",
     # mypy 2.x currently crashes with an INTERNAL ERROR on this codebase.

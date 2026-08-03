@@ -110,7 +110,9 @@ def _fast_instrument_probe(settings: Settings) -> bool:
     return report.reachable
 
 
-def run_gui(settings: Settings, simulate: bool = False) -> int:
+def run_gui(
+    settings: Settings, simulate: bool = False, use_qt: bool = False
+) -> int:
     from gan_fet.core.command_logger import ScpiFileLogger
     from gan_fet.core.experiment import ExperimentEngine
     from gan_fet.core.safety import SafetyMonitor
@@ -177,6 +179,16 @@ def run_gui(settings: Settings, simulate: bool = False) -> int:
         )
         resources.sheets = sheets
 
+        if use_qt:
+            # Phase-1 shell: no operations spine yet, so the composition
+            # root only offers it against virtual instruments.
+            from gan_fet.ui_qt.app import run_qt_shell
+
+            return run_qt_shell(
+                is_simulated=simulate,
+                on_emergency_stop=engine.request_emergency_stop,
+            )
+
         window = MainWindow(
             settings,
             db,
@@ -236,6 +248,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="launch with isolated virtual instruments and a simulation database",
     )
+    parser.add_argument(
+        "--qt",
+        action="store_true",
+        help="use the PyQt6 interface preview (requires --simulate for now)",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="debug logging")
     args = parser.parse_args(argv)
 
@@ -256,7 +273,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.diagnose:
         return run_diagnostics(settings)
-    return run_gui(settings, simulate=args.simulate)
+    if args.qt and not args.simulate:
+        print(
+            "--qt currently requires --simulate: the Qt front-end has no "
+            "operations spine yet and must not drive the bench.",
+            file=sys.stderr,
+        )
+        return 2
+    return run_gui(settings, simulate=args.simulate, use_qt=args.qt)
 
 
 if __name__ == "__main__":

@@ -177,15 +177,9 @@ def _default_label(key: str, value: Any) -> str:
     return default_label(key, value)
 
 
-def mode_banner_presentation(is_simulated: bool) -> tuple[str, str]:
-    """Return the persistent operator-facing mode identity and colour."""
-    if is_simulated:
-        return (
-            "SIMULATION — VIRTUAL INSTRUMENTS — NO BENCH I/O — "
-            "NOT MEASURED DATA",
-            "#6a1b9a",
-        )
-    return ("LIVE HARDWARE — REAL BENCH OUTPUTS", "#b71c1c")
+# Re-exported so existing importers keep working; the policy itself is
+# toolkit-free and shared with the Qt front-end.
+from gan_fet.ui.presentation import mode_banner_presentation  # noqa: E402
 
 
 class MainWindow(tk.Tk):
