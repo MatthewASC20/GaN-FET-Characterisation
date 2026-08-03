@@ -37,13 +37,16 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QStatusBar,
+    QTabWidget,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
+from gan_fet.core.autotune import find_prior_tuned_frequency
 from gan_fet.core.experiment import EngineCallbacks
 from gan_fet.core.models import ExperimentParams, ExperimentState
+from gan_fet.core.sequence import AutoSequence, SequenceCallbacks
 from gan_fet.ui.operations.experiment_ops import (
     APPLY_FIRST_PROMPT,
     CancelTarget,
@@ -64,11 +67,21 @@ from gan_fet.ui.presentation import (
     mode_banner_presentation,
 )
 from gan_fet.ui.refusal import Refusal
+from gan_fet.ui.plan_store import (
+    ApplyAction,
+    PlanStore,
+    StartAction,
+    apply_plan_decision,
+    measured_point,
+    pending_points,
+    start_sequence_decision,
+)
 from gan_fet.ui.run_request import (
     InputRejected,
     build_experiment_params,
     build_matrix_point,
     require_populated_options,
+    tuning_candidate,
 )
 from gan_fet.ui.smu_status import smu_status_line
 from gan_fet.ui.telemetry_format import (
@@ -78,10 +91,18 @@ from gan_fet.ui.telemetry_format import (
     format_volts,
     last_current_text,
 )
-from gan_fet.ui.widgets import OperationCoordinator, resolve_rig_control_state
+from gan_fet.ui.widgets import (
+    OperationCoordinator,
+    resolve_confirm_presentation,
+    resolve_rig_control_state,
+)
 from gan_fet.ui_qt.dispatcher import QtDispatcher
 from gan_fet.ui_qt.event_bridge import EventBridge
+from gan_fet.ui_qt.analytics import AnalyticsPane
+from gan_fet.ui_qt.command_log import CommandLogConsole, RunHistoryView
+from gan_fet.ui_qt.config import ConfigPane
 from gan_fet.ui_qt.params import ParamSelector
+from gan_fet.ui_qt.planner import PlannerPane, QueueView
 from gan_fet.ui_qt.plot import QtLivePlot
 
 log = logging.getLogger(__name__)
@@ -157,9 +178,25 @@ class QtMainWindow(QMainWindow):
             engine=engine,
             hardware_labels=HARDWARE_OPERATION_LABELS,
         )
-        # No auto-sequence yet; RigOperations guards every use with None
-        # checks, and the engine remains the emergency-stop owner.
-        self.rig.sequence = None
+        self.plan_store = PlanStore(db)
+        self.sequence = AutoSequence(
+            db,
+            engine,
+            wavegen_controller,
+            all_configs=list(settings.default_configurations),
+            callbacks=SequenceCallbacks(
+                on_status=self.set_status_async,
+                on_step=lambda index, total, point: self.dispatcher.post(
+                    self._status.showMessage,
+                    f"Sequence {index + 1}/{total}: {point.describe()}",
+                ),
+                on_finished=lambda ok, message: self.dispatcher.post(
+                    self._on_sequence_finished, ok, message
+                ),
+                prompt_operator=self._prompt_operator,
+            ),
+        )
+        self.rig.sequence = self.sequence
 
         self._param_options = {
             "configurations": list(settings.default_configurations),
@@ -267,6 +304,12 @@ class QtMainWindow(QMainWindow):
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self._cancel_experiment)
         actions_row.addWidget(self.cancel_button)
+        self.recall_button = QPushButton("No Tuned Frequency Stored")
+        self.recall_button.clicked.connect(self._recall_tuned_frequency)
+        actions_row.addWidget(self.recall_button)
+        self.sequence_button = QPushButton("Start Auto Sequence")
+        self.sequence_button.clicked.connect(self._toggle_sequence)
+        actions_row.addWidget(self.sequence_button)
         actions_row.addStretch(1)
         left.addLayout(actions_row)
 
@@ -305,10 +348,40 @@ class QtMainWindow(QMainWindow):
         left.addLayout(telemetry)
         left.addStretch(1)
 
+        # The queue lives beside the experiment controls: the plan drains
+        # where the operator watches runs, not in the planner that built it.
+        self.queue_view = QueueView(self.plan_store)
+        left.addWidget(self.queue_view)
+
         self.plot = QtLivePlot()
         body_layout.addWidget(self.plot, stretch=4)
-        outer.addWidget(body, stretch=1)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(body, "Experiment")
+        self.planner_pane = PlannerPane(
+            self.db,
+            self.settings,
+            get_device_name=lambda: self.device_combo.currentText().strip(),
+            on_apply_plan=self._apply_test_plan,
+        )
+        self.tabs.addTab(self.planner_pane, "Test Planner")
+        self.analytics_pane = AnalyticsPane(self.db)
+        self.tabs.addTab(self.analytics_pane, "Analytics")
+        self.history_view = RunHistoryView(self.db)
+        self.tabs.addTab(self.history_view, "Run History")
+        self.command_log = CommandLogConsole()
+        self.command_log.attach(self.bridge)
+        self.tabs.addTab(self.command_log, "Command Log")
+        self.config_pane = ConfigPane(
+            self.settings, on_applied=self.refresh_controls
+        )
+        self.tabs.addTab(self.config_pane, "Configuration")
+        outer.addWidget(self.tabs, stretch=1)
         self.setCentralWidget(central)
+        self.device_combo.currentTextChanged.connect(
+            self._on_device_changed
+        )
+        self.queue_view.refresh()
 
         self._status = QStatusBar(self)
         self.setStatusBar(self._status)
@@ -325,8 +398,14 @@ class QtMainWindow(QMainWindow):
             on_state=lambda state: self.dispatcher.post(
                 self._on_engine_state, state
             ),
+            # The outcome is captured at emission: the next sequence point's
+            # start() clears engine.last_outcome, so reading it when the
+            # queued callback runs loses which point just finished.
             on_finished=lambda success, message: self.dispatcher.post(
-                self._on_run_finished, success, message
+                self._on_run_finished,
+                success,
+                message,
+                self.engine.last_outcome,
             ),
             confirm_overwrite=self._confirm_overwrite,
             report_error=lambda title, message: self.dispatcher.post(
@@ -480,7 +559,12 @@ class QtMainWindow(QMainWindow):
             if self.rig.request_voltage_tune_stop():
                 return
         self.operations.cancel_active()
-        self.engine.cancel()
+        if cancel_target(self.operations.active_kind) is CancelTarget.SEQUENCE:
+            self.sequence.cancel()
+            self.sequence_button.setText("Stopping...")
+            self.sequence_button.setEnabled(False)
+        else:
+            self.engine.cancel()
 
     def _confirm_overwrite(self, description: str) -> bool:
         active = self.operations.active
@@ -502,7 +586,9 @@ class QtMainWindow(QMainWindow):
         )
         self.refresh_controls()
 
-    def _on_run_finished(self, success: bool, message: str) -> None:
+    def _on_run_finished(
+        self, success: bool, message: str, outcome=None
+    ) -> None:
         if self._closing:
             return
         active = self.operations.active
@@ -511,12 +597,173 @@ class QtMainWindow(QMainWindow):
         self._on_engine_state(ExperimentState.IDLE)
         self.smu_state_changed()
         self._reload_devices()
+        self.plan_store.complete_point(measured_point(outcome, success))
+        self.queue_view.refresh()
+        device = self.device_combo.currentText().strip()
+        if device:
+            self.analytics_pane.refresh(device)
+            self.history_view.refresh(device)
         report = run_finished_report(
             success=success, message=message, validation=False
         )
         self._status.showMessage(report.status)
         if report.dialog is not None:
             self.show_info(*report.dialog)
+
+    def _on_device_changed(self, device_name: str) -> None:
+        device = device_name.strip()
+        if not device:
+            return
+        self.analytics_pane.refresh(device)
+        self.history_view.refresh(device)
+        self.refresh_confirm()
+
+    def _apply_test_plan(self, plan_summary) -> bool:
+        """Make the planner's plan the one the queue shows and the rig runs."""
+        points = [
+            item.point for item in getattr(plan_summary, "points", [])
+        ]
+        decision = apply_plan_decision(
+            point_count=len(points),
+            sequence_running=(
+                self.operations.active_kind == "sequence"
+                or self.sequence.active
+            ),
+            existing=self.plan_store.applied,
+        )
+        if decision.action is ApplyAction.REFUSE:
+            self._show_refusal(Refusal(decision.title, decision.message))
+            return False
+        if decision.action is not ApplyAction.APPLY:
+            if not self.confirm(decision.title, decision.message):
+                return False
+            if decision.action is ApplyAction.CONFIRM_STOP_AND_APPLY:
+                self.operations.cancel_active()
+                self.sequence.cancel()
+        device = self.device_combo.currentText().strip()
+        self.plan_store.apply(
+            points,
+            source=f"Planner: {len(points)} point(s)",
+            device_name=device,
+        )
+        self.queue_view.refresh()
+        self._status.showMessage(
+            f"Applied a {len(points)}-point test plan."
+        )
+        return True
+
+    def _prompt_operator(self, title: str, message: str) -> bool:
+        """Blocking chamber prompt from the sequence worker; None aborts."""
+        return bool(self.dispatcher.call(self.confirm, title, message))
+
+    def _on_sequence_finished(self, success: bool, message: str) -> None:
+        active = self.operations.active
+        if active is not None and active.kind == "sequence":
+            self.operations.finish(active)
+        self.sequence_button.setText("Start Auto Sequence")
+        self.sequence_button.setEnabled(True)
+        self.queue_view.refresh()
+        self._status.showMessage(message)
+        if not success:
+            self.show_error("Auto Sequence", message)
+        self.smu_state_changed()
+
+    def _toggle_sequence(self) -> None:
+        if (
+            self.operations.active_kind == "sequence"
+            or self.sequence.active
+        ):
+            self.operations.cancel_active()
+            self.sequence.cancel()
+            self.sequence_button.setText("Stopping...")
+            self.sequence_button.setEnabled(False)
+            return
+        if not self.hardware_online(HARDWARE_OPERATION_LABELS["sequence"]):
+            return
+        if bool(getattr(self.safety, "is_tripped", False)):
+            self._show_refusal(
+                Refusal(
+                    "Safety Interlock",
+                    "Reset the latched safety trip before starting a "
+                    "sequence.",
+                )
+            )
+            return
+        if self.operations.busy:
+            self.report_busy(self.operations.active_kind)
+            return
+        applied = self.plan_store.applied
+        plan = pending_points(applied) if applied is not None else []
+        decision = start_sequence_decision(
+            applied=applied,
+            pending=len(plan),
+            selected_device=self.device_combo.currentText().strip(),
+        )
+        if decision.action is StartAction.OFFER_PLANNER:
+            self.show_info(decision.title, decision.message)
+            return
+        if decision.action is StartAction.WRONG_DEVICE:
+            self.show_error(decision.title, decision.message)
+            return
+        if decision.action is StartAction.ALREADY_COMPLETE:
+            self.show_info(decision.title, decision.message)
+            return
+        # Duration and the tune option belong to the applied plan: the
+        # planner saved them with the selections.
+        stored = self.db.load_plan_selections(
+            self.device_combo.currentText().strip()
+        )
+        duration_minutes = float(stored[2]) if stored else 1.0
+        tune_voltage = bool(stored[3]) if stored else True
+        if not self.confirm(
+            "Start Auto Sequence",
+            f"This will run {len(plan)} planned test point(s).\n\n"
+            "Voltage is set automatically by the SMU; you will only be "
+            "prompted for chamber temperature changes.\n\nContinue?",
+        ):
+            return
+        token = self.operations.try_begin("sequence")
+        if token is None:
+            self.report_busy(self.operations.active_kind)
+            return
+        self.refresh_controls()
+        if self.sequence.start(plan, duration_minutes, tune_voltage):
+            self.sequence_button.setText("Stop Auto Sequence")
+            self._status.showMessage("Auto sequence starting...")
+        else:
+            self.operations.finish(token)
+            self.refresh_controls()
+            self.show_error(
+                "Auto Sequence", "The sequence could not start."
+            )
+
+    def _current_point_silently(self):
+        try:
+            return build_matrix_point(**self._read_selection())
+        except InputRejected:
+            return None
+
+    def _recall_candidate(self):
+        point = self._current_point_silently()
+        if point is None:
+            return None
+        prior = find_prior_tuned_frequency(
+            self.db, point, list(self.settings.default_configurations)
+        )
+        return tuning_candidate(
+            prior, getattr(self.wavegen_controller, "applied_freq_hz", None)
+        )
+
+    def _recall_tuned_frequency(self) -> None:
+        candidate = self._recall_candidate()
+        if candidate is None:
+            self.show_info(
+                "Recall Tuned Frequency",
+                "No tuned frequency is available for the current settings.",
+            )
+            return
+        selection = self._read_selection()
+        self.rig.autotune(candidate, config=selection["config"])
 
     def _apply_wavegen(self, after_success=None) -> bool:
         selection = self._read_selection()
@@ -599,14 +846,18 @@ class QtMainWindow(QMainWindow):
     def is_closing(self) -> bool:
         return self._closing
 
-    def refresh_controls(self) -> None:
-        state = resolve_rig_control_state(
+    def _control_state(self):
+        return resolve_rig_control_state(
             active_kind=self.operations.active_kind,
             closing=self._closing,
             safety_tripped=bool(getattr(self.safety, "is_tripped", False)),
             hardware_offline=self._hardware_offline,
             engine_running=self.engine.is_busy(),
+            bus_energised=bool(getattr(self.smu, "output_is_on", True)),
         )
+
+    def refresh_controls(self) -> None:
+        state = self._control_state()
         self.device_combo.setEnabled(state.edit_inputs)
         for selector in self.param_selectors.values():
             selector.set_enabled(state.edit_inputs)
@@ -624,10 +875,35 @@ class QtMainWindow(QMainWindow):
         else:
             self.voltage_tune_button.setEnabled(state.hardware_actions)
             self.voltage_tune_button.setText("Tune DC Voltage Now")
+        sequence_running = (
+            self.operations.active_kind == "sequence" or self.sequence.active
+        )
+        if not sequence_running:
+            self.sequence_button.setText("Start Auto Sequence")
+            self.sequence_button.setEnabled(state.hardware_actions)
         # E-stop deliberately untouched: no state may disable it.
 
     def refresh_confirm(self) -> None:
-        """Recall Tuned Frequency arrives with the history screens."""
+        selection = self._read_selection()
+        state = self._control_state()
+        presentation = resolve_confirm_presentation(
+            wavegen_pending=self.wavegen_controller.has_pending_changes(
+                selection["config"],
+                selection["frequency_hz"],
+                selection["duty_pct"],
+            ),
+            tuning_candidate_hz=(
+                candidate[0]
+                if (candidate := self._recall_candidate()) is not None
+                else None
+            ),
+            tuner_busy=self.operations.active_kind
+            in {"autotune", "voltage_tune"},
+            hardware_actions=state.hardware_actions,
+            frequency_actions=state.frequency_actions,
+        )
+        self.recall_button.setText(presentation.autotune_text)
+        self.recall_button.setEnabled(presentation.autotune_enabled)
 
     def smu_state_changed(self) -> None:
         self.smu_status_label.setText(
@@ -668,6 +944,7 @@ class QtMainWindow(QMainWindow):
         self._status.showMessage(
             "Closing safely: cancelling work and shutting outputs down..."
         )
+        self.sequence.cancel()
         self.engine.cancel()
         threading.Thread(
             target=self._shutdown_worker, name="qt-close", daemon=False
@@ -689,18 +966,28 @@ class QtMainWindow(QMainWindow):
                 outputs_safe = False
                 log.exception("Output shutdown attempt failed during close")
             try:
+                sequence_stopped = self.sequence.cancel_and_join(timeout=2.0)
+            except Exception:
+                sequence_stopped = False
+                log.exception("Sequence join attempt failed during close")
+            try:
                 self.engine.cancel_and_join(timeout=2.0)
                 engine_stopped = not self.engine.is_busy()
             except Exception:
                 engine_stopped = False
                 log.exception("Engine join attempt failed during close")
             workers_stopped = self.pool.join_all(timeout=2.0)
-            if outputs_safe and engine_stopped and workers_stopped:
+            if (
+                outputs_safe
+                and sequence_stopped
+                and engine_stopped
+                and workers_stopped
+            ):
                 break
             detail = (
                 "Waiting for safe shutdown "
-                f"(outputs={outputs_safe}, engine={engine_stopped}, "
-                f"workers={workers_stopped})"
+                f"(outputs={outputs_safe}, sequence={sequence_stopped}, "
+                f"engine={engine_stopped}, workers={workers_stopped})"
             )
             log.critical("%s; attempt %d", detail, attempt)
             self.dispatcher.post(self._status.showMessage, detail)

@@ -64,6 +64,18 @@ def _fast(settings: Settings) -> Settings:
     settings.voltage_tune.max_steps = 30
     settings.safety.max_dc_current_a = 1.0
     settings.safety.max_vds_peak_v = 450.0
+    # Sequenced runs tune the gate frequency, so the wavegen ramps and the
+    # search spans must not run at bench-realistic speed here.
+    settings.wavegen.freq_ramp_rate_khz_s = 1_000_000.0
+    settings.wavegen.duty_ramp_rate_pct_s = 1_000_000.0
+    ft = settings.frequency_tune
+    ft.settle_s = 0.0
+    ft.window_frac = 0.05
+    ft.survey_window_frac = 0.05
+    ft.survey_step_hz = 200_000
+    ft.coarse_step_hz = 100_000
+    ft.fine_step_hz = 50_000
+    ft.fine_span_hz = 100_000
     return settings
 
 
@@ -245,5 +257,53 @@ def test_closing_shuts_down_and_closes_resources_exactly_once(
     assert pump(qapp, lambda: spine._resources_closed, 15.0)
     assert pump(qapp, lambda: not spine.isVisible())
     assert spine._resources_closed_calls == [True]
+    assert not spine.smu.output_is_on
+    assert not spine.wavegen_controller.outputs_armed
+
+
+def test_a_planned_sequence_runs_its_points_through_the_qt_window(
+    qapp, spine
+) -> None:
+    """Apply a two-point plan, start the sequence, get two completed runs.
+
+    Same temperature for both points so the only operator interaction is
+    the start confirmation, which the fixture accepts.
+    """
+    from gan_fet.core.models import MatrixPoint
+
+    device = "QT-SEQ"
+    spine.device_combo.setCurrentText(device)
+    points = [
+        MatrixPoint(device, "Single Device", 6_000_000, 25, 25, 200),
+        MatrixPoint(device, "Single Device", 6_000_000, 25, 25, 300),
+    ]
+    spine.db.save_plan_selections(
+        device,
+        {
+            "configurations": ["Single Device"],
+            "frequencies": [6_000_000],
+            "duties": [25],
+            "voltages": [200, 300],
+            "temperatures": [25],
+        },
+        include_completed=False,
+        duration_minutes=0.02,
+        tune_voltage=False,
+    )
+    spine.plan_store.apply(points, source="test", device_name=device)
+
+    spine.sequence_button.click()
+    assert pump(
+        qapp,
+        lambda: not spine.sequence.active
+        and spine.operations.active_kind is None
+        and not spine.engine.is_busy(),
+        timeout_s=120.0,
+    )
+    applied = spine.plan_store.applied
+    assert applied is not None and len(applied.pending) == 0
+    for point in points:
+        record = spine.db.find_run(point)
+        assert record is not None and record.status == "completed", point
     assert not spine.smu.output_is_on
     assert not spine.wavegen_controller.outputs_armed

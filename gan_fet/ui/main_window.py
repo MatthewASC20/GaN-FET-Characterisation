@@ -424,7 +424,12 @@ class MainWindow(tk.Tk):
         self.ui_dispatcher.post(self._on_engine_state, state)
 
     def _queue_run_finished(self, success: bool, message: str) -> None:
-        self.ui_dispatcher.post(self._on_run_finished, success, message)
+        # Captured at emission: the next sequence point's start() clears
+        # engine.last_outcome, so reading it when the queued callback runs
+        # loses which point just finished.
+        self.ui_dispatcher.post(
+            self._on_run_finished, success, message, self.engine.last_outcome
+        )
 
     def _queue_engine_error(self, title: str, message: str) -> None:
         self.ui_dispatcher.post(
@@ -1734,7 +1739,9 @@ class MainWindow(tk.Tk):
         )
         self._refresh_control_states()
 
-    def _on_run_finished(self, success: bool, message: str) -> None:
+    def _on_run_finished(
+        self, success: bool, message: str, outcome=None
+    ) -> None:
         if self._closing:
             return
         validation_run = bool(
@@ -1750,7 +1757,6 @@ class MainWindow(tk.Tk):
         # Follow the point that just finished, not whichever frequency the
         # tracker was last set to by hand: a sequence working through a
         # multi-frequency plan otherwise ticks off points out of view.
-        outcome = self.engine.last_outcome
         record = getattr(outcome, "record", None)
         finished_at = getattr(record, "frequency_hz", None)
         self.tracker.follow_frequency(finished_at)
@@ -1764,7 +1770,6 @@ class MainWindow(tk.Tk):
         sample_count = 0
         screenshot_path = None
         if validation_run and success:
-            outcome = self.engine.last_outcome
             if outcome is not None and outcome.run_id is not None:
                 sample_count = len(self.db.samples_for_run(outcome.run_id))
                 if outcome.record is not None:
