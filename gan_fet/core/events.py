@@ -36,6 +36,30 @@ class SampleAcquiredEvent:
 
 
 @dataclass(frozen=True)
+class MeasurementEvent:
+    """Emitted when a reading is taken outside the sampling loop.
+
+    The frequency search and the peak controller measure the same quantities a
+    run does — bus, Vds peak, DC current — but at points that are *not* run
+    data: they are the search finding its operating point, and several of them
+    are on the way to somewhere else. Between them they occupy almost all of a
+    tuned run's wall-clock time, so without this the live telemetry sits frozen
+    while the rig is at its busiest.
+
+    Deliberately **not** a :class:`SampleAcquiredEvent`. That one is written to
+    the database and drawn on the run plot, and neither is true here. Anything
+    consuming this should display it and nothing else.
+    """
+
+    #: Where the reading was taken, for the status line. e.g. "frequency search".
+    source: str
+    frequency_hz: Optional[float] = None
+    bus_voltage: Optional[float] = None
+    vds_peak: Optional[float] = None
+    dc_current: Optional[float] = None
+
+
+@dataclass(frozen=True)
 class StateChangedEvent:
     """Emitted when the experiment engine state transitions."""
 

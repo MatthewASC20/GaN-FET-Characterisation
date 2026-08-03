@@ -64,6 +64,7 @@ from gan_fet.ui.param_options import (
     normalize_options,
 )
 from gan_fet.core.events import (
+    MeasurementEvent,
     SampleAcquiredEvent,
     StatusUpdatedEvent,
     bus,
@@ -315,6 +316,10 @@ class MainWindow(tk.Tk):
                     StatusUpdatedEvent,
                     self._queue_status_event,
                 ),
+                bus.subscribe(
+                    MeasurementEvent,
+                    self._queue_measurement_event,
+                ),
             )
         )
 
@@ -323,6 +328,24 @@ class MainWindow(tk.Tk):
 
     def _queue_status_event(self, event: StatusUpdatedEvent) -> None:
         self.ui_dispatcher.post(self.status_bar.set_message, event.message)
+
+    def _queue_measurement_event(self, event: MeasurementEvent) -> None:
+        self.ui_dispatcher.post(self._on_measurement_event, event)
+
+    def _on_measurement_event(self, event: MeasurementEvent) -> None:
+        """Show a reading taken outside the sampling loop.
+
+        Telemetry only. These points are the search finding its operating
+        point, not run data — several are on the way to somewhere else — so
+        they must not reach the plot or the database, which is why this is a
+        separate event from SampleAcquiredEvent rather than a flag on it.
+        """
+        self.update_telemetry(
+            freq_hz=event.frequency_hz,
+            vds_peak=event.vds_peak,
+            dc_volts=event.bus_voltage,
+            dc_current_a=event.dc_current,
+        )
 
     def _on_sample_event(self, event: SampleAcquiredEvent) -> None:
         self.last_current_label.config(text=last_current_text(event.amps))
@@ -2039,7 +2062,9 @@ class MainWindow(tk.Tk):
             has_screenshot=bool(screenshot_path),
         )
         if report.dialog is not None:
-            self.notebook.select(self.analytics_tab)
+            # The dialog says where the results are; jumping there as well
+            # takes the operator off the live view the moment the run ends,
+            # which is the half of the validation they were watching.
             messagebox.showinfo(*report.dialog, parent=self)
         self.status_bar.set_message(report.status)
         self._refresh_confirm_state()

@@ -32,6 +32,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from gan_fet.core.events import MeasurementEvent, bus
 from gan_fet.core.control_loop import finite_float, is_cancelled, settle
 from gan_fet.core.reachability import ReachabilityGuard
 from gan_fet.core.safety import SafetyMonitor
@@ -174,6 +175,33 @@ class FrequencyTuner:
 
     def _read_current(self) -> Optional[float]:
         return self._read(lambda: self.smu.measure_dc_current(), "SMU current")
+
+    def _publish_measurement(
+        self,
+        frequency_hz: float,
+        peak: Optional[float],
+        current: Optional[float],
+    ) -> None:
+        """Offer the reading to whatever is watching, and never fail for it.
+
+        ``EventBus.publish`` already isolates each subscriber, so a broken
+        listener cannot reach here. What this guard is actually for is the
+        argument list: it reads ``smu.setpoint_v``, which talks to an
+        instrument that can be gone. Displaying telemetry must never be able
+        to stop a sweep that is holding a live rig at its target peak.
+        """
+        try:
+            bus.publish(
+                MeasurementEvent(
+                    source="frequency search",
+                    frequency_hz=frequency_hz,
+                    bus_voltage=float(self.smu.setpoint_v),
+                    vds_peak=peak,
+                    dc_current=current,
+                )
+            )
+        except Exception:  # pragma: no cover - defensive
+            log.exception("Publishing a tuning measurement failed")
 
     @property
     def _peak_ceiling_v(self) -> float:
@@ -380,6 +408,10 @@ class FrequencyTuner:
         self.guard.record_converged(peak, float(self.smu.setpoint_v))
         self.safety.check_sample(dc_current=current, vds_peak=peak)
         self.safety.check_compliance()
+        # Publish after the safety checks, never before: a reading that is
+        # about to trip the rig should reach the interlock first, and showing
+        # it as a normal operating point would be actively misleading.
+        self._publish_measurement(frequency_hz, peak, current)
         return TunePoint(
             arrival_peak_v=arrival_peak,
             zvs_dwell_fraction=self._read_dwell(),

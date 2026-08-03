@@ -15,6 +15,7 @@ import math
 from typing import Callable, Optional
 
 from gan_fet.core.control_loop import finite_float, is_cancelled, settle
+from gan_fet.core.events import MeasurementEvent, bus
 from gan_fet.core.safety import SafetyMonitor
 from gan_fet.instruments.base import OscilloscopeInterface, SmuInterface
 from gan_fet.instruments.smu import SmuLimitError
@@ -77,8 +78,36 @@ class PeakVoltageController:
             log.warning("Scope returned an unusable peak reading: %r", peak)
         return numeric_peak
 
-    def _check_input_current(self) -> None:
-        """Enforce the independent DC-current ceiling during peak control."""
+    def _publish_measurement(
+        self, peak: float, current: Optional[float]
+    ) -> None:
+        """Offer the reading to whatever is watching, and never fail for it.
+
+        ``EventBus.publish`` already isolates each subscriber, so a broken
+        listener cannot reach here. What this guard is actually for is the
+        argument list: it reads ``smu.setpoint_v``, which talks to an
+        instrument that can be gone. The bus ramp is the longest stretch in
+        which the rig is live, and showing it must not be able to stop it.
+        """
+        try:
+            bus.publish(
+                MeasurementEvent(
+                    source="peak control",
+                    bus_voltage=float(self.smu.setpoint_v),
+                    vds_peak=peak,
+                    dc_current=current,
+                )
+            )
+        except Exception:  # pragma: no cover - defensive
+            log.exception("Publishing a peak-control measurement failed")
+
+    def _check_input_current(self) -> Optional[float]:
+        """Enforce the independent DC-current ceiling during peak control.
+
+        Returns the reading so it can be displayed, but the return value is
+        incidental: this exists to check the ceiling, and it does that whether
+        or not anyone is looking at the number.
+        """
         try:
             current = self.smu.measure_dc_current()
         except Exception as exc:
@@ -90,6 +119,7 @@ class PeakVoltageController:
         else:
             self.safety.record_read_success("SMU current (peak control)")
             self.safety.check_sample(dc_current=numeric_current)
+        return numeric_current
 
     def _gain_estimate(
         self,
@@ -193,7 +223,7 @@ class PeakVoltageController:
             peak = self._read_peak(cancel_check)
             # Current and compliance are independent of the scope read.  They
             # must still be checked when peak telemetry is unavailable.
-            self._check_input_current()
+            current = self._check_input_current()
             self.safety.check_compliance()
             if peak is None:
                 self.safety.record_read_failure("scope peak voltage")
@@ -201,6 +231,9 @@ class PeakVoltageController:
                 continue
             self.safety.record_read_success("scope peak voltage")
             self.safety.check_sample(vds_peak=peak)
+            # After the safety checks, never before: a reading about to trip
+            # the rig belongs to the interlock first.
+            self._publish_measurement(peak, current)
 
             error = target_v - peak
             if abs(error) <= cfg.tolerance_v:
