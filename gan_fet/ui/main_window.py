@@ -37,7 +37,7 @@ from gan_fet.ui.run_request import (
     require_populated_options,
     tuning_candidate,
 )
-from gan_fet.ui.operations.background import run_in_background
+from gan_fet.ui.operations.rig_control import RigOperations
 from gan_fet.ui.operations.experiment_ops import (
     APPLY_FIRST_PROMPT,
     CancelTarget,
@@ -216,6 +216,18 @@ class MainWindow(tk.Tk):
         self._resources_closed = False
         self.operations = OperationCoordinator()
         self._worker_pool = WorkerPool()
+        # Built before the UI: it holds the operation lifecycle, so anything
+        # that can claim the rig has to go through it from the start.
+        self.rig = RigOperations(
+            ui=self,
+            operations=self.operations,
+            pool=self._worker_pool,
+            dispatcher=self.ui_dispatcher,
+            safety=safety,
+            smu=smu,
+            wavegen_controller=wavegen_controller,
+            hardware_labels=HARDWARE_OPERATION_LABELS,
+        )
         self._emergency_worker: Optional[threading.Thread] = None
         self._event_unsubscribers: list[Callable[[], None]] = []
 
@@ -916,14 +928,7 @@ class MainWindow(tk.Tk):
         ] = None,
     ) -> threading.Thread:
         """Run one rig operation off the Tk thread and report how it ended."""
-        return run_in_background(
-            pool=self._worker_pool,
-            dispatcher=self.ui_dispatcher,
-            work=work,
-            on_done=on_done,
-            name=name,
-            on_error=on_error,
-        )
+        return self.rig.run(work, on_done, name=name, on_error=on_error)
 
     def _join_workers(self, timeout: float) -> bool:
         return self._worker_pool.join_all(timeout)
@@ -931,26 +936,38 @@ class MainWindow(tk.Tk):
     def _begin_operation(
         self, kind: str, *, show_busy: bool = True
     ) -> Optional[OperationToken]:
-        if self._closing:
-            return None
-        action = HARDWARE_OPERATION_LABELS.get(kind)
-        if action is not None and not self._ensure_hardware_online(action):
-            return None
-        token = self.operations.try_begin(kind)
-        if token is None and show_busy:
-            active = self.operations.active_kind or "another operation"
-            messagebox.showinfo(
-                "Rig Busy",
-                f"Wait for {active.replace('_', ' ')} to finish, or use EMERGENCY STOP.",
-                parent=self,
-            )
-        self._refresh_control_states()
-        return token
+        return self.rig.begin(kind, show_busy=show_busy)
 
     def _finish_operation(self, token: OperationToken) -> None:
-        self.operations.finish(token)
+        self.rig.finish(token)
+
+    # -- RigUi: what RigOperations calls back through ----------------------
+
+    def set_status(self, message: str) -> None:
+        self.status_bar.set_message(message)
+
+    def hardware_online(self, action: str) -> bool:
+        return self._ensure_hardware_online(action)
+
+    def report_busy(self, active_kind: Optional[str]) -> None:
+        active = active_kind or "another operation"
+        messagebox.showinfo(
+            "Rig Busy",
+            f"Wait for {active.replace('_', ' ')} to finish, or use EMERGENCY STOP.",
+            parent=self,
+        )
+
+    def is_closing(self) -> bool:
+        return self._closing
+
+    def refresh_controls(self) -> None:
         self._refresh_control_states()
+
+    def refresh_confirm(self) -> None:
         self._refresh_confirm_state()
+
+    def smu_state_changed(self) -> None:
+        self._update_smu_panel()
 
     def _safety_is_tripped(self) -> bool:
         return bool(getattr(self.safety, "is_tripped", False))
@@ -1785,48 +1802,7 @@ class MainWindow(tk.Tk):
             )
 
     def _bus_off(self) -> None:
-        if not self._ensure_hardware_online(HARDWARE_OPERATION_LABELS["bus_off"]):
-            return
-        token = self._begin_operation("bus_off")
-        if token is None:
-            return
-
-        def work() -> None:
-            self.smu.ramp_to(0.0, cancel_check=token.cancel_event.is_set)
-            if not self.smu.output_off():
-                raise RuntimeError("SMU output-off was not acknowledged")
-            self.wavegen_controller.disarm_outputs()
-            if self.smu.output_is_on or self.wavegen_controller.outputs_armed:
-                raise RuntimeError("Output readback did not confirm the rig is safe")
-
-        def fall_back(error: BaseException) -> Optional[BaseException]:
-            """Take the emergency path, on the worker thread, while the rig is
-            still in whatever state the failure left it."""
-            if not self.safety.shutdown_outputs():
-                if not self.safety.emergency_stop():
-                    return RuntimeError(
-                        f"{error}; emergency output-off was unconfirmed"
-                    )
-            return None
-
-        self._run_operation(
-            work,
-            partial(self._on_bus_off_done, token),
-            name="bus-off",
-            on_error=fall_back,
-        )
-        self.status_bar.set_message("Ramping bus to 0 V...")
-
-    def _on_bus_off_done(
-        self, token: OperationToken, error: Optional[BaseException]
-    ) -> None:
-        self._finish_operation(token)
-        self._update_smu_panel()
-        self.status_bar.set_message(
-            "Bus and gate outputs are OFF."
-            if error is None
-            else f"Bus Off required the emergency shutdown path: {error}"
-        )
+        self.rig.bus_off()
 
     def _emergency_stop(self) -> None:
         if self._emergency_worker is not None and self._emergency_worker.is_alive():
