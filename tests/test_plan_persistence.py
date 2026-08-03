@@ -433,10 +433,10 @@ def test_selections_round_trip(database):
         {"frequencies": [6_000_000, 6_500_000], "duties": [50]},
         include_completed=True,
         duration_minutes=2.5,
-        find_zvs=False,
+        tune_voltage=False,
     )
 
-    selections, include_completed, duration, find_zvs = (
+    selections, include_completed, duration, tune_voltage = (
         database.load_plan_selections("EPC2001C")
     )
 
@@ -444,7 +444,7 @@ def test_selections_round_trip(database):
     assert selections["duties"] == {"50"}
     assert include_completed is True
     assert duration == 2.5
-    assert find_zvs is False
+    assert tune_voltage is False
 
 
 def test_selections_are_per_device(database):
@@ -490,13 +490,13 @@ def test_a_deliberately_empty_selection_is_kept(database):
 def test_options_default_sensibly_when_not_passed(database):
     database.save_plan_selections("EPC2001C", {"duties": [50]})
 
-    _, include_completed, duration, find_zvs = database.load_plan_selections(
+    _, include_completed, duration, tune_voltage = database.load_plan_selections(
         "EPC2001C"
     )
 
     assert include_completed is False
     assert duration == 1.0
-    assert find_zvs is True
+    assert tune_voltage is True
 
 
 # -- upgrading a schema 7 database ---------------------------------------------

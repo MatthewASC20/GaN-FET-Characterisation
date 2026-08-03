@@ -16,13 +16,14 @@ one:
 | **ZVS** | the measured physical phenomenon only — the scope's dwell measurement (P4), its threshold, and the ZVS *point* a voltage tune lands on |
 
 The DC voltage tune was historically called the "ZVS search" and the frequency
-recall was called "Autotune". Code identifiers now follow the glossary
-(`VoltageTuner`, `tune_voltage`, `tuned_voltage_v`). Three families keep old
-names deliberately: persisted surfaces (`v_zvs` and `find_zvs` columns, the
-`zvs` settings key) until the storage migration renames them; the `autotune`
-module, which also hosts the shared `WavegenController`; and every
-`zvs_dwell`/ZVS-threshold identifier, which measures actual zero-voltage
-switching.
+recall was called "Autotune". Code identifiers, the persisted schema
+(`runs.tuned_voltage_v`, `plan_options.tune_voltage`, schema 9) and the
+settings keys (`voltage_tune`, `tune_voltage_before_run`,
+`show_voltage_tune_controls`) now follow the glossary; databases and settings
+files written before the rename migrate in place on open. Two families keep
+old names deliberately: the `autotune` module, which also hosts the shared
+`WavegenController`; and every `zvs_dwell`/ZVS-threshold identifier, which
+measures actual zero-voltage switching.
 
 ## Layering
 

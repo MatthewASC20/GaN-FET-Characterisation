@@ -207,3 +207,88 @@ def test_unrelated_unique_index_does_not_trigger_runs_rebuild(tmp_path: Path):
     connection.close()
 
     assert "keep_unique_screenshot" in indexes
+
+
+def test_v8_tuning_columns_are_renamed_in_place(tmp_path: Path):
+    """A schema-8 database opens with v_zvs / find_zvs renamed, values intact.
+
+    The rename must be a migration, not a rebuild: prior measurements and the
+    operator's saved planner preference both survive, and reopening the
+    migrated file must not attempt the rename again.
+    """
+    path = tmp_path / "v8.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO schema_version(version) VALUES (8);
+        CREATE TABLE devices (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            param_options_json TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO devices(id, name) VALUES (1, 'DUT-1');
+        CREATE TABLE runs (
+            id INTEGER PRIMARY KEY,
+            device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+            config TEXT NOT NULL,
+            frequency_hz INTEGER NOT NULL,
+            duty_pct INTEGER NOT NULL,
+            temperature_c INTEGER NOT NULL,
+            voltage_v INTEGER NOT NULL,
+            duration_minutes REAL,
+            started_at TEXT,
+            completed_at TEXT,
+            status TEXT NOT NULL DEFAULT 'running',
+            bus_voltage_v REAL,
+            v_zvs REAL,
+            vin REAL, iin REAL, fsw_hz REAL, irms REAL, vds_pk REAL,
+            isw_rms REAL,
+            screenshot_path TEXT,
+            attempt_no INTEGER NOT NULL DEFAULT 1,
+            tuned_frequency_hz REAL,
+            tuned_input_power_w REAL,
+            sweep_direction TEXT,
+            zvs_dwell_fraction REAL
+        );
+        INSERT INTO runs(device_id, config, frequency_hz, duty_pct,
+                         temperature_c, voltage_v, duration_minutes, status,
+                         v_zvs)
+        VALUES (1, 'Single Device', 13560000, 50, 25, 300, 1.0, 'completed',
+                95.5);
+        CREATE TABLE plan_options (
+            device_name TEXT PRIMARY KEY,
+            include_completed INTEGER NOT NULL DEFAULT 0,
+            duration_minutes REAL NOT NULL DEFAULT 1.0,
+            find_zvs INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT INTO plan_options(device_name, include_completed,
+                                 duration_minutes, find_zvs)
+        VALUES ('DUT-1', 0, 2.5, 0);
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    for _reopen in range(2):
+        db = Database(path)
+        try:
+            columns = {
+                row[1]
+                for row in db._conn.execute("PRAGMA table_info(runs)")
+            }
+            assert "tuned_voltage_v" in columns and "v_zvs" not in columns
+            value = db._conn.execute(
+                "SELECT tuned_voltage_v FROM runs"
+            ).fetchone()[0]
+            assert value == 95.5
+            stored = db.load_plan_selections("DUT-1")
+            assert stored is not None
+            assert stored[2] == 2.5
+            assert stored[3] is False
+        finally:
+            db.close()

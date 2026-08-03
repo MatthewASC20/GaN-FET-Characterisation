@@ -515,7 +515,7 @@ class Settings:
     )
     smu: SmuSettings = field(default_factory=SmuSettings)
     wavegen: WavegenSettings = field(default_factory=WavegenSettings)
-    zvs: VoltageTuneSettings = field(default_factory=VoltageTuneSettings)
+    voltage_tune: VoltageTuneSettings = field(default_factory=VoltageTuneSettings)
     frequency_tune: FrequencyTuneSettings = field(
         default_factory=FrequencyTuneSettings
     )
@@ -545,7 +545,7 @@ class Settings:
 
     # UI state persisted between sessions (replaces last_params.json)
     last_params: dict[str, Any] = field(default_factory=dict)
-    find_zvs_before_run: bool = False
+    tune_voltage_before_run: bool = False
     #: Tune the gate frequency at the operating point before sampling. On by
     #: default: across 460 historical runs the tuned frequency departed from
     #: nominal by a median of 8.5% and up to 21.7%, so running at nominal
@@ -554,7 +554,7 @@ class Settings:
     tune_frequency_at_operating_point: bool = True
     #: The voltage-only ZVS sweep is retained mainly to exercise the frequency
     #: search independently, so its control is hidden unless revealed here.
-    show_zvs_voltage_sweep: bool = False
+    show_voltage_tune_controls: bool = False
 
     _settings_path: Path = field(
         default=DEFAULT_SETTINGS_PATH, init=False, repr=False, compare=False
@@ -805,6 +805,17 @@ class Settings:
     @classmethod
     def _from_dict(cls, raw: dict[str, Any]) -> "Settings":
         raw = _normalize_scope_payload(raw, require_scope_evidence=False)
+        # Keys written before the tuning-vocabulary rename. Folded into the
+        # current names here so an existing settings.json keeps its values;
+        # the next save writes only the new keys. A file that somehow has
+        # both keeps the current one.
+        for legacy, current in (
+            ("zvs", "voltage_tune"),
+            ("find_zvs_before_run", "tune_voltage_before_run"),
+            ("show_zvs_voltage_sweep", "show_voltage_tune_controls"),
+        ):
+            if legacy in raw and current not in raw:
+                raw[current] = raw.pop(legacy)
         settings = cls()
 
         instrument_raw = raw.get("instruments")
@@ -832,7 +843,7 @@ class Settings:
         sections = {
             "smu": (SmuSettings, settings.smu),
             "wavegen": (WavegenSettings, settings.wavegen),
-            "zvs": (VoltageTuneSettings, settings.zvs),
+            "voltage_tune": (VoltageTuneSettings, settings.voltage_tune),
             "frequency_tune": (FrequencyTuneSettings, settings.frequency_tune),
             "peak_control": (PeakControlSettings, settings.peak_control),
             "safety": (SafetySettings, settings.safety),
@@ -894,9 +905,9 @@ class Settings:
         if isinstance(raw.get("last_params"), dict):
             settings.last_params = dict(raw["last_params"])
         for flag in (
-            "find_zvs_before_run",
+            "tune_voltage_before_run",
             "tune_frequency_at_operating_point",
-            "show_zvs_voltage_sweep",
+            "show_voltage_tune_controls",
         ):
             if isinstance(raw.get(flag), bool):
                 setattr(settings, flag, raw[flag])
@@ -922,7 +933,7 @@ class Settings:
                 "duty_ramp_rate_pct_s",
                 "duty_step_pct",
             ),
-            "zvs": (
+            "voltage_tune": (
                 "step_v",
                 "settle_s",
                 "samples_per_point",
@@ -964,8 +975,8 @@ class Settings:
             ),
         }
         integer_fields = {
-            ("zvs", "samples_per_point"),
-            ("zvs", "max_steps"),
+            ("voltage_tune", "samples_per_point"),
+            ("voltage_tune", "max_steps"),
             ("peak_control", "max_iterations"),
             ("frequency_tune", "max_points"),
             ("safety", "watchdog_consecutive_failures"),

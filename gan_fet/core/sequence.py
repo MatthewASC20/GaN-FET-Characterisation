@@ -278,6 +278,20 @@ class AutoSequence:
                         point=point,
                         duration_minutes=duration_minutes,
                         tune_voltage=tune_voltage,
+                        # Always, and deliberately not a flag. A sequence is a
+                        # characterisation matrix, and a point measured off
+                        # resonance is not a characterisation of anything —
+                        # Coss moves resonance with amplitude, so the right
+                        # frequency can only be found at the operating point.
+                        #
+                        # This used to be omitted, so it defaulted to False and
+                        # every sequenced point ran at its nominal frequency.
+                        # The ramp above hid it: recalling a previously tuned
+                        # frequency looks like tuning, but only works once some
+                        # other run has already found one. On a fresh device
+                        # there is nothing to recall and the whole matrix ran
+                        # off resonance, with tuned_frequency_hz NULL
+                        # throughout.
                     )
                 ):
                     success = False

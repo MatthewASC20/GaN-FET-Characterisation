@@ -99,7 +99,7 @@ class _FakeVar:
 class _FakeSettings:
     def __init__(self) -> None:
         self.smu = SimpleNamespace(ramp_rate_v_s=25.0)
-        self.zvs = SimpleNamespace(
+        self.voltage_tune = SimpleNamespace(
             autotune_freq_rate_khz_s=200.0,
             duty_ramp_rate_pct_s=10.0,
         )
@@ -458,7 +458,7 @@ def test_ramp_slider_motion_only_stages_changes() -> None:
     editor._on_duty_slider("12.34")
 
     assert settings.smu.ramp_rate_v_s == 25.0
-    assert settings.zvs.autotune_freq_rate_khz_s == 200.0
+    assert settings.voltage_tune.autotune_freq_rate_khz_s == 200.0
     assert settings.wavegen.duty_ramp_rate_pct_s == 10.0
     assert settings.save_calls == 0
     assert editor._dirty
@@ -619,10 +619,10 @@ def test_ramp_apply_persists_one_normalized_update() -> None:
     editor._apply()
 
     assert settings.smu.ramp_rate_v_s == 42.3
-    assert settings.zvs.autotune_freq_rate_khz_s == 333.0
+    assert settings.voltage_tune.autotune_freq_rate_khz_s == 333.0
     assert settings.wavegen.freq_ramp_rate_khz_s == 333.0
     assert settings.wavegen.duty_ramp_rate_pct_s == 12.3
-    assert settings.zvs.duty_ramp_rate_pct_s == 12.3
+    assert settings.voltage_tune.duty_ramp_rate_pct_s == 12.3
     assert settings.save_calls == 1
     assert applied == [True]
     assert not editor._dirty

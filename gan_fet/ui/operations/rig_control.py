@@ -483,7 +483,7 @@ class RigOperations:
             self.wavegen_controller.ramp_to_frequency(
                 target,
                 config,
-                rate_khz_s=self.settings.zvs.autotune_freq_rate_khz_s,
+                rate_khz_s=self.settings.voltage_tune.autotune_freq_rate_khz_s,
                 cancel_check=token.cancel_event.is_set,
                 status=self.ui.set_status_async,
             )

@@ -184,6 +184,24 @@ class Database:
         if "slot" in plan_columns:
             self._migrate_plans_drop_slot()
 
+        option_columns = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(plan_options)"
+            ).fetchall()
+        }
+        if "find_zvs" in option_columns:
+            self._migrate_plan_options_rename_tune_voltage()
+
+        # Re-inspected rather than reusing ``columns``: the attempts rebuild
+        # above recreates the table and this must see what is there *now*.
+        run_columns = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        if "v_zvs" in run_columns:
+            self._migrate_runs_rename_tuned_voltage()
+
         self._migrate_added_columns()
 
         with self._conn:
@@ -287,6 +305,45 @@ class Database:
             "discarded the unread draft slot",
             len(carried),
         )
+
+    def _migrate_plan_options_rename_tune_voltage(self) -> None:
+        """Schema 8 called this column ``find_zvs``.
+
+        The operation it gates is tuning the DC bus voltage before a run, not
+        searching for ZVS — a separate thing the rig also does. The UI was
+        renamed first, leaving storage as the last place still using the old
+        word. Same column, same meaning, honest name.
+
+        A rename rather than a rebuild: the stored value is correct, and
+        ``ALTER TABLE ... RENAME COLUMN`` keeps every operator's saved
+        preference rather than resetting it to the default.
+        """
+        self._net_lock.assert_owned()
+        with self._conn:
+            self._conn.execute(
+                "ALTER TABLE plan_options RENAME COLUMN find_zvs TO tune_voltage"
+            )
+            self._net_lock.assert_owned()
+        log.info("migrated plan_options: find_zvs renamed to tune_voltage")
+
+    def _migrate_runs_rename_tuned_voltage(self) -> None:
+        """Schema 8 called this column ``v_zvs``.
+
+        It stores where the DC voltage tune left the bus. The tune's *goal* is
+        the ZVS point, but the value recorded is the tuned voltage, and every
+        code path now says ``tuned_voltage_v`` — storage was the last place
+        still using the old word. Same column, same meaning, honest name.
+
+        A rename rather than a rebuild: prior measurements must survive, and
+        the append-only runs history is exactly what a rebuild would risk.
+        """
+        self._net_lock.assert_owned()
+        with self._conn:
+            self._conn.execute(
+                "ALTER TABLE runs RENAME COLUMN v_zvs TO tuned_voltage_v"
+            )
+            self._net_lock.assert_owned()
+        log.info("migrated runs: v_zvs renamed to tuned_voltage_v")
 
     def _migrate_samples_add_elapsed(self) -> None:
         """Add nullable active elapsed time without rewriting legacy samples."""
@@ -568,7 +625,7 @@ class Database:
         readings: FinalReadings,
         *,
         bus_voltage_v: Optional[float] = None,
-        v_zvs: Optional[float] = None,
+        tuned_voltage_v: Optional[float] = None,
         screenshot_path: Optional[str] = None,
         completed_at: Optional[str] = None,
         tuned_frequency_hz: Optional[float] = None,
@@ -578,13 +635,15 @@ class Database:
     ) -> None:
         self._execute(
             "UPDATE runs SET status='completed', completed_at=?, bus_voltage_v=?,"
-            " v_zvs=?, vin=?, iin=?, fsw_hz=?, irms=?, vds_pk=?, isw_rms=?,"
+            " tuned_voltage_v=?, vin=?, iin=?, fsw_hz=?, irms=?, vds_pk=?,"
+            " isw_rms=?,"
             " screenshot_path=COALESCE(?, screenshot_path),"
             " tuned_frequency_hz=?, tuned_input_power_w=?, sweep_direction=?,"
             " zvs_dwell_fraction=?"
             " WHERE id=?",
             (completed_at or time.strftime("%Y-%m-%d %H:%M:%S"), bus_voltage_v,
-             v_zvs, readings.vin, readings.iin, readings.fsw_hz, readings.irms,
+             tuned_voltage_v, readings.vin, readings.iin, readings.fsw_hz,
+             readings.irms,
              readings.vds_pk, readings.isw_rms, screenshot_path,
              tuned_frequency_hz, tuned_input_power_w, sweep_direction,
              zvs_dwell_fraction, run_id),
@@ -877,7 +936,7 @@ class Database:
         *,
         include_completed: bool = False,
         duration_minutes: float = 1.0,
-        find_zvs: bool = True,
+        tune_voltage: bool = True,
     ) -> None:
         """Remember which parameters are ticked, for ``device_name``.
 
@@ -903,23 +962,23 @@ class Database:
                 )
             conn.execute(
                 "INSERT INTO plan_options(device_name, include_completed,"
-                " duration_minutes, find_zvs) VALUES (?,?,?,?)"
+                " duration_minutes, tune_voltage) VALUES (?,?,?,?)"
                 " ON CONFLICT(device_name) DO UPDATE SET"
                 " include_completed=excluded.include_completed,"
                 " duration_minutes=excluded.duration_minutes,"
-                " find_zvs=excluded.find_zvs",
+                " tune_voltage=excluded.tune_voltage",
                 (
                     device_name,
                     int(bool(include_completed)),
                     float(duration_minutes),
-                    int(bool(find_zvs)),
+                    int(bool(tune_voltage)),
                 ),
             )
 
     def load_plan_selections(
         self, device_name: str
     ) -> Optional[tuple[dict[str, set[str]], bool, float, bool]]:
-        """``(selections, include_completed, duration, find_zvs)`` or None.
+        """``(selections, include_completed, duration, tune_voltage)`` or None.
 
         None means this device has never been planned for, which the planner
         treats as "select everything" — its existing default. An empty
@@ -928,7 +987,7 @@ class Database:
         """
         with self._lock:
             options = self._conn.execute(
-                "SELECT include_completed, duration_minutes, find_zvs"
+                "SELECT include_completed, duration_minutes, tune_voltage"
                 " FROM plan_options WHERE device_name=?",
                 (device_name,),
             ).fetchone()

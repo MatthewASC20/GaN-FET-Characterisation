@@ -10,7 +10,7 @@ import sqlite3
 
 from gan_fet.core.models import FinalReadings, MatrixPoint, RunRecord
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS runs (
     completed_at TEXT,
     status TEXT NOT NULL DEFAULT 'running',
     bus_voltage_v REAL,
-    v_zvs REAL,
+    tuned_voltage_v REAL,
     vin REAL, iin REAL, fsw_hz REAL, irms REAL, vds_pk REAL, isw_rms REAL,
     screenshot_path TEXT,
     attempt_no INTEGER NOT NULL DEFAULT 1,
@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS plan_options (
     device_name TEXT PRIMARY KEY,
     include_completed INTEGER NOT NULL DEFAULT 0,
     duration_minutes REAL NOT NULL DEFAULT 1.0,
-    find_zvs INTEGER NOT NULL DEFAULT 1
+    tune_voltage INTEGER NOT NULL DEFAULT 1
 );
 """
 
@@ -221,7 +221,7 @@ CREATE TABLE runs_v2 (
 RUN_COLUMNS = (
     "r.id, d.name, r.config, r.frequency_hz, r.duty_pct, r.temperature_c, "
     "r.voltage_v, r.duration_minutes, r.started_at, r.completed_at, r.status, "
-    "r.bus_voltage_v, r.v_zvs, r.vin, r.iin, r.fsw_hz, r.irms, r.vds_pk, "
+    "r.bus_voltage_v, r.tuned_voltage_v, r.vin, r.iin, r.fsw_hz, r.irms, r.vds_pk, "
     "r.isw_rms, r.screenshot_path, r.attempt_no, "
     "r.tuned_frequency_hz, r.tuned_input_power_w, r.sweep_direction, "
     "r.zvs_dwell_fraction"

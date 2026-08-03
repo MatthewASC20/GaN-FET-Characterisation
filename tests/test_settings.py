@@ -386,3 +386,60 @@ def test_experiment_params_do_not_tune_implicitly() -> None:
         duration_minutes=1.0,
     )
     assert params.tune_frequency is False
+
+
+def test_legacy_tuning_keys_fold_into_the_new_names(tmp_path):
+    """A settings.json from before the rename keeps its values.
+
+    ``zvs`` / ``find_zvs_before_run`` / ``show_zvs_voltage_sweep`` were the
+    persisted spellings before the tuning-vocabulary rename; loading must fold
+    them into the new keys rather than silently resetting the operator's
+    limits and preferences to defaults.
+    """
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "instruments": {
+                    "HDO4054": {
+                        "ip": "TCPIP0::192.0.2.50::inst0::INSTR",
+                        "port": 0,
+                    },
+                },
+                "zvs": {"step_v": 2.5, "window_v": 12.0},
+                "find_zvs_before_run": True,
+                "show_zvs_voltage_sweep": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = Settings.load(path)
+
+    assert loaded.voltage_tune.step_v == 2.5
+    assert loaded.voltage_tune.window_v == 12.0
+    assert loaded.tune_voltage_before_run is True
+    assert loaded.show_voltage_tune_controls is True
+
+
+def test_current_tuning_keys_win_over_legacy_ones(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "instruments": {
+                    "HDO4054": {
+                        "ip": "TCPIP0::192.0.2.50::inst0::INSTR",
+                        "port": 0,
+                    },
+                },
+                "voltage_tune": {"step_v": 3.0},
+                "zvs": {"step_v": 1.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = Settings.load(path)
+
+    assert loaded.voltage_tune.step_v == 3.0

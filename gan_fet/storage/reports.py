@@ -174,7 +174,7 @@ def generate_device_report(
 <h2>Completed runs</h2>
 <table>
 <tr><th>Config</th><th>Freq</th><th>Duty %</th><th>Temp °C</th><th>V target</th>
-<th>Bus V</th><th>V<sub>ZVS</sub></th><th>Vin</th><th>Iin (A)</th>
+<th>Bus V</th><th>Tuned V</th><th>Vin</th><th>Iin (A)</th>
 <th>fsw (MHz)</th><th>Irms (A)</th><th>Vds pk</th><th>Isw RMS</th></tr>
 {''.join(rows)}
 </table>

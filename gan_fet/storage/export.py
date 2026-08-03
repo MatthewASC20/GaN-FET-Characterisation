@@ -13,7 +13,7 @@ from gan_fet.storage.paths import device_output_path
 RUN_HEADER = [
     "Run ID", "Device", "Configuration", "Frequency (Hz)", "Duty (%)",
     "Temperature (°C)", "Voltage (V)", "Attempt", "Status", "Started",
-    "Completed", "Bus Voltage (V)", "V_ZVS (V)", "Vin (V)", "Iin (A)",
+    "Completed", "Bus Voltage (V)", "Tuned DC Voltage (V)", "Vin (V)", "Iin (A)",
     "fsw (Hz)", "Irms (A)", "Vds peak (V)", "Isw RMS (A)", "Screenshot",
 ]
 

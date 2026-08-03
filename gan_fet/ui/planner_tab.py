@@ -483,9 +483,7 @@ class PlannerTab(ttk.Frame):
                 duration_minutes=parse_positive_duration(
                     self.duration_entry.get()
                 ),
-                # save_plan_selections speaks schema names; find_zvs is the
-                # column until the storage migration renames it.
-                find_zvs=self.tune_voltage_var.get(),
+                tune_voltage=self.tune_voltage_var.get(),
             )
         except Exception:
             log.exception("Could not save the planner selections")

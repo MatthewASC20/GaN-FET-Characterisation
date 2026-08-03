@@ -371,8 +371,8 @@ class SmuLimitsEditor(ttk.LabelFrame):
         ("NPLC", "smu", "nplc", float),
         ("Sample interval (s)", "smu", "sample_interval_s", float),
         ("Ramp step (V)", "smu", "ramp_step_v", float),
-        ("DC voltage tune window (± V)", "zvs", "window_v", float),
-        ("DC voltage tune step (V)", "zvs", "step_v", float),
+        ("DC voltage tune window (± V)", "voltage_tune", "window_v", float),
+        ("DC voltage tune step (V)", "voltage_tune", "step_v", float),
         ("Max DC current (A)", "safety", "max_dc_current_a", float),
         ("Max Vds peak (V)", "safety", "max_vds_peak_v", float),
         ("Peak tolerance (V)", "peak_control", "tolerance_v", float),
@@ -461,7 +461,7 @@ class RampRatesSliderEditor(ttk.LabelFrame):
 
         # Frequency Autotune Ramp Rate (kHz/s)
         ttk.Label(self, text="Frequency Ramp Rate (kHz/s):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        current_freq_rate = getattr(self.settings.zvs, "autotune_freq_rate_khz_s", 200.0)
+        current_freq_rate = getattr(self.settings.voltage_tune, "autotune_freq_rate_khz_s", 200.0)
         self.freq_rate_var = tk.DoubleVar(value=current_freq_rate)
         self.freq_label = ttk.Label(self, text=f"{current_freq_rate:.0f} kHz/s", width=12)
         self.freq_label.grid(row=1, column=2, padx=5, pady=5)
@@ -571,12 +571,12 @@ class RampRatesSliderEditor(ttk.LabelFrame):
 
         updates = [
             (self.settings.smu, "ramp_rate_v_s", voltage),
-            (self.settings.zvs, "autotune_freq_rate_khz_s", frequency),
+            (self.settings.voltage_tune, "autotune_freq_rate_khz_s", frequency),
             (self.settings.wavegen, "freq_ramp_rate_khz_s", frequency),
             (self.settings.wavegen, "duty_ramp_rate_pct_s", duty),
         ]
-        if hasattr(self.settings.zvs, "duty_ramp_rate_pct_s"):
-            updates.append((self.settings.zvs, "duty_ramp_rate_pct_s", duty))
+        if hasattr(self.settings.voltage_tune, "duty_ramp_rate_pct_s"):
+            updates.append((self.settings.voltage_tune, "duty_ramp_rate_pct_s", duty))
 
         previous = [(section, attr, getattr(section, attr)) for section, attr, _ in updates]
         for section, attr, value in updates:

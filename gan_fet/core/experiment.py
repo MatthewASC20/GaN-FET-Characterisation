@@ -130,7 +130,7 @@ class ExperimentEngine:
         self.peak_controller = PeakVoltageController(
             smu, scope, settings.peak_control, safety
         )
-        self.voltage_tuner = VoltageTuner(smu, settings.zvs, safety, scope=scope)
+        self.voltage_tuner = VoltageTuner(smu, settings.voltage_tune, safety, scope=scope)
         self.frequency_tuner = FrequencyTuner(
             wavegen,
             smu,
@@ -591,9 +591,7 @@ class ExperimentEngine:
                 run_id,
                 readings,
                 bus_voltage_v=bus_voltage,
-                # complete_run speaks schema names; v_zvs is the column until
-                # the storage migration renames it.
-                v_zvs=tuned_voltage_v,
+                tuned_voltage_v=tuned_voltage_v,
                 screenshot_path=str(screenshot) if screenshot else None,
                 tuned_frequency_hz=(
                     None if tune_result is None else tune_result.frequency_hz

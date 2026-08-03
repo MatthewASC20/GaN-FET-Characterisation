@@ -393,12 +393,12 @@ class MainWindow(tk.Tk):
         self.duty_var = tk.IntVar(value=self._first("duties"))
         self.temperature_var = tk.IntVar(value=self._first("temperatures"))
         self.voltage_var = tk.IntVar(value=self._first("voltages"))
-        self.tune_voltage_var = tk.BooleanVar(value=self.settings.find_zvs_before_run)
+        self.tune_voltage_var = tk.BooleanVar(value=self.settings.tune_voltage_before_run)
         self.tune_frequency_var = tk.BooleanVar(
             value=self.settings.tune_frequency_at_operating_point
         )
         self.show_voltage_tune_var = tk.BooleanVar(
-            value=self.settings.show_zvs_voltage_sweep
+            value=self.settings.show_voltage_tune_controls
         )
 
     def _on_tune_frequency_toggled(self) -> None:
@@ -407,7 +407,7 @@ class MainWindow(tk.Tk):
         )
 
     def _on_show_voltage_tune_toggled(self) -> None:
-        self.settings.show_zvs_voltage_sweep = bool(self.show_voltage_tune_var.get())
+        self.settings.show_voltage_tune_controls = bool(self.show_voltage_tune_var.get())
         self._apply_voltage_tune_visibility()
         self._refresh_control_states()
 
@@ -1360,11 +1360,11 @@ class MainWindow(tk.Tk):
             "voltage": self.voltage_var.get(),
             "duration": self.run_controls.duration_entry.get(),
         }
-        self.settings.find_zvs_before_run = bool(self.tune_voltage_var.get())
+        self.settings.tune_voltage_before_run = bool(self.tune_voltage_var.get())
         self.settings.tune_frequency_at_operating_point = bool(
             self.tune_frequency_var.get()
         )
-        self.settings.show_zvs_voltage_sweep = bool(
+        self.settings.show_voltage_tune_controls = bool(
             self.show_voltage_tune_var.get()
         )
         self.settings.save()
