@@ -92,6 +92,12 @@ from gan_fet.ui.config_tab import (
 )
 from gan_fet.ui.analytics_tab import AnalyticsTab
 from gan_fet.ui.planner_tab import PlannerTab
+from gan_fet.ui.plan_store import (
+    ApplyAction,
+    PlanStore,
+    apply_plan_decision,
+    pending_points,
+)
 from gan_fet.ui.plot import LivePlot
 from gan_fet.ui.tracker_view import UpNextView
 from gan_fet.ui.widgets import (
@@ -216,6 +222,7 @@ class MainWindow(tk.Tk):
         self._closing = False
         self._resources_closed = False
         self.operations = OperationCoordinator()
+        self.plan_store = PlanStore()
         self._worker_pool = WorkerPool()
         # Built before the UI: it holds the operation lifecycle, so anything
         # that can claim the rig has to go through it from the start.
@@ -453,6 +460,7 @@ class MainWindow(tk.Tk):
             db=self.db,
             get_device_name=lambda: self.device_name_var.get(),
             on_start_sequence=self._start_planned_sequence,
+            on_apply_plan=self._apply_test_plan,
             on_delete_run=self.sheets.enqueue_clear,
             can_delete_run=lambda: not self.operations.busy and not self._closing,
         )
@@ -794,6 +802,7 @@ class MainWindow(tk.Tk):
                 self._values("voltages"),
                 self._values("temperatures"),
             ) if hasattr(self, "frequency_var") else None,
+            plan_store=self.plan_store,
         )
         self.up_next_view.grid(row=0, column=0, sticky="nsew")
 
@@ -1815,21 +1824,32 @@ class MainWindow(tk.Tk):
         params = self._build_params()
         if params is None:
             return
-        plan = build_plan(
-            self.db,
-            params.point.device_name,
-            params.point.frequency_hz,
-            configs=self._values("configurations"),
-            duties=self._values("duties"),
-            voltages=self._values("voltages"),
-            temperatures=self._values("temperatures"),
-        )
-        if not plan:
-            messagebox.showwarning(
-                "Auto Sequence",
-                "All parameter combinations at this frequency are already complete.",
-                parent=self,
+        # Whatever the queue is showing is what runs. With a plan applied the
+        # Experiment tab's selectors are not consulted at all, which is the
+        # point of applying one.
+        applied = self.plan_store.applied
+        if applied is not None:
+            plan = pending_points(applied, self._completed_keys(applied))
+            empty_message = (
+                "Every point in the applied test plan has already been "
+                "measured. Apply a new plan, or clear this one."
             )
+        else:
+            plan = build_plan(
+                self.db,
+                params.point.device_name,
+                params.point.frequency_hz,
+                configs=self._values("configurations"),
+                duties=self._values("duties"),
+                voltages=self._values("voltages"),
+                temperatures=self._values("temperatures"),
+            )
+            empty_message = (
+                "All parameter combinations at this frequency are already "
+                "complete."
+            )
+        if not plan:
+            messagebox.showwarning("Auto Sequence", empty_message, parent=self)
             return
         if not messagebox.askyesno(
             "Start Auto Sequence",
@@ -1856,6 +1876,51 @@ class MainWindow(tk.Tk):
             messagebox.showerror(
                 "Auto Sequence", "The sequence could not start.", parent=self
             )
+
+    def _completed_keys(self, applied) -> set:
+        """Which points of ``applied`` the database already has runs for."""
+        device = self.device_name_var.get().strip()
+        keys: set = set()
+        for frequency in {pt.frequency_hz for pt in applied.points}:
+            for config, duty, voltage, temp in self.db.completed_points(
+                device, frequency
+            ):
+                keys.add((frequency, config, duty, voltage, temp))
+        return keys
+
+    def _apply_test_plan(self, plan_summary: Any) -> bool:
+        """Make the planner's plan the one the queue shows and the rig runs."""
+        points = [item.point for item in getattr(plan_summary, "points", [])]
+        decision = apply_plan_decision(
+            point_count=len(points),
+            sequence_running=(
+                self.operations.active_kind == "sequence" or self.sequence.active
+            ),
+            existing=self.plan_store.applied,
+        )
+        if decision.action is ApplyAction.REFUSE:
+            messagebox.showwarning(
+                decision.title, decision.message, parent=self
+            )
+            return False
+        if decision.action is not ApplyAction.APPLY:
+            if not messagebox.askyesno(
+                decision.title, decision.message, icon="warning", parent=self
+            ):
+                return False
+        if decision.action is ApplyAction.CONFIRM_STOP_AND_APPLY:
+            # Stop before storing, so the queue never describes a plan the
+            # running sequence is not executing.
+            self._cancel_experiment()
+        self.plan_store.apply(points, source="Planner")
+        if hasattr(self, "up_next_view"):
+            self.up_next_view.refresh()
+        self.status_bar.set_message(
+            f"Test plan applied: {len(points)} point(s). "
+            "The Experiment tab queue now follows this plan."
+        )
+        self._refresh_control_states()
+        return True
 
     def _start_planned_sequence(
         self, plan_summary: Any, duration_minutes: float, find_zvs: bool

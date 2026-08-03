@@ -11,6 +11,7 @@ from typing import Callable, List, Optional, Tuple
 
 from gan_fet.core.models import MatrixPoint, RunRecord, freq_label
 from gan_fet.storage.db import Database
+from gan_fet.ui.plan_store import pending_points, queue_heading
 
 
 def _sample_plot_axis(
@@ -398,12 +399,16 @@ class UpNextView(ttk.LabelFrame):
         db: Database,
         get_device_name: Callable[[], str],
         get_current_params: Callable[[], Optional[Tuple[int, list, list, list, list]]],
+        plan_store=None,
         **kwargs,
     ):
         super().__init__(master, text="Auto Testing Queue (Next 5 Tests)", **kwargs)
         self.db = db
         self.get_device_name = get_device_name
         self.get_current_params = get_current_params
+        # When a plan has been applied, it is what runs, so it is what this
+        # shows. Without one the live matrix drives the queue as before.
+        self.plan_store = plan_store
 
         self._build_ui()
 
@@ -442,6 +447,11 @@ class UpNextView(ttk.LabelFrame):
         params = self.get_current_params()
         self.tree.delete(*self.tree.get_children())
 
+        applied = getattr(self.plan_store, "applied", None)
+        if applied is not None:
+            self._show_applied(applied)
+            return
+
         if not device or not params:
             self.status_lbl.config(text="Select a device to view scheduled tests.")
             return
@@ -471,7 +481,30 @@ class UpNextView(ttk.LabelFrame):
             text=f"Next {len(next_5)} test(s) to execute ({total_pending} total pending for {device} @ {freq_label(frequency_hz)}):"
         )
 
-        for idx, pt in enumerate(next_5, start=1):
+        self._fill(next_5)
+
+    def _show_applied(self, applied) -> None:
+        """Render the applied plan, skipping points already measured.
+
+        Completed points are dropped rather than struck through: this is a
+        queue of what is left to run, and a plan half-finished from a previous
+        session should not look like it is about to repeat itself.
+        """
+        completed: set = set()
+        for frequency in {pt.frequency_hz for pt in applied.points}:
+            for config, duty, voltage, temp in self.db.completed_points(
+                self.get_device_name().strip(), frequency
+            ):
+                completed.add((frequency, config, duty, voltage, temp))
+        pending = pending_points(applied, completed)
+        next_5 = pending[:5]
+        self.status_lbl.config(
+            text=queue_heading(applied, len(pending), len(next_5), "")
+        )
+        self._fill(next_5)
+
+    def _fill(self, points) -> None:
+        for idx, pt in enumerate(points, start=1):
             self.tree.insert(
                 "",
                 "end",

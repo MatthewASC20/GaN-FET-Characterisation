@@ -96,6 +96,7 @@ class PlannerTab(ttk.Frame):
         db: Database,
         get_device_name: Callable[[], str],
         on_start_sequence: Callable[[PlanSummary, float, bool], None],
+        on_apply_plan: Callable[[Optional[PlanSummary]], bool],
         on_delete_run: Optional[Callable[[MatrixPoint], None]] = None,
         can_delete_run: Optional[Callable[[], bool]] = None,
     ):
@@ -103,6 +104,7 @@ class PlannerTab(ttk.Frame):
         self.db = db
         self.get_device_name = get_device_name
         self.on_start_sequence = on_start_sequence
+        self.on_apply_plan = on_apply_plan
         self.on_delete_run = on_delete_run
         self.can_delete_run = can_delete_run
 
@@ -189,10 +191,14 @@ class PlannerTab(ttk.Frame):
             variable=self.find_zvs_var,
         ).pack(side="left", padx=15)
 
+        # The plan is already rebuilt live on every selection change, so
+        # there is nothing for a "generate" button to do. Applying is the
+        # action that matters: it makes this plan the one the Experiment tab
+        # queue shows and the one the sequence runs.
         self.generate_btn = ttk.Button(
             ctrl_frame,
-            text="Generate Test Plan",
-            command=self.generate_plan,
+            text="Apply Test Plan",
+            command=self._apply_plan,
         )
         self.generate_btn.pack(side="right", padx=10)
 
@@ -438,6 +444,11 @@ class PlannerTab(ttk.Frame):
         self.run_btn.config(state="normal" if has_runnable_points else "disabled")
         self.export_btn.config(state="normal" if has_runnable_points else "disabled")
 
+    def _apply_plan(self) -> None:
+        """Make the current plan the one the rig is working from."""
+        plan = self.generate_plan(show_errors=True)
+        self.on_apply_plan(plan)
+
     def _start_sequence(self) -> None:
         # Rebuild at click time so edits made after the last explicit
         # "Generate" action can never launch a stale matrix.
@@ -457,6 +468,10 @@ class PlannerTab(ttk.Frame):
             return
 
         find_zvs = self.find_zvs_var.get()
+        # Apply first: starting switches to the Experiment tab, and its queue
+        # has to describe the sequence that is about to run rather than a
+        # matrix rebuilt from that tab's own selectors.
+        self.on_apply_plan(plan)
         self.on_start_sequence(plan, duration, find_zvs)
 
     def _export_csv(self) -> None:
