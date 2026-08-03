@@ -491,14 +491,16 @@ class UpNextView(ttk.LabelFrame):
     def _show_applied(self, applied) -> None:
         """Render the outstanding points of the applied plan.
 
-        No run-table lookup: the stored plan is already the remaining work,
-        because each point is deleted as its run completes. Subtracting the
-        run table here as well would hide the one case the planner's re-test
-        option exists for — points deliberately queued again despite already
-        having runs.
+        No run-table lookup: the stored plan records its own progress.
+        Subtracting the run table here as well would hide the one case the
+        planner's re-test option exists for — points deliberately queued again
+        despite already having runs.
+
+        The selected device is passed so a plan belonging to another part says
+        so instead of quietly listing work that will be refused.
         """
         try:
-            contents = applied_queue(applied)
+            contents = applied_queue(applied, self.get_device_name().strip())
         except Exception:
             # A blank table and an unchanged heading is what this used to look
             # like, which reads as "the plan is empty" rather than "something

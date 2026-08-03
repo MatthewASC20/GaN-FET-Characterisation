@@ -24,6 +24,7 @@ from gan_fet.core.models import (
 )
 from gan_fet.storage.schema import (
     ADDED_COLUMNS,
+    PLAN_TABLES_V8,
     RUN_COLUMNS,
     RUN_NATURAL_KEY_COLUMNS,
     RUNS_WITHOUT_LEGACY_UNIQUE,
@@ -174,6 +175,15 @@ class Database:
         if "elapsed_s" not in sample_columns:
             self._migrate_samples_add_elapsed()
 
+        plan_columns = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(plan_points)"
+            ).fetchall()
+        }
+        if "slot" in plan_columns:
+            self._migrate_plans_drop_slot()
+
         self._migrate_added_columns()
 
         with self._conn:
@@ -230,6 +240,53 @@ class Database:
                 table,
                 ", ".join(name for name, _ in missing),
             )
+
+    def _migrate_plans_drop_slot(self) -> None:
+        """Schema 7 kept two plans in one table, discriminated by ``slot``.
+
+        The 'draft' slot was never read — it held the planner's expanded
+        cross-product, rewritten on every click — and is replaced by
+        ``plan_selections``. The 'applied' rows are the operator's actual
+        plan and are carried across in order.
+
+        ``CREATE TABLE IF NOT EXISTS`` in ``SCHEMA`` has already run by this
+        point and did nothing, because the old tables exist under the same
+        names. So the rebuild is explicit: rename, recreate, copy, drop.
+        """
+        self._net_lock.assert_owned()
+        with self._conn:
+            carried = self._conn.execute(
+                "SELECT device_name, config, frequency_hz, duty_pct,"
+                " temperature_c, voltage_v FROM plan_points"
+                " WHERE slot='applied' ORDER BY position"
+            ).fetchall()
+            meta = self._conn.execute(
+                "SELECT source, device_name FROM plan_meta WHERE slot='applied'"
+            ).fetchone()
+
+            self._conn.execute("DROP TABLE plan_points")
+            self._conn.execute("DROP TABLE plan_meta")
+            self._conn.executescript(PLAN_TABLES_V8)
+
+            if carried:
+                self._conn.executemany(
+                    "INSERT INTO plan_points(position, device_name, config,"
+                    " frequency_hz, duty_pct, temperature_c, voltage_v)"
+                    " VALUES (?,?,?,?,?,?,?)",
+                    [(i, *row) for i, row in enumerate(carried)],
+                )
+            if meta is not None:
+                self._conn.execute(
+                    "INSERT INTO plan_meta(id, source, device_name)"
+                    " VALUES (1,?,?)",
+                    (meta[0], meta[1]),
+                )
+            self._net_lock.assert_owned()
+        log.info(
+            "migrated test plans to schema 8: carried %d applied point(s), "
+            "discarded the unread draft slot",
+            len(carried),
+        )
 
     def _migrate_samples_add_elapsed(self) -> None:
         """Add nullable active elapsed time without rewriting legacy samples."""
@@ -723,14 +780,13 @@ class Database:
 
     def save_plan(
         self,
-        slot: str,
         points: Iterable[MatrixPoint],
         *,
         source: str,
         device_name: str,
-        total_count: Optional[int] = None,
+        completed: Iterable[int] = (),
     ) -> None:
-        """Replace the whole of ``slot`` with ``points``, in order.
+        """Replace the applied plan with ``points``, in order.
 
         Wholesale replacement rather than a diff. A plan is one statement of
         intent, and a partially-updated one is a plan nobody asked for — the
@@ -738,62 +794,59 @@ class Database:
         reason about. Position is stored explicitly because the run order is
         part of what was applied, not an artefact of row insertion.
 
-        The meta row is written even when ``points`` is empty, so a plan
-        drained to its last point still reports as complete rather than as
-        absent. ``total_count`` defaults to the number of points, which is
-        right at apply time; a draining caller passes the original total.
+        ``completed`` holds positions already measured, so re-saving a
+        part-finished plan does not resurrect its finished points.
 
         The delete and the insert share a transaction, so a crash mid-save
         leaves the previous plan intact rather than half of two.
         """
-        rows = [
-            (
-                slot, position, point.device_name, point.config,
-                point.frequency_hz, point.duty_pct, point.temperature_c,
-                point.voltage_v,
-            )
-            for position, point in enumerate(points)
-        ]
-        if total_count is None:
-            total_count = len(rows)
+        done = set(completed)
         with self.transaction() as conn:
-            conn.execute("DELETE FROM plan_points WHERE slot=?", (slot,))
-            conn.execute("DELETE FROM plan_meta WHERE slot=?", (slot,))
+            # Taken from SQLite rather than the client so plan timestamps
+            # agree with every other datetime('now') default in the schema.
+            now = conn.execute("SELECT datetime('now')").fetchone()[0]
+            rows = [
+                (
+                    position, point.device_name, point.config,
+                    point.frequency_hz, point.duty_pct, point.temperature_c,
+                    point.voltage_v, now if position in done else None,
+                )
+                for position, point in enumerate(points)
+            ]
+            conn.execute("DELETE FROM plan_points")
+            conn.execute("DELETE FROM plan_meta")
             if rows:
                 conn.executemany(
-                    "INSERT INTO plan_points(slot, position, device_name,"
-                    " config, frequency_hz, duty_pct, temperature_c,"
-                    " voltage_v) VALUES (?,?,?,?,?,?,?,?)",
+                    "INSERT INTO plan_points(position, device_name, config,"
+                    " frequency_hz, duty_pct, temperature_c, voltage_v,"
+                    " completed_at) VALUES (?,?,?,?,?,?,?,?)",
                     rows,
                 )
             conn.execute(
-                "INSERT INTO plan_meta(slot, source, device_name, total_count)"
-                " VALUES (?,?,?,?)",
-                (slot, source, device_name, int(total_count)),
+                "INSERT INTO plan_meta(id, source, device_name)"
+                " VALUES (1,?,?)",
+                (source, device_name),
             )
 
     def load_plan(
-        self, slot: str
-    ) -> Optional[tuple[list[MatrixPoint], str, str, int]]:
-        """``(points, source, device_name, total_count)``, or None if unset.
+        self,
+    ) -> Optional[tuple[list[MatrixPoint], set[int], str, str]]:
+        """``(points, completed_positions, source, device_name)``, or None.
 
-        None and an empty point list are deliberately different: no plan is
-        not the same as a plan with nothing left in it, and conflating them is
-        what made a finished plan look like a broken table.
+        None means no plan has been applied, and stays distinct from a plan
+        whose points are all complete. Conflating the two is what made a
+        finished plan look like a broken table.
         """
         with self._lock:
             meta = self._conn.execute(
-                "SELECT source, device_name, total_count FROM plan_meta"
-                " WHERE slot=?",
-                (slot,),
+                "SELECT source, device_name FROM plan_meta WHERE id=1"
             ).fetchone()
             if meta is None:
                 return None
             rows = self._conn.execute(
                 "SELECT device_name, config, frequency_hz, duty_pct,"
-                " temperature_c, voltage_v FROM plan_points"
-                " WHERE slot=? ORDER BY position",
-                (slot,),
+                " temperature_c, voltage_v, completed_at, position"
+                " FROM plan_points ORDER BY position"
             ).fetchall()
         points = [
             MatrixPoint(
@@ -806,13 +859,94 @@ class Database:
             )
             for row in rows
         ]
-        return points, str(meta[0]), str(meta[1]), int(meta[2])
+        completed = {int(row[7]) for row in rows if row[6] is not None}
+        return points, completed, str(meta[0]), str(meta[1])
 
-    def clear_plan(self, slot: str) -> None:
-        """Forget ``slot`` entirely, so loading it returns None."""
+    def clear_plan(self) -> None:
+        """Forget the applied plan, so loading it returns None."""
         with self.transaction() as conn:
-            conn.execute("DELETE FROM plan_points WHERE slot=?", (slot,))
-            conn.execute("DELETE FROM plan_meta WHERE slot=?", (slot,))
+            conn.execute("DELETE FROM plan_points")
+            conn.execute("DELETE FROM plan_meta")
+
+    # -- planner selections --------------------------------------------
+
+    def save_plan_selections(
+        self,
+        device_name: str,
+        selections: dict[str, Iterable[Any]],
+        *,
+        include_completed: bool = False,
+        duration_minutes: float = 1.0,
+        find_zvs: bool = True,
+    ) -> None:
+        """Remember which parameters are ticked, for ``device_name``.
+
+        Per device, because that is the unit the operator thinks in: coming
+        back to a part should bring back the matrix that was being worked on
+        for it, not whatever was selected for a different one.
+        """
+        rows = [
+            (device_name, kind, str(value))
+            for kind, values in selections.items()
+            for value in values
+        ]
+        with self.transaction() as conn:
+            conn.execute(
+                "DELETE FROM plan_selections WHERE device_name=?",
+                (device_name,),
+            )
+            if rows:
+                conn.executemany(
+                    "INSERT INTO plan_selections(device_name, kind, value)"
+                    " VALUES (?,?,?)",
+                    rows,
+                )
+            conn.execute(
+                "INSERT INTO plan_options(device_name, include_completed,"
+                " duration_minutes, find_zvs) VALUES (?,?,?,?)"
+                " ON CONFLICT(device_name) DO UPDATE SET"
+                " include_completed=excluded.include_completed,"
+                " duration_minutes=excluded.duration_minutes,"
+                " find_zvs=excluded.find_zvs",
+                (
+                    device_name,
+                    int(bool(include_completed)),
+                    float(duration_minutes),
+                    int(bool(find_zvs)),
+                ),
+            )
+
+    def load_plan_selections(
+        self, device_name: str
+    ) -> Optional[tuple[dict[str, set[str]], bool, float, bool]]:
+        """``(selections, include_completed, duration, find_zvs)`` or None.
+
+        None means this device has never been planned for, which the planner
+        treats as "select everything" — its existing default. An empty
+        selection for a device that *has* been planned is a real state and is
+        returned as such.
+        """
+        with self._lock:
+            options = self._conn.execute(
+                "SELECT include_completed, duration_minutes, find_zvs"
+                " FROM plan_options WHERE device_name=?",
+                (device_name,),
+            ).fetchone()
+            if options is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT kind, value FROM plan_selections WHERE device_name=?",
+                (device_name,),
+            ).fetchall()
+        selections: dict[str, set[str]] = {}
+        for kind, value in rows:
+            selections.setdefault(str(kind), set()).add(str(value))
+        return (
+            selections,
+            bool(options[0]),
+            float(options[1]),
+            bool(options[2]),
+        )
 
     # -- samples -------------------------------------------------------
 

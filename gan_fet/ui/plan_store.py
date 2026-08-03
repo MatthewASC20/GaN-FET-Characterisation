@@ -15,24 +15,27 @@ It is stored in SQLite rather than held only in memory. A plan is a statement
 of intent about hours of bench time, and losing it to a restart meant
 rebuilding it from memory and hoping the selections matched.
 
+Measured points are *marked*, not removed. The queue drains on screen, but the
+plan survives being finished, so it can be inspected afterwards or applied to
+the next part.
+
 No tkinter: the window renders what this decides.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Optional, Protocol, Sequence
+from typing import Any, Iterable, Optional, Protocol, Sequence
 
 from gan_fet.core.models import MatrixPoint
-from gan_fet.storage.schema import PLAN_SLOT_APPLIED
 
 log = logging.getLogger(__name__)
 
 
 class PlanBackend(Protocol):
-    """The three operations :class:`PlanStore` needs from storage.
+    """The operations :class:`PlanStore` needs from storage.
 
     Narrower than :class:`~gan_fet.storage.db.Database` so the store can be
     exercised without one.
@@ -40,28 +43,28 @@ class PlanBackend(Protocol):
 
     def save_plan(
         self,
-        slot: str,
         points: Sequence[MatrixPoint],
         *,
         source: str,
         device_name: str,
-        total_count: Optional[int] = None,
+        completed: Iterable[int] = (),
     ) -> None: ...
 
     def load_plan(
-        self, slot: str
-    ) -> Optional[tuple[list[MatrixPoint], str, str, int]]: ...
+        self,
+    ) -> Optional[tuple[list[MatrixPoint], set[int], str, str]]: ...
 
-    def clear_plan(self, slot: str) -> None: ...
+    def clear_plan(self) -> None: ...
 
 
 @dataclass(frozen=True)
 class AppliedPlan:
     """A plan the operator deliberately chose, and where it came from.
 
-    ``points`` is what is *left*. Each one is removed as its run completes,
-    so this is a work queue that drains rather than a static list with a
-    status column — which is why ``total_count`` is carried separately.
+    ``points`` is the *whole* plan, in run order, and ``completed`` holds the
+    positions already measured. Keeping the finished points means the plan can
+    still answer "what was in that?" after the last one is done — which a
+    queue that deleted as it drained could not.
     """
 
     points: tuple[MatrixPoint, ...]
@@ -70,20 +73,39 @@ class AppliedPlan:
     source: str
     #: The device the plan was built for. Held explicitly rather than read
     #: from the Experiment tab's selector: a persisted plan outlives the
-    #: selection that made it, and a plan drained against the wrong device
-    #: would discard points that were never measured on this part.
+    #: selection that made it, and running it against a different part would
+    #: record that part's runs with this one's parameters.
     device_name: str = ""
-    #: How many points were applied originally. Without it a fully drained
-    #: plan could only say "0 remaining", which reads as a fault rather than
-    #: as the job being finished.
-    total_count: int = 0
+    #: Positions in ``points`` that have been measured.
+    completed: frozenset[int] = field(default_factory=frozenset)
 
     def __len__(self) -> int:
         return len(self.points)
 
     @property
+    def total_count(self) -> int:
+        return len(self.points)
+
+    @property
     def completed_count(self) -> int:
-        return max(0, self.total_count - len(self.points))
+        return len(self.completed)
+
+    @property
+    def pending(self) -> tuple[MatrixPoint, ...]:
+        """What is left to run, in order."""
+        return tuple(
+            point
+            for position, point in enumerate(self.points)
+            if position not in self.completed
+        )
+
+    def is_for(self, device_name: str) -> bool:
+        """Whether this plan belongs to ``device_name``.
+
+        An unnamed plan matches anything: plans stored before the device was
+        recorded, and the headless tests, must not be locked out.
+        """
+        return not self.device_name or self.device_name == device_name.strip()
 
 
 class PlanStore:
@@ -97,15 +119,9 @@ class PlanStore:
     a database. In the application it is always the live :class:`Database`.
     """
 
-    def __init__(
-        self,
-        backend: Optional[PlanBackend] = None,
-        *,
-        slot: str = PLAN_SLOT_APPLIED,
-    ) -> None:
+    def __init__(self, backend: Optional[PlanBackend] = None) -> None:
         self._applied: Optional[AppliedPlan] = None
         self._backend = backend
-        self._slot = slot
 
     @property
     def applied(self) -> Optional[AppliedPlan]:
@@ -132,9 +148,7 @@ class PlanStore:
         """
         if not device_name and points:
             device_name = points[0].device_name
-        self._applied = AppliedPlan(
-            tuple(points), source, device_name, total_count=len(points)
-        )
+        self._applied = AppliedPlan(tuple(points), source, device_name)
         self._persist(self._applied)
         return self._applied
 
@@ -144,60 +158,73 @@ class PlanStore:
         self._persist(None)
 
     def complete_point(self, point: Optional[MatrixPoint]) -> bool:
-        """Drop ``point`` from the queue now that it has been measured.
+        """Mark ``point`` measured, taking it out of the queue.
 
-        Called when a run finishes, so the stored plan is the outstanding work
-        and nothing else. Persisting the drain rather than recomputing it is
-        what lets a sequence interrupted by a crash resume where it stopped
-        instead of re-deciding from the run table — which would re-run any
-        point the operator had deliberately queued for a re-test.
+        Called when a run finishes. Marking rather than deleting keeps the
+        finished plan inspectable; the queue drains because the table shows
+        ``pending``. Persisting it here rather than recomputing from the run
+        table is what lets a sequence interrupted by a crash resume where it
+        stopped — and recomputing would re-run any point the operator had
+        deliberately queued for a re-test.
 
-        Returns whether anything was removed, so a caller can skip a redraw.
+        The *first* outstanding match is marked. A plan may legitimately queue
+        the same point twice; completing one run must not tick off both.
+
+        Returns whether anything changed, so a caller can skip a redraw.
         """
         if point is None or self._applied is None:
             return False
         key = _key(point)
-        remaining = tuple(
-            candidate
-            for candidate in self._applied.points
-            if _key(candidate) != key
+        position = next(
+            (
+                index
+                for index, candidate in enumerate(self._applied.points)
+                if _key(candidate) == key
+                and index not in self._applied.completed
+            ),
+            None,
         )
-        if len(remaining) == len(self._applied.points):
+        if position is None:
             return False
         self._applied = AppliedPlan(
-            remaining,
+            self._applied.points,
             self._applied.source,
             self._applied.device_name,
-            total_count=self._applied.total_count,
+            self._applied.completed | {position},
         )
+        # Through the same full save as everything else. A surgical UPDATE
+        # would be less work, but it is a second write path that can disagree
+        # with the first, and a point takes a minute of bench time to measure
+        # — the few milliseconds this costs are not worth a way for the stored
+        # plan and the plan in memory to diverge.
         self._persist(self._applied)
         return True
 
     def restore(self) -> Optional[AppliedPlan]:
         """Reload the plan saved by a previous session, if any.
 
-        Called once at startup. A stored plan drained to nothing is restored
-        as such rather than discarded: "every point is measured" is a real
-        state the operator reached, and dropping it back to "no plan applied"
-        would misreport what happened.
+        Called once at startup. A plan whose points are all measured is
+        restored as such rather than discarded: "the job is finished" is a
+        real state the operator reached, and dropping it back to "no plan
+        applied" would misreport what happened.
         """
         if self._backend is None:
             return None
         try:
-            stored = self._backend.load_plan(self._slot)
+            stored = self._backend.load_plan()
         except Exception:
             log.exception("Could not load the saved test plan")
             return None
         if stored is None:
             return None
-        points, source, device_name, total_count = stored
+        points, completed, source, device_name = stored
         self._applied = AppliedPlan(
-            tuple(points), source, device_name, total_count=total_count
+            tuple(points), source, device_name, frozenset(completed)
         )
         log.info(
             "Restored applied test plan: %d of %d point(s) left for %s (%s)",
+            len(self._applied.pending),
             len(points),
-            total_count,
             device_name or "unknown device",
             source,
         )
@@ -215,14 +242,13 @@ class PlanStore:
             return
         try:
             if plan is None:
-                self._backend.clear_plan(self._slot)
+                self._backend.clear_plan()
             else:
                 self._backend.save_plan(
-                    self._slot,
                     plan.points,
-                    total_count=plan.total_count,
                     source=plan.source,
                     device_name=plan.device_name,
+                    completed=plan.completed,
                 )
         except Exception:
             log.exception(
@@ -330,13 +356,12 @@ def measured_point(outcome: Any, success: bool) -> Optional[MatrixPoint]:
 def pending_points(applied: AppliedPlan) -> list[MatrixPoint]:
     """What the sequence has left to run.
 
-    Now simply the stored plan: points are removed as their runs complete, so
-    the queue *is* the outstanding work. It used to be recomputed by
-    subtracting the run table from the plan on every read, which meant a
+    Read straight off the stored plan, which records its own progress. It used
+    to be recomputed by subtracting the run table on every read, which meant a
     re-test plan — points deliberately queued again despite already having
     runs — filtered itself down to nothing before it could start.
     """
-    return list(applied.points)
+    return list(applied.pending)
 
 
 @dataclass(frozen=True)
@@ -358,15 +383,17 @@ class QueueContents:
 def plan_rows(applied: AppliedPlan) -> list[PlanRow]:
     """The outstanding points, in run order.
 
-    All pending by construction: a measured point is deleted from the stored
-    plan rather than marked. The flag is carried anyway so these rows render
-    through the same table code as the planner's listing, where completed
-    points *are* shown.
+    All pending: measured points are marked in the stored plan and filtered
+    out here, so the table drains as the sequence works through it. The flag
+    is carried anyway so these rows render through the same table code as the
+    planner's listing, where completed points *are* shown.
     """
-    return [PlanRow(point, False) for point in applied.points]
+    return [PlanRow(point, False) for point in applied.pending]
 
 
-def applied_queue(applied: AppliedPlan) -> QueueContents:
+def applied_queue(
+    applied: AppliedPlan, selected_device: str = ""
+) -> QueueContents:
     """Rows and heading for an applied plan.
 
     Extracted from the widget because a blank table is indistinguishable from
@@ -374,7 +401,7 @@ def applied_queue(applied: AppliedPlan) -> QueueContents:
     the application. Now it can be exercised without a display.
     """
     rows = plan_rows(applied)
-    return QueueContents(rows, queue_heading(applied, len(rows)))
+    return QueueContents(rows, queue_heading(applied, selected_device))
 
 
 #: Shown when no plan has been applied. The queue is empty because nothing has
@@ -385,7 +412,22 @@ NO_PLAN_HEADING = (
 )
 
 
-def queue_heading(applied: Optional[AppliedPlan], pending: int) -> str:
+def wrong_device_heading(applied: AppliedPlan, selected_device: str) -> str:
+    """Said when the applied plan belongs to a different part.
+
+    Names both devices. "Wrong device" alone leaves the operator to work out
+    which of the two is wrong, and the answer is not always the plan.
+    """
+    return (
+        f"This plan was built for {applied.device_name}, but "
+        f"{selected_device} is selected. It will not run against a different "
+        f"part — select {applied.device_name} again, or clear the plan."
+    )
+
+
+def queue_heading(
+    applied: Optional[AppliedPlan], selected_device: str = ""
+) -> str:
     """The Planned Tests heading.
 
     There is no computed fallback. The table shows the plan the operator
@@ -394,21 +436,24 @@ def queue_heading(applied: Optional[AppliedPlan], pending: int) -> str:
     enough like a real plan that "Clear Plan" appeared broken when it correctly
     reported there was none.
 
-    The three states are worded so they cannot be confused for one another: an
-    empty table now means "no plan", and only that.
+    The states are worded so they cannot be confused for one another: an empty
+    table means "no plan", and only that.
     """
     if applied is None:
         return NO_PLAN_HEADING
+    if selected_device and not applied.is_for(selected_device):
+        return wrong_device_heading(applied, selected_device)
     total = applied.total_count
     if total == 0:
         return f"Applied plan is empty ({applied.source}) — nothing to run."
+    pending = len(applied.pending)
     if pending <= 0:
         return f"Applied plan complete — all {total} points measured."
     done = total - pending
     if done > 0:
         return (
             f"{pending} of {total} points left to run ({applied.source}); "
-            f"{done} completed and removed from this list."
+            f"{done} completed."
         )
     return f"{pending} test(s) to run, in order ({applied.source})."
 
@@ -462,12 +507,17 @@ class StartAction(Enum):
     OFFER_PLANNER = auto()
     #: The applied plan has no points left.
     ALREADY_COMPLETE = auto()
+    #: The plan belongs to a different device. Refuse.
+    WRONG_DEVICE = auto()
     #: Run it.
     START = auto()
 
 
 def start_sequence_decision(
-    *, applied: Optional[AppliedPlan], pending: int
+    *,
+    applied: Optional[AppliedPlan],
+    pending: int,
+    selected_device: str = "",
 ) -> ApplyDecision:
     """Decide what starting a sequence should do.
 
@@ -475,6 +525,12 @@ def start_sequence_decision(
     told no. Refusing alone leaves them to work out for themselves that the
     queue is fed from another tab, which is exactly the confusion the implicit
     cross-product used to hide.
+
+    A plan built for a different device is refused outright, not offered as a
+    confirmation. Now that plans persist, one can outlive the selection that
+    made it by days; running it would drive the mounted part with another
+    part's frequencies and voltages and record the results against the
+    mounted one. Nothing about the resulting data would look wrong.
     """
     if applied is None:
         return ApplyDecision(
@@ -482,6 +538,17 @@ def start_sequence_decision(
             "No Test Plan",
             "There is no test plan to run.\n\n"
             "Open the Test Planner to build one?",
+        )
+    if selected_device and not applied.is_for(selected_device):
+        return ApplyDecision(
+            StartAction.WRONG_DEVICE,
+            "Wrong Device",
+            f"The applied test plan was built for {applied.device_name}, "
+            f"but {selected_device} is selected.\n\n"
+            "Running it would drive this part with another part's "
+            "parameters and record the results against this one.\n\n"
+            f"Select {applied.device_name} again, or clear the plan and "
+            "build a new one.",
         )
     if pending <= 0:
         return ApplyDecision(

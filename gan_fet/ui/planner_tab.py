@@ -8,12 +8,11 @@ import csv
 import logging
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from gan_fet.core.models import MatrixPoint, freq_label, sanitize_device_name
 from gan_fet.core.sequence import PlanSummary, build_matrix_plan
 from gan_fet.storage.db import Database
-from gan_fet.storage.schema import PLAN_SLOT_DRAFT
 from gan_fet.ui.plan_table import (
     PLAN_COLUMN_IDS,
     configure_plan_tree,
@@ -88,6 +87,23 @@ class MultiSelectBox(ttk.LabelFrame):
         indices = self.listbox.curselection()
         return [self.options[i][0] for i in indices if i < len(self.options)]
 
+    def set_selected_values(self, values: Iterable[Any]) -> None:
+        """Tick exactly ``values``, silently.
+
+        Compared as strings because a restored selection comes back from
+        SQLite as text, and because the option list is keyed by value rather
+        than by index — an option removed from the device's configuration
+        since the selection was saved is simply not ticked, instead of
+        shifting every subsequent tick by one.
+
+        Fires no callback: the caller is restoring state, not editing it.
+        """
+        wanted = {str(value) for value in values}
+        self.listbox.selection_clear(0, tk.END)
+        for index, (value, _label) in enumerate(self.options):
+            if str(value) in wanted:
+                self.listbox.select_set(index)
+
     def _on_select(self, _event) -> None:
         if self.on_selection_changed:
             self.on_selection_changed()
@@ -123,6 +139,9 @@ class PlannerTab(ttk.Frame):
         }
         self.select_boxes: Dict[str, MultiSelectBox] = {}
         self.current_plan: Optional[PlanSummary] = None
+        #: What was last written to ``plan_selections``, so a rebuild that
+        #: changed nothing costs no write.
+        self._saved_selection_state: tuple = ()
 
         self._building_ui = True
         self._build_ui()
@@ -309,6 +328,9 @@ class PlannerTab(ttk.Frame):
         try:
             for key, box in self.select_boxes.items():
                 box.set_options(self.param_options[key], select_all_by_default=True)
+            # After the options exist, not before: restoring ticks a subset of
+            # what is on offer, so the offer has to be in place first.
+            self._restore_selections()
         finally:
             self._building_ui = False
 
@@ -384,7 +406,6 @@ class PlannerTab(ttk.Frame):
         self.lbl_temp_prompts.config(text="Thermal Chamber Prompts: —")
 
         self.tree.delete(*self.tree.get_children())
-        self._clear_draft()
         self.run_btn.config(state="disabled")
         self.export_btn.config(state="disabled")
 
@@ -410,35 +431,92 @@ class PlannerTab(ttk.Frame):
         # the shared renderer wants, so this listing and the Experiment tab's
         # Planned Tests table are drawn by the same code.
         fill_plan_tree(self.tree, plan.points, duration)
-        self._save_draft(plan)
+        self._save_selections()
 
         has_runnable_points = len(plan.points) > 0
         self.run_btn.config(state="normal" if has_runnable_points else "disabled")
         self.export_btn.config(state="normal" if has_runnable_points else "disabled")
 
-    def _save_draft(self, plan: PlanSummary) -> None:
-        """Persist the listing as it stands, on every selection change.
+    def _selection_state(self) -> tuple:
+        """Everything that would be saved, in a comparable form."""
+        return (
+            tuple(
+                (key, tuple(sorted(str(v) for v in box.get_selected_values())))
+                for key, box in sorted(self.select_boxes.items())
+            ),
+            bool(self.include_completed_var.get()),
+            self.duration_entry.get(),
+            bool(self.find_zvs_var.get()),
+        )
 
-        Best effort, and deliberately silent on failure: this is the working
-        plan, not the applied one, and interrupting parameter selection with
-        an error dialog would be worse than losing a draft that is one click
-        from being rebuilt.
+    def _save_selections(self) -> None:
+        """Remember which parameters are ticked, for this device.
+
+        The selections, not the matrix they expand to. A large matrix is
+        ~1500 rows and was previously rewritten on every click; the selections
+        behind it are about two dozen values, and the listing regenerates from
+        them exactly. The reverse is not true — an expanded cross-product
+        cannot tell you which boxes were ticked.
+
+        Skipped when nothing has changed, because ``generate_plan`` is also
+        called on device load, on focus-out and after every run, and each of
+        those would otherwise cost a write.
+
+        Best effort, and deliberately silent on failure: interrupting
+        parameter selection with an error dialog would be worse than losing a
+        selection that is one click from being rebuilt.
         """
+        device = sanitize_device_name(self.get_device_name().strip())
+        if not device:
+            return
+        state = self._selection_state()
+        if state == self._saved_selection_state:
+            return
         try:
-            self.db.save_plan(
-                PLAN_SLOT_DRAFT,
-                plan.all_points,
-                source="Planner draft",
-                device_name=sanitize_device_name(self.get_device_name().strip()),
+            self.db.save_plan_selections(
+                device,
+                {
+                    key: box.get_selected_values()
+                    for key, box in self.select_boxes.items()
+                },
+                include_completed=self.include_completed_var.get(),
+                duration_minutes=parse_positive_duration(
+                    self.duration_entry.get()
+                ),
+                find_zvs=self.find_zvs_var.get(),
             )
         except Exception:
-            log.exception("Could not save the planner draft")
+            log.exception("Could not save the planner selections")
+            return
+        self._saved_selection_state = state
 
-    def _clear_draft(self) -> None:
+    def _restore_selections(self) -> bool:
+        """Tick what was last selected for this device. True if anything was.
+
+        A device that has never been planned for is left with everything
+        selected — the existing default — because "no saved selection" and
+        "deliberately selected nothing" are different, and only the second
+        should produce an empty planner.
+        """
+        device = sanitize_device_name(self.get_device_name().strip())
+        if not device:
+            return False
         try:
-            self.db.clear_plan(PLAN_SLOT_DRAFT)
+            stored = self.db.load_plan_selections(device)
         except Exception:
-            log.exception("Could not clear the planner draft")
+            log.exception("Could not load the planner selections")
+            return False
+        if stored is None:
+            return False
+        selections, include_completed, duration, find_zvs = stored
+        for key, box in self.select_boxes.items():
+            box.set_selected_values(selections.get(key, ()))
+        self.include_completed_var.set(include_completed)
+        self.find_zvs_var.set(find_zvs)
+        self.duration_entry.delete(0, tk.END)
+        self.duration_entry.insert(0, f"{duration:g}")
+        self._saved_selection_state = self._selection_state()
+        return True
 
     def _apply_plan(self) -> None:
         """Make the current plan the one the rig is working from."""

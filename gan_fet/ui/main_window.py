@@ -1847,12 +1847,21 @@ class MainWindow(tk.Tk):
         # as their runs finished.
         applied = self.plan_store.applied
         plan = pending_points(applied) if applied is not None else []
-        decision = start_sequence_decision(applied=applied, pending=len(plan))
+        decision = start_sequence_decision(
+            applied=applied,
+            pending=len(plan),
+            selected_device=self.device_name_var.get().strip(),
+        )
         if decision.action is StartAction.OFFER_PLANNER:
             if messagebox.askyesno(
                 decision.title, decision.message, parent=self
             ):
                 self.notebook.select(self.planner_tab)
+            return
+        if decision.action is StartAction.WRONG_DEVICE:
+            messagebox.showerror(
+                decision.title, decision.message, parent=self
+            )
             return
         if decision.action is StartAction.ALREADY_COMPLETE:
             messagebox.showinfo(

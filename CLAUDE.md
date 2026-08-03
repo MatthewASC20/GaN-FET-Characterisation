@@ -100,7 +100,7 @@ this is a worthwhile change.
 
 ## Storage
 
-- `storage/schema.py` holds `SCHEMA_VERSION` (currently 7) and the canonical
+- `storage/schema.py` holds `SCHEMA_VERSION` (currently 8) and the canonical
   run-row projection. **Never duplicate a positional run projection.** To evolve
   persistence, add an idempotent structural migration and raise the version.
 - `runs` is **append-only**. Each execution appends an attempt; a failed retry
@@ -111,31 +111,51 @@ this is a worthwhile change.
 
 ### Test plans
 
-Two slots in `plan_points` / `plan_meta`, from schema 7. They are separate
-stores, not two views of one:
+Two things are stored, and they are different kinds of thing.
 
-- `draft` — the whole matrix the planner is showing, completed points
-  included. Rewritten on every selection change; backs the "Sequence Execution
-  Plan Listing".
-- `applied` — the outstanding work, written by "Apply Test Plan" and
-  **drained**: `PlanStore.complete_point()` deletes a point as its run
-  succeeds. Backs "Planned Tests" and is what the sequence runs.
+**The applied plan** — `plan_points` / `plan_meta`, one plan, no slot column.
+Points are **marked** complete, not deleted: "Planned Tests" drains because it
+renders `AppliedPlan.pending`, while the plan itself survives being finished
+and can be inspected or re-applied.
 
-- Only a *successful* run drains a point (`plan_store.measured_point`). A
+- Only a *successful* run marks a point (`plan_store.measured_point`). A
   failed or tripped attempt records itself in `runs` without producing a
   measurement, so the point stays queued.
-- A slot with a meta row and no points means **complete**; no meta row means
-  **no plan applied**. `load_plan` returns `None` only for the latter.
+- `complete_point` marks the first **outstanding** match. A plan may
+  deliberately queue the same point twice; one run ticks off one of them.
+- No meta row means **no plan applied**; a plan whose points are all marked
+  means **complete**. `load_plan` returns `None` only for the former.
   Conflating the two is what made a finished plan render as a blank table.
-- `plan_meta.total_count` survives the last point being drained, so a finished
-  plan can still report how big it was.
 - The queue is **not** recomputed by subtracting `runs` from the plan. That
   cannot express a deliberate re-test — "Include Completed Runs" queues points
   that already have runs, and subtracting would empty the plan on apply.
-- Both tables render through `ui/plan_table.py`. Columns, formatting and tags
-  live there so the two cannot drift apart, as they previously had.
+- `PlanStore` has **one write path** (`_persist`, a full save). A surgical
+  UPDATE per completion was cheaper but was a second path that could disagree
+  with the first; a point costs a minute of bench time, so the saving was not
+  worth the divergence.
+- A plan built for another device is **refused**, not confirmed
+  (`StartAction.WRONG_DEVICE`). Plans persist, so one can outlive its device
+  selection; running it would drive the mounted part with another part's
+  parameters and record the results against the mounted one.
 - A failed plan write is logged, never raised: losing persistence costs the
   operator next session, whereas refusing to apply blocks them at the bench.
+
+**The planner's selections** — `plan_selections` / `plan_options`, per device.
+The ~24 ticked values, not the ~1500-row matrix they expand to: the listing
+regenerates from them exactly, and the reverse is impossible. Restored when the
+device's options load; skipped when unchanged, because `generate_plan` also
+runs on device load, focus-out and after every run.
+
+`None` from `load_plan_selections` means "never planned for this device" and
+leaves the planner's select-everything default alone; an empty selection for a
+device that *has* been planned is a real state and is kept.
+
+Both plan tables render through `ui/plan_table.py`. Columns, formatting and
+tags live there so the two cannot drift apart, as they previously had.
+
+Schema 7 kept a second `draft` slot holding the expanded matrix, rewritten on
+every click and never read. `_migrate_plans_drop_slot` carries the applied
+points across and discards it.
 - Shared data directories use a tokenized, fail-closed heartbeat lease. A
   stale-looking lock is **never** auto-removed — network clock skew makes that
   unsafe. Operators must verify and remove it manually.

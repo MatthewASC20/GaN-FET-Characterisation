@@ -2,16 +2,18 @@
 
 Plans used to live only in memory. Completion never did — that has always come
 from the ``runs`` table, recomputed on every read — so losing a plan never lost
-a measurement. What it lost was the *intent*: the order, the re-tests, and how
-far through a multi-hour sequence the rig had got. Closing the application, or
-crashing mid-sequence, meant rebuilding the selection by hand and hoping it
-matched.
+a measurement. What it lost was the *intent*: the order, the deliberate
+re-tests, and how far through a multi-hour sequence the rig had got. Closing
+the application, or crashing mid-sequence, meant rebuilding the selection by
+hand and hoping it matched.
 
-Two slots are stored, because they answer different questions:
+Two things are stored, and they are different kinds of thing:
 
-* ``draft``   — the whole matrix the planner is showing, completed points
-  included, rewritten on every selection change.
-* ``applied`` — the outstanding work, drained as runs complete.
+* the **applied plan** — points, in order, each marked when measured. The
+  Planned Tests table drains because it shows the unmarked ones; the plan
+  itself survives being finished.
+* the **planner's selections**, per device — which boxes are ticked, not the
+  matrix they expand to.
 
 These tests use a real SQLite file. The point is the round trip.
 """
@@ -22,7 +24,6 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from gan_fet.core.models import MatrixPoint
-from gan_fet.storage.schema import PLAN_SLOT_APPLIED, PLAN_SLOT_DRAFT
 from gan_fet.ui.plan_store import PlanStore, measured_point
 
 
@@ -42,16 +43,14 @@ def _point(voltage: int = 200, frequency_hz: int = 6_000_000) -> MatrixPoint:
 
 def test_a_saved_plan_comes_back_unchanged(database):
     points = [_point(200), _point(300), _point(400)]
-    database.save_plan(
-        PLAN_SLOT_APPLIED, points, source="Planner", device_name="EPC2001C"
-    )
+    database.save_plan(points, source="Planner", device_name="EPC2001C")
 
-    restored, source, device, total = database.load_plan(PLAN_SLOT_APPLIED)
+    restored, completed, source, device = database.load_plan()
 
     assert restored == points
+    assert completed == set()
     assert source == "Planner"
     assert device == "EPC2001C"
-    assert total == 3
 
 
 def test_run_order_survives_the_round_trip(database):
@@ -59,87 +58,63 @@ def test_run_order_survives_the_round_trip(database):
     order SQLite felt like returning them would silently reorder a sequence
     that was deliberately grouped by temperature."""
     points = [_point(400), _point(200), _point(300)]
-    database.save_plan(
-        PLAN_SLOT_APPLIED, points, source="Planner", device_name="EPC2001C"
-    )
+    database.save_plan(points, source="Planner", device_name="EPC2001C")
 
-    restored, _, _, _ = database.load_plan(PLAN_SLOT_APPLIED)
+    restored, _, _, _ = database.load_plan()
 
     assert [p.voltage_v for p in restored] == [400, 200, 300]
 
 
-def test_an_unsaved_slot_reads_as_none(database):
-    """None means "no plan", and has to stay distinguishable from a plan with
-    nothing left in it."""
-    assert database.load_plan(PLAN_SLOT_APPLIED) is None
+def test_no_plan_reads_as_none(database):
+    """None means "no plan", and has to stay distinguishable from a plan whose
+    points are all measured."""
+    assert database.load_plan() is None
 
 
-def test_a_drained_plan_is_empty_but_still_present(database):
-    """The state the bench report was actually about: every point measured.
-    Returning None here would render as "no test plan applied" and send the
-    operator looking for a bug that is not there."""
+def test_a_finished_plan_keeps_its_points(database):
+    """The state the bench report was actually about. Deleting as the queue
+    drained left nothing to show and nothing to re-apply; marking keeps both."""
+    points = [_point(200), _point(300)]
     database.save_plan(
-        PLAN_SLOT_APPLIED, [], source="Planner", device_name="EPC2001C",
-        total_count=6,
+        points, source="Planner", device_name="EPC2001C", completed=[0, 1]
     )
 
-    stored = database.load_plan(PLAN_SLOT_APPLIED)
+    restored, completed, _, _ = database.load_plan()
 
-    assert stored is not None
-    points, _, _, total = stored
-    assert points == []
-    assert total == 6, "a drained plan still knows how big it was"
+    assert restored == points, "the plan is still there after it is finished"
+    assert completed == {0, 1}
 
 
 def test_saving_replaces_rather_than_appends(database):
-    """Two plans at once in one slot is the state this exists to prevent."""
+    """Two plans at once is the state this exists to prevent."""
     database.save_plan(
-        PLAN_SLOT_APPLIED, [_point(200), _point(300)],
-        source="Planner", device_name="EPC2001C",
+        [_point(200), _point(300)], source="Planner", device_name="EPC2001C"
     )
-    database.save_plan(
-        PLAN_SLOT_APPLIED, [_point(400)],
-        source="Planner", device_name="EPC2001C",
-    )
+    database.save_plan([_point(400)], source="Planner", device_name="EPC2001C")
 
-    points, _, _, total = database.load_plan(PLAN_SLOT_APPLIED)
+    points, _, _, _ = database.load_plan()
 
     assert [p.voltage_v for p in points] == [400]
-    assert total == 1
 
 
-def test_the_two_slots_do_not_disturb_each_other(database):
-    """The listing shows the whole matrix while the queue drains. Applying,
-    or finishing a point, must not rewrite what the planner is displaying."""
+def test_re_saving_keeps_the_points_already_measured(database):
+    """Otherwise persisting any later change would resurrect finished work."""
+    points = [_point(200), _point(300)]
     database.save_plan(
-        PLAN_SLOT_DRAFT, [_point(200), _point(300), _point(400)],
-        source="Planner draft", device_name="EPC2001C",
-    )
-    database.save_plan(
-        PLAN_SLOT_APPLIED, [_point(300)],
-        source="Planner", device_name="EPC2001C",
+        points, source="Planner", device_name="EPC2001C", completed=[0]
     )
 
-    draft, draft_source, _, _ = database.load_plan(PLAN_SLOT_DRAFT)
-    applied, applied_source, _, _ = database.load_plan(PLAN_SLOT_APPLIED)
+    _, completed, _, _ = database.load_plan()
 
-    assert len(draft) == 3
-    assert len(applied) == 1
-    assert draft_source != applied_source
+    assert completed == {0}
 
 
-def test_clearing_one_slot_leaves_the_other(database):
-    database.save_plan(
-        PLAN_SLOT_DRAFT, [_point()], source="d", device_name="EPC2001C"
-    )
-    database.save_plan(
-        PLAN_SLOT_APPLIED, [_point()], source="a", device_name="EPC2001C"
-    )
+def test_clearing_removes_the_plan(database):
+    database.save_plan([_point()], source="Planner", device_name="EPC2001C")
 
-    database.clear_plan(PLAN_SLOT_APPLIED)
+    database.clear_plan()
 
-    assert database.load_plan(PLAN_SLOT_APPLIED) is None
-    assert database.load_plan(PLAN_SLOT_DRAFT) is not None
+    assert database.load_plan() is None
 
 
 def test_every_field_of_a_point_round_trips(database):
@@ -153,11 +128,9 @@ def test_every_field_of_a_point_round_trips(database):
         temperature_c=125,
         voltage_v=350,
     )
-    database.save_plan(
-        PLAN_SLOT_APPLIED, [point], source="Planner", device_name="GS66508B"
-    )
+    database.save_plan([point], source="Planner", device_name="GS66508B")
 
-    restored, _, _, _ = database.load_plan(PLAN_SLOT_APPLIED)
+    restored, _, _, _ = database.load_plan()
 
     assert restored == [point]
 
@@ -172,7 +145,7 @@ def test_an_applied_plan_survives_a_restart(database):
     PlanStore(database).apply(points, source="Planner", device_name="EPC2001C")
 
     reopened = PlanStore(database)
-    assert reopened.applied is None, "nothing is loaded until restore() is called"
+    assert reopened.applied is None, "nothing loads until restore() is called"
 
     restored = reopened.restore()
 
@@ -183,10 +156,9 @@ def test_an_applied_plan_survives_a_restart(database):
 
 
 def test_a_sequence_resumes_where_it_stopped(database):
-    """Points completed before the interruption are gone from the queue, and
-    stay gone. Recomputing the remainder from the run table instead would be
-    wrong for exactly the plans that matter — a re-test queues points that
-    already have runs."""
+    """Points completed before the interruption stay completed. Recomputing
+    the remainder from the run table instead would be wrong for exactly the
+    plans that matter — a re-test queues points that already have runs."""
     a, b, c = _point(200), _point(300), _point(400)
     store = PlanStore(database)
     store.apply([a, b, c], source="Planner", device_name="EPC2001C")
@@ -195,8 +167,9 @@ def test_a_sequence_resumes_where_it_stopped(database):
 
     resumed = PlanStore(database).restore()
 
-    assert list(resumed.points) == [c]
+    assert list(resumed.pending) == [c]
     assert resumed.total_count == 3, "still reports the size of the whole job"
+    assert list(resumed.points) == [a, b, c], "and what was in it"
 
 
 def test_a_finished_plan_restores_as_finished_not_as_absent(database):
@@ -207,8 +180,8 @@ def test_a_finished_plan_restores_as_finished_not_as_absent(database):
     resumed = PlanStore(database).restore()
 
     assert resumed is not None, "a completed plan is not the same as no plan"
-    assert list(resumed.points) == []
-    assert resumed.total_count == 1
+    assert list(resumed.pending) == []
+    assert resumed.completed_count == 1
 
 
 def test_clearing_a_plan_clears_it_for_good(database):
@@ -226,14 +199,27 @@ def test_restoring_nothing_leaves_the_store_empty(database):
 def test_applying_replaces_the_stored_plan_too(database):
     """Otherwise a restart would resurrect the plan that was replaced."""
     store = PlanStore(database)
-    store.apply([_point(200), _point(300)], source="Planner",
-                device_name="EPC2001C")
+    store.apply(
+        [_point(200), _point(300)], source="Planner", device_name="EPC2001C"
+    )
     store.apply([_point(400)], source="Planner", device_name="EPC2001C")
 
     resumed = PlanStore(database).restore()
 
     assert [p.voltage_v for p in resumed.points] == [400]
-    assert resumed.total_count == 1, "the replacement's size, not the old one's"
+
+
+def test_a_replacement_does_not_inherit_the_old_progress(database):
+    """Position 0 of the old plan being done says nothing about position 0 of
+    the new one."""
+    store = PlanStore(database)
+    store.apply(
+        [_point(200), _point(300)], source="Planner", device_name="EPC2001C"
+    )
+    store.complete_point(_point(200))
+    store.apply([_point(400)], source="Planner", device_name="EPC2001C")
+
+    assert PlanStore(database).restore().completed_count == 0
 
 
 def test_the_device_is_stored_with_the_plan(database):
@@ -263,10 +249,13 @@ def test_a_storage_failure_does_not_refuse_the_apply(database, caplog):
         def save_plan(self, *_args, **_kwargs):
             raise RuntimeError("disk gone")
 
-        def load_plan(self, _slot):
+        def load_plan(self):
             return None
 
-        def clear_plan(self, _slot):
+        def mark_plan_point_completed(self, _position):
+            raise RuntimeError("disk gone")
+
+        def clear_plan(self):
             raise RuntimeError("disk gone")
 
     store = PlanStore(Failing())
@@ -284,10 +273,13 @@ def test_a_load_failure_leaves_the_store_empty_rather_than_raising(caplog):
         def save_plan(self, *_args, **_kwargs):
             return None
 
-        def load_plan(self, _slot):
+        def load_plan(self):
             raise RuntimeError("corrupt")
 
-        def clear_plan(self, _slot):
+        def mark_plan_point_completed(self, _position):
+            return None
+
+        def clear_plan(self):
             return None
 
     store = PlanStore(Failing())
@@ -305,16 +297,16 @@ def test_completing_a_point_is_persisted_immediately(database):
     store.apply([a, b], source="Planner", device_name="EPC2001C")
     store.complete_point(a)
 
-    points, _, _, _ = database.load_plan(PLAN_SLOT_APPLIED)
+    _, completed, _, _ = database.load_plan()
 
-    assert points == [b]
+    assert completed == {0}
 
 
 def test_a_point_matching_on_every_field_but_frequency_is_not_completed(
     database,
 ):
     """Multi-frequency plans queue the same (config, duty, voltage, temp) at
-    several frequencies. Dropping the wrong one would skip a measurement."""
+    several frequencies. Marking the wrong one would skip a measurement."""
     at_six = _point(200, frequency_hz=6_000_000)
     at_seven = replace(at_six, frequency_hz=7_000_000)
     store = PlanStore(database)
@@ -322,7 +314,65 @@ def test_a_point_matching_on_every_field_but_frequency_is_not_completed(
 
     store.complete_point(at_six)
 
-    assert list(store.applied.points) == [at_seven]
+    assert list(store.applied.pending) == [at_seven]
+
+
+def test_a_duplicated_point_is_completed_one_run_at_a_time(database):
+    """A plan may deliberately queue the same point twice — a repeatability
+    check. One run must tick off one of them."""
+    store = PlanStore(database)
+    store.apply(
+        [_point(200), _point(200)], source="Planner", device_name="EPC2001C"
+    )
+
+    store.complete_point(_point(200))
+
+    assert len(store.applied.pending) == 1
+    assert PlanStore(database).restore().completed_count == 1
+
+
+def test_the_second_run_of_a_duplicated_point_completes_the_other_one(
+    database,
+):
+    """Marking the *first* match every time would leave a repeatability check
+    permanently one run short, with the queue insisting there is work left
+    that has in fact been done twice."""
+    store = PlanStore(database)
+    store.apply(
+        [_point(200), _point(200)], source="Planner", device_name="EPC2001C"
+    )
+
+    assert store.complete_point(_point(200)) is True
+    assert store.complete_point(_point(200)) is True
+
+    assert store.applied.completed == frozenset({0, 1})
+    assert list(store.applied.pending) == []
+
+
+def test_a_third_run_of_a_duplicated_point_has_nothing_left_to_complete(
+    database,
+):
+    """And must say so, rather than silently re-marking a finished row."""
+    store = PlanStore(database)
+    store.apply(
+        [_point(200), _point(200)], source="Planner", device_name="EPC2001C"
+    )
+    store.complete_point(_point(200))
+    store.complete_point(_point(200))
+
+    assert store.complete_point(_point(200)) is False
+
+
+def test_progress_survives_a_restart_point_by_point(database):
+    """Each completion is written as it happens, not flushed at shutdown: the
+    interruption this protects against is the one where shutdown never runs."""
+    points = [_point(200), _point(300), _point(400)]
+    store = PlanStore(database)
+    store.apply(points, source="Planner", device_name="EPC2001C")
+
+    for expected, point in enumerate(points, start=1):
+        store.complete_point(point)
+        assert PlanStore(database).restore().completed_count == expected
 
 
 # -- which attempts take work off the queue ------------------------------------
@@ -339,7 +389,7 @@ def test_a_successful_run_takes_its_point_off_the_queue():
 
 def test_a_failed_run_leaves_the_point_outstanding():
     """``runs`` is append-only: a failed attempt records itself without
-    producing a measurement. Removing the point would drop it from a sequence
+    producing a measurement. Marking the point would drop it from a sequence
     that had not done it, and the gap would only surface when the
     characterisation set came up short."""
     assert measured_point(_Outcome(_point(200)), False) is None
@@ -351,13 +401,13 @@ def test_a_tripped_run_leaves_the_point_outstanding():
     assert measured_point(_Outcome(_point(200)), success=False) is None
 
 
-def test_a_run_that_never_produced_a_record_removes_nothing():
-    """A run that failed before creating its record has no point to drop, and
+def test_a_run_that_never_produced_a_record_marks_nothing():
+    """A run that failed before creating its record has no point to mark, and
     reaching through the missing record would raise inside a UI callback."""
     assert measured_point(_Outcome(None), True) is None
 
 
-def test_no_outcome_at_all_removes_nothing():
+def test_no_outcome_at_all_marks_nothing():
     assert measured_point(None, True) is None
 
 
@@ -369,6 +419,220 @@ def test_a_failed_run_does_not_shrink_a_stored_plan(database):
 
     store.complete_point(measured_point(_Outcome(a), success=False))
 
-    assert list(store.applied.points) == [a, b]
-    stored, _, _, _ = database.load_plan(PLAN_SLOT_APPLIED)
-    assert stored == [a, b]
+    assert list(store.applied.pending) == [a, b]
+    _, completed, _, _ = database.load_plan()
+    assert completed == set()
+
+
+# -- the planner's selections --------------------------------------------------
+
+
+def test_selections_round_trip(database):
+    database.save_plan_selections(
+        "EPC2001C",
+        {"frequencies": [6_000_000, 6_500_000], "duties": [50]},
+        include_completed=True,
+        duration_minutes=2.5,
+        find_zvs=False,
+    )
+
+    selections, include_completed, duration, find_zvs = (
+        database.load_plan_selections("EPC2001C")
+    )
+
+    assert selections["frequencies"] == {"6000000", "6500000"}
+    assert selections["duties"] == {"50"}
+    assert include_completed is True
+    assert duration == 2.5
+    assert find_zvs is False
+
+
+def test_selections_are_per_device(database):
+    """Coming back to a part should bring back the matrix being worked on for
+    it, not whatever was selected for a different one."""
+    database.save_plan_selections("EPC2001C", {"duties": [50]})
+    database.save_plan_selections("GS66508B", {"duties": [35, 40]})
+
+    epc, _, _, _ = database.load_plan_selections("EPC2001C")
+    gs, _, _, _ = database.load_plan_selections("GS66508B")
+
+    assert epc["duties"] == {"50"}
+    assert gs["duties"] == {"35", "40"}
+
+
+def test_a_device_never_planned_for_reads_as_none(database):
+    """Which the planner treats as "select everything" — its existing default.
+    Returning empty selections instead would open the planner with nothing
+    ticked and no plan."""
+    assert database.load_plan_selections("EPC2001C") is None
+
+
+def test_saving_selections_replaces_the_previous_set(database):
+    database.save_plan_selections("EPC2001C", {"duties": [40, 45, 50]})
+    database.save_plan_selections("EPC2001C", {"duties": [50]})
+
+    selections, _, _, _ = database.load_plan_selections("EPC2001C")
+
+    assert selections["duties"] == {"50"}
+
+
+def test_a_deliberately_empty_selection_is_kept(database):
+    """Distinct from never having planned: the operator cleared a box."""
+    database.save_plan_selections("EPC2001C", {"duties": [50]})
+    database.save_plan_selections("EPC2001C", {"duties": []})
+
+    stored = database.load_plan_selections("EPC2001C")
+
+    assert stored is not None, "still a saved state, just an empty one"
+    assert stored[0].get("duties", set()) == set()
+
+
+def test_options_default_sensibly_when_not_passed(database):
+    database.save_plan_selections("EPC2001C", {"duties": [50]})
+
+    _, include_completed, duration, find_zvs = database.load_plan_selections(
+        "EPC2001C"
+    )
+
+    assert include_completed is False
+    assert duration == 1.0
+    assert find_zvs is True
+
+
+# -- upgrading a schema 7 database ---------------------------------------------
+
+
+_SCHEMA_7_PLAN_TABLES = """
+CREATE TABLE plan_points (
+    slot TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    device_name TEXT NOT NULL,
+    config TEXT NOT NULL,
+    frequency_hz INTEGER NOT NULL,
+    duty_pct INTEGER NOT NULL,
+    temperature_c INTEGER NOT NULL,
+    voltage_v INTEGER NOT NULL,
+    PRIMARY KEY (slot, position)
+);
+CREATE TABLE plan_meta (
+    slot TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    device_name TEXT NOT NULL,
+    total_count INTEGER NOT NULL DEFAULT 0,
+    saved_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+
+def _schema_7_database(tmp_path, *, applied=(), draft=()):
+    """A database at schema 7: two plans in one table, keyed by ``slot``."""
+    import sqlite3
+
+    from gan_fet.storage.schema import SCHEMA
+
+    path = tmp_path / "legacy" / "gan_fet.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    # Everything except the plan tables, which are recreated in the old shape.
+    conn.executescript(SCHEMA.split("-- The applied test plan")[0])
+    conn.executescript(_SCHEMA_7_PLAN_TABLES)
+    conn.execute("INSERT INTO schema_version(version) VALUES (7)")
+    for slot, points in (("applied", applied), ("draft", draft)):
+        for position, point in enumerate(points):
+            conn.execute(
+                "INSERT INTO plan_points VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    slot, position, point.device_name, point.config,
+                    point.frequency_hz, point.duty_pct, point.temperature_c,
+                    point.voltage_v,
+                ),
+            )
+        if points:
+            conn.execute(
+                "INSERT INTO plan_meta VALUES (?,?,?,?,datetime('now'))",
+                (slot, f"Planner {slot}", "EPC2001C", len(points)),
+            )
+    conn.commit()
+    conn.close()
+    return path
+
+
+def test_a_schema_7_applied_plan_is_carried_across(tmp_path):
+    """It is the operator's actual queue. Losing it to an upgrade would mean
+    rebuilding a multi-hour plan by hand."""
+    from gan_fet.storage.db import Database
+
+    points = [_point(200), _point(300), _point(400)]
+    path = _schema_7_database(tmp_path, applied=points, draft=[_point(999)])
+
+    db = Database(path)
+    try:
+        restored = PlanStore(db).restore()
+        assert list(restored.points) == points
+        assert restored.device_name == "EPC2001C"
+    finally:
+        db.close()
+
+
+def test_the_schema_7_draft_is_discarded(tmp_path):
+    """Nothing ever read it, and plan_selections replaces it. Carrying it
+    across would leave a table full of rows with no reader."""
+    from gan_fet.storage.db import Database
+
+    path = _schema_7_database(
+        tmp_path, applied=[_point(200)], draft=[_point(v) for v in range(1, 20)]
+    )
+
+    db = Database(path)
+    try:
+        total = db._conn.execute(
+            "SELECT COUNT(*) FROM plan_points"
+        ).fetchone()[0]
+        assert total == 1
+    finally:
+        db.close()
+
+
+def test_the_slot_column_is_gone_after_upgrading(tmp_path):
+    from gan_fet.storage.db import Database
+
+    path = _schema_7_database(tmp_path, applied=[_point()])
+
+    db = Database(path)
+    try:
+        columns = {
+            row[1] for row in db._conn.execute("PRAGMA table_info(plan_points)")
+        }
+        assert "slot" not in columns
+        assert "completed_at" in columns
+    finally:
+        db.close()
+
+
+def test_upgrading_a_database_with_no_plan_is_harmless(tmp_path):
+    from gan_fet.storage.db import Database
+
+    path = _schema_7_database(tmp_path)
+
+    db = Database(path)
+    try:
+        assert db.load_plan() is None
+    finally:
+        db.close()
+
+
+def test_reopening_an_upgraded_database_does_not_rebuild_again(tmp_path):
+    """The migration is keyed on the slot column being present, so a second
+    open must be a no-op rather than dropping the plan it just carried."""
+    from gan_fet.storage.db import Database
+
+    path = _schema_7_database(tmp_path, applied=[_point(200), _point(300)])
+
+    db = Database(path)
+    db.close()
+    db = Database(path)
+    try:
+        points, _, _, _ = db.load_plan()
+        assert [p.voltage_v for p in points] == [200, 300]
+    finally:
+        db.close()

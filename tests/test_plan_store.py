@@ -148,50 +148,122 @@ def test_with_no_applied_plan_the_queue_says_to_build_one():
     assert "Test Planner" in heading
 
 
+def _plan(count: int, done: int = 0, source: str = "Planner", device: str = ""):
+    """An applied plan of ``count`` points with the first ``done`` measured."""
+    store = PlanStore()
+    store.apply(
+        [_point(100 + 10 * i) for i in range(count)],
+        source=source,
+        device_name=device or "EPC2001C",
+    )
+    for i in range(done):
+        store.complete_point(_point(100 + 10 * i))
+    return store.applied
+
+
 def test_an_applied_plan_names_where_it_came_from():
-    store = PlanStore()
-    applied = store.apply([_point()] * 10, source="Planner")
-    assert "Planner" in queue_heading(applied, 7)
+    assert "Planner" in queue_heading(_plan(10, done=3))
 
 
-def test_a_partly_drained_plan_reports_both_numbers():
-    """"3 left" alone loses the size of the job; "10 planned" alone hides the
+def test_a_partly_finished_plan_reports_both_numbers():
+    """"7 left" alone loses the size of the job; "10 planned" alone hides the
     progress. The operator is deciding whether to leave it running."""
-    store = PlanStore()
-    applied = store.apply([_point()] * 10, source="Planner")
-    heading = queue_heading(applied, 7)
+    heading = queue_heading(_plan(10, done=3))
     assert "7 of 10" in heading
     assert "3 completed" in heading
 
 
 def test_an_untouched_plan_does_not_claim_zero_completed():
-    """Saying "0 completed and removed" reads as though something was lost."""
-    store = PlanStore()
-    applied = store.apply([_point()] * 4, source="Planner")
-    heading = queue_heading(applied, 4)
+    """Saying "0 completed" reads as though something was lost."""
+    heading = queue_heading(_plan(4))
     assert "4 test(s) to run" in heading
     assert "completed" not in heading
 
 
 def test_a_finished_applied_plan_says_it_is_complete():
     """Not "0 remaining", which reads like something went wrong."""
-    store = PlanStore()
-    applied = store.apply([_point()] * 4, source="Planner")
-    heading = queue_heading(applied, 0)
+    heading = queue_heading(_plan(4, done=4))
     assert "complete" in heading
-    assert "4" in heading, "a drained plan must still say how big it was"
+    assert "4" in heading, "a finished plan must still say how big it was"
 
 
-def test_a_drained_plan_still_knows_its_original_size():
-    """The count comes from the stored total, not from the rows that are left,
-    so the heading survives the last point being removed."""
+def test_a_finished_plan_still_knows_what_was_in_it():
+    """Marking rather than deleting is what makes this answerable — and what
+    lets the same plan be applied to the next part."""
+    applied = _plan(2, done=2)
+    assert applied.total_count == 2
+    assert applied.completed_count == 2
+    assert len(applied.points) == 2
+    assert "all 2 points measured" in queue_heading(applied)
+
+
+# -- a plan built for another device -------------------------------------------
+
+
+def test_a_plan_for_another_device_says_so_instead_of_listing_work():
+    """Plans persist now, so one can outlive its device selection by days.
+    Listing points that will be refused is worse than saying why."""
+    heading = queue_heading(_plan(5, device="EPC2001C"), "GS66508B")
+    assert "EPC2001C" in heading
+    assert "GS66508B" in heading
+
+
+def test_the_matching_device_reads_normally():
+    assert "5 test(s) to run" in queue_heading(
+        _plan(5, device="EPC2001C"), "EPC2001C"
+    )
+
+
+def test_an_unnamed_plan_matches_any_device():
+    """Plans stored before the device was recorded must not be locked out."""
     store = PlanStore()
-    store.apply([_point(200), _point(300)], source="Planner")
-    store.complete_point(_point(200))
-    store.complete_point(_point(300))
-    assert store.applied.total_count == 2
-    assert store.applied.completed_count == 2
-    assert "all 2 points measured" in queue_heading(store.applied, 0)
+    applied = store.apply([], source="Planner", device_name="")
+    assert applied.is_for("anything")
+
+
+def test_no_selected_device_does_not_trigger_the_mismatch():
+    """Startup order: the plan restores before the device selector is set."""
+    assert "3 test(s) to run" in queue_heading(_plan(3, device="EPC2001C"), "")
+
+
+def test_starting_a_plan_for_another_device_is_refused():
+    """The one that matters. Running EPC2001C's plan with GS66508B mounted
+    would drive it with the wrong frequencies and voltages and record the
+    results against GS66508B — nothing about the data would look wrong."""
+    from gan_fet.ui.plan_store import StartAction
+
+    decision = _start(
+        applied=_plan(5, device="EPC2001C"),
+        pending=5,
+        selected_device="GS66508B",
+    )
+    assert decision.action is StartAction.WRONG_DEVICE
+    assert "EPC2001C" in decision.message
+    assert "GS66508B" in decision.message
+
+
+def test_the_wrong_device_outranks_the_plan_being_finished():
+    """Otherwise the operator is told to apply a new plan when the real
+    problem is which part is mounted."""
+    from gan_fet.ui.plan_store import StartAction
+
+    decision = _start(
+        applied=_plan(2, done=2, device="EPC2001C"),
+        pending=0,
+        selected_device="GS66508B",
+    )
+    assert decision.action is StartAction.WRONG_DEVICE
+
+
+def test_the_right_device_starts_normally():
+    from gan_fet.ui.plan_store import StartAction
+
+    decision = _start(
+        applied=_plan(5, device="EPC2001C"),
+        pending=5,
+        selected_device="EPC2001C",
+    )
+    assert decision.action is StartAction.START
 
 
 # -- what is left of an applied plan ------------------------------------------
