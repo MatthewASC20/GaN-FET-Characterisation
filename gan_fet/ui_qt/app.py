@@ -14,6 +14,7 @@ from typing import Callable
 def run_qt_shell(
     *,
     settings,
+    db,
     engine,
     safety,
     smu,
@@ -28,6 +29,7 @@ def run_qt_shell(
     app = QApplication.instance() or QApplication([])
     window = QtMainWindow(
         settings=settings,
+        db=db,
         engine=engine,
         safety=safety,
         smu=smu,

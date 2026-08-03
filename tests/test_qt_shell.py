@@ -47,10 +47,30 @@ def pump(qapp, predicate, timeout_s: float = 10.0) -> bool:
     return False
 
 
+def _fast(settings: Settings) -> Settings:
+    """The runtime-test recipe: same searches, no wall-clock padding."""
+    settings.smu.sample_interval_s = 0.01
+    settings.smu.ramp_rate_v_s = 100_000.0
+    settings.peak_control.tolerance_v = 2.0
+    settings.peak_control.settle_s = 0.001
+    settings.peak_control.max_iterations = 30
+    settings.peak_control.min_step_v = 0.1
+    settings.peak_control.proportional_gain = 0.5
+    settings.voltage_tune.step_v = 1.0
+    settings.voltage_tune.settle_s = 0.001
+    settings.voltage_tune.samples_per_point = 1
+    settings.voltage_tune.min_improvement_a = 0.00005
+    settings.voltage_tune.window_v = 20.0
+    settings.voltage_tune.max_steps = 30
+    settings.safety.max_dc_current_a = 1.0
+    settings.safety.max_vds_peak_v = 450.0
+    return settings
+
+
 @pytest.fixture()
 def spine(qapp, tmp_path):
     """A Qt window over the full simulated composition, torn down safely."""
-    settings = Settings()
+    settings = _fast(Settings())
     rig = build_instrument_rig(settings, simulate=True)
     db = Database(tmp_path / "qt.db")
     safety = SafetyMonitor(settings.safety, rig.smu, rig.wavegen, db)
@@ -60,6 +80,7 @@ def spine(qapp, tmp_path):
     closed: list[bool] = []
     window = QtMainWindow(
         settings=settings,
+        db=db,
         engine=engine,
         safety=safety,
         smu=rig.smu,
@@ -162,6 +183,59 @@ def test_the_bridge_relays_bus_events_and_unsubscribes_on_close(
     bus.publish(StatusUpdatedEvent(message="after close"))
     qapp.processEvents()
     assert received == ["hello from a worker"]
+
+
+def test_a_full_simulated_experiment_runs_through_the_qt_window(
+    qapp, spine
+) -> None:
+    """The end-to-end proof: click Start, get a completed run in the DB.
+
+    Same production engine, drivers and storage as the bench; only the
+    bytes are synthetic. Tuning options are off so the run is the plain
+    arm -> ramp -> sample -> complete path.
+    """
+    spine.device_combo.setCurrentText("QT-DUT")
+    spine.duration_entry.setText("0.02")
+    spine.tune_voltage_check.setChecked(False)
+    spine.tune_frequency_check.setChecked(False)
+    spine.param_selectors["voltages"].set_value(200)
+
+    # The wavegen has never been applied, so Start offers to apply first;
+    # confirm() is patched to accept in the fixture.
+    spine.start_button.click()
+    assert pump(
+        qapp,
+        lambda: spine.operations.active_kind is None
+        and not spine.engine.is_busy(),
+        timeout_s=60.0,
+    )
+    outcome = spine.engine.last_outcome
+    assert outcome is not None and outcome.success, outcome
+    record = spine.db.find_run(outcome.record.point)
+    assert record is not None and record.status == "completed"
+    assert spine.plot.sample_count > 0
+    assert "—" not in spine.last_current_label.text()
+    assert not spine.smu.output_is_on
+    assert "QT-DUT" in [
+        spine.device_combo.itemText(i)
+        for i in range(spine.device_combo.count())
+    ]
+
+
+def test_tune_dc_voltage_now_runs_and_makes_the_rig_safe(
+    qapp, spine
+) -> None:
+    spine.param_selectors["voltages"].set_value(200)
+    spine.voltage_tune_button.click()
+    assert pump(
+        qapp,
+        lambda: spine.operations.active_kind is None,
+        timeout_s=60.0,
+    )
+    message = spine.statusBar().currentMessage()
+    assert "DC voltage tune" in message or "DC voltage tuned" in message
+    assert not spine.smu.output_is_on
+    assert not spine.wavegen_controller.outputs_armed
 
 
 def test_closing_shuts_down_and_closes_resources_exactly_once(

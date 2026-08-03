@@ -186,6 +186,7 @@ def run_gui(
 
             return run_qt_shell(
                 settings=settings,
+                db=db,
                 engine=engine,
                 safety=safety,
                 smu=smu,
