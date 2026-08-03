@@ -508,3 +508,36 @@ def test_every_queued_row_is_pending():
     store = PlanStore()
     applied = store.apply([_point(200), _point(300)], source="Planner")
     assert all(not row.is_completed for row in applied_queue(applied).rows)
+
+
+def test_the_running_point_is_marked_and_only_that_point():
+    from gan_fet.ui.plan_store import applied_queue
+
+    a, b, c = _point(200), _point(300), _point(400)
+    store = PlanStore()
+    applied = store.apply([a, b, c], source="Planner")
+
+    rows = applied_queue(applied, running_point=b).rows
+    assert [row.is_running for row in rows] == [False, True, False]
+
+
+def test_without_a_running_point_no_row_claims_to_be_running():
+    from gan_fet.ui.plan_store import applied_queue
+
+    store = PlanStore()
+    applied = store.apply([_point(200), _point(300)], source="Planner")
+    assert all(not row.is_running for row in applied_queue(applied).rows)
+
+
+def test_a_point_queued_twice_shows_one_running_row():
+    """A plan may deliberately queue the same point twice, and the rig is on
+    one of them — the same convention complete_point uses to tick off one
+    occurrence per run."""
+    from gan_fet.ui.plan_store import applied_queue
+
+    point = _point(200)
+    store = PlanStore()
+    applied = store.apply([point, point], source="Planner")
+
+    rows = applied_queue(applied, running_point=point).rows
+    assert [row.is_running for row in rows] == [True, False]

@@ -259,6 +259,7 @@ class MainWindow(tk.Tk):
             all_configs=self._values("configurations"),
             callbacks=SequenceCallbacks(
                 on_status=self._status_async,
+                on_step=self._on_sequence_step,
                 on_finished=self._on_sequence_finished,
                 prompt_operator=self._prompt_operator,
             ),
@@ -1970,6 +1971,15 @@ class MainWindow(tk.Tk):
             )
         )
 
+    def _on_sequence_step(self, _index: int, _total: int, point) -> None:
+        """Sequence worker thread reports the point it is about to run."""
+        def update() -> None:
+            if self._closing:
+                return
+            if hasattr(self, "up_next_view"):
+                self.up_next_view.set_running_point(point)
+        self.ui_dispatcher.post(update)
+
     def _on_sequence_finished(self, _success: bool, message: str) -> None:
         def update() -> None:
             if self._closing:
@@ -1980,7 +1990,7 @@ class MainWindow(tk.Tk):
             self.status_bar.set_message(message)
             self.tracker.refresh()
             if hasattr(self, "up_next_view"):
-                self.up_next_view.refresh()
+                self.up_next_view.set_running_point(None)
             self.planner_tab.generate_plan(show_errors=False)
             self.analytics_tab.refresh()
             self._refresh_control_states()

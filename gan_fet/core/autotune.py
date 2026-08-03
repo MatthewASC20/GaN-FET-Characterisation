@@ -15,6 +15,7 @@ import threading
 import time
 from typing import Callable, Optional
 
+from gan_fet.core.events import MeasurementEvent, bus
 from gan_fet.core.models import MatrixPoint
 from gan_fet.instruments.base import OscilloscopeInterface, WavegenInterface
 from gan_fet.settings import WavegenSettings
@@ -29,6 +30,11 @@ log = logging.getLogger(__name__)
 PEAK_POLL_STEPS = 5
 #: A wall-clock bound as well, so a slow ramp is still watched frequently.
 PEAK_POLL_INTERVAL_S = 0.05
+#: Ramp telemetry is published every this many driver steps. The driver steps
+#: every 10 kHz, so publishing each one would flood the bus on a long ramp;
+#: every fifth step keeps the display moving at 50 kHz resolution, and the
+#: final value is always published unthinned.
+RAMP_TELEMETRY_STEPS = 5
 
 
 class FrequencyRampAborted(RuntimeError):
@@ -156,6 +162,29 @@ class WavegenController:
 
         return guarded
 
+    @staticmethod
+    def _report_frequency(freq_hz: Optional[float]) -> None:
+        """Publish the gate frequency for the live telemetry displays."""
+        if freq_hz is None:
+            return
+        bus.publish(
+            MeasurementEvent(
+                source="frequency ramp", frequency_hz=float(freq_hz)
+            )
+        )
+
+    def _ramp_reporter(self) -> Callable[[float], None]:
+        """Per-step ramp telemetry, thinned to every RAMP_TELEMETRY_STEPS."""
+        steps = 0
+
+        def report(freq_hz: float) -> None:
+            nonlocal steps
+            steps += 1
+            if steps % RAMP_TELEMETRY_STEPS == 0:
+                self._report_frequency(freq_hz)
+
+        return report
+
     def has_pending_changes(self, config: str, freq_hz: int, duty: int) -> bool:
         with self._state_lock:
             if self.applied_config is None:
@@ -221,6 +250,7 @@ class WavegenController:
                     self.applied_freq_hz = float(freq_hz)
                     self.applied_duty = float(duty)
                     self.tuned_freq_hz = float(freq_hz)
+                self._report_frequency(float(freq_hz))
                 return
 
             # Autotune deliberately moves away from the nominal selection.
@@ -240,6 +270,7 @@ class WavegenController:
                         else self.settings.freq_ramp_rate_khz_s
                     ),
                     cancel_check=cancel_check,
+                    on_step=self._ramp_reporter(),
                 )
                 with self._state_lock:
                     self.applied_freq_hz = (
@@ -248,12 +279,16 @@ class WavegenController:
                         else None
                     )
                     self.tuned_freq_hz = actual_freq
+                # Published even for a cancelled ramp: the display should show
+                # where the gate actually stopped, not where it was headed.
+                self._report_frequency(actual_freq)
                 if status is not None:
                     status(f"Frequency Ramp: {actual_freq / 1e6:.3f} MHz")
             else:
                 with self._state_lock:
                     self.applied_freq_hz = float(freq_hz)
                     self.tuned_freq_hz = float(actual_before)
+                self._report_frequency(float(actual_before))
 
             if cancel_check is not None and cancel_check():
                 return
@@ -340,11 +375,15 @@ class WavegenController:
                     else self.settings.freq_ramp_rate_khz_s
                 ),
                 cancel_check=self._peak_guard(cancel_check, breach),
+                on_step=self._ramp_reporter(),
             )
             # The ramp stops where it is rather than continuing to target, so
             # the recorded tuned frequency must be what was actually applied.
             with self._state_lock:
                 self.tuned_freq_hz = actual
+            # Reported before the breach check: on an abort the display must
+            # show the frequency the gate is actually at.
+            self._report_frequency(actual)
             if breach:
                 log.error(
                     "Frequency ramp aborted at %.4f MHz: Vds peak %.1f V "

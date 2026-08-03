@@ -444,6 +444,9 @@ class UpNextView(ttk.LabelFrame):
         # When a plan has been applied, it is what runs, so it is what this
         # shows. Without one the live matrix drives the queue as before.
         self.plan_store = plan_store
+        # The point the auto sequence is on right now, reported via on_step
+        # and cleared when the sequence ends. Highlighted, not persisted.
+        self._running_point: Optional[MatrixPoint] = None
 
         self._build_ui()
 
@@ -471,6 +474,11 @@ class UpNextView(ttk.LabelFrame):
 
         self.tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+
+    def set_running_point(self, point: Optional[MatrixPoint]) -> None:
+        """Highlight the point the sequence is measuring; None clears it."""
+        self._running_point = point
+        self.refresh()
 
     def refresh(self) -> None:
         """Show the applied plan, or say that there is none.
@@ -500,7 +508,11 @@ class UpNextView(ttk.LabelFrame):
         so instead of quietly listing work that will be refused.
         """
         try:
-            contents = applied_queue(applied, self.get_device_name().strip())
+            contents = applied_queue(
+                applied,
+                self.get_device_name().strip(),
+                running_point=self._running_point,
+            )
         except Exception:
             # A blank table and an unchanged heading is what this used to look
             # like, which reads as "the plan is empty" rather than "something

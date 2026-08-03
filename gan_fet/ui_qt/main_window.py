@@ -6,11 +6,9 @@ engine through the same toolkit-free policy modules: ``run_request`` builds
 the parameters, ``experiment_ops`` decides preconditions and cancel
 routing, ``resolve_rig_control_state`` decides what is enabled.
 
-Working against ``--simulate``: full experiment runs (start, pause,
-cancel, overwrite confirmation), Apply Wavegen Settings, Tune DC Voltage
-Now, Bus Off, Reset Safety, EMERGENCY STOP, live plot and telemetry.
-Planner, tracker, analytics and configuration screens are still Tk; the
-composition root offers this window only under ``--simulate``.
+Full experiment runs (start, pause, cancel, overwrite confirmation),
+Apply Wavegen Settings, Tune DC Voltage Now, Bus Off, Reset Safety,
+EMERGENCY STOP, sequences, live plot and telemetry, and the data tabs.
 
 Threading contract, same as Tk: workers never touch a widget. Completion
 callbacks arrive through :class:`QtDispatcher`; broadcast telemetry arrives
@@ -45,7 +43,11 @@ from PyQt6.QtWidgets import (
 
 from gan_fet.core.autotune import find_prior_tuned_frequency
 from gan_fet.core.experiment import EngineCallbacks
-from gan_fet.core.models import ExperimentParams, ExperimentState
+from gan_fet.core.models import (
+    ExperimentParams,
+    ExperimentState,
+    MatrixPoint,
+)
 from gan_fet.core.sequence import AutoSequence, SequenceCallbacks
 from gan_fet.ui.operations.experiment_ops import (
     APPLY_FIRST_PROMPT,
@@ -150,7 +152,7 @@ class QtMainWindow(QMainWindow):
         bridge: Optional[EventBridge] = None,
     ) -> None:
         super().__init__()
-        self.setWindowTitle("GaN FET Characterisation (Qt preview)")
+        self.setWindowTitle("GaN FET Characterisation (Qt)")
         self.settings = settings
         self.db = db
         self.engine = engine
@@ -187,8 +189,7 @@ class QtMainWindow(QMainWindow):
             callbacks=SequenceCallbacks(
                 on_status=self.set_status_async,
                 on_step=lambda index, total, point: self.dispatcher.post(
-                    self._status.showMessage,
-                    f"Sequence {index + 1}/{total}: {point.describe()}",
+                    self._on_sequence_step, index, total, point
                 ),
                 on_finished=lambda ok, message: self.dispatcher.post(
                     self._on_sequence_finished, ok, message
@@ -656,13 +657,24 @@ class QtMainWindow(QMainWindow):
         """Blocking chamber prompt from the sequence worker; None aborts."""
         return bool(self.dispatcher.call(self.confirm, title, message))
 
+    def _on_sequence_step(
+        self, index: int, total: int, point: MatrixPoint
+    ) -> None:
+        # Each sequence point is its own run: start its trace the way a
+        # manual Start does, or successive runs pile onto one axes.
+        self.plot.reset(point.describe())
+        self._status.showMessage(f"Sequence {index}/{total}: {point.describe()}")
+        self.queue_view.set_running_point(point)
+
     def _on_sequence_finished(self, success: bool, message: str) -> None:
         active = self.operations.active
         if active is not None and active.kind == "sequence":
             self.operations.finish(active)
         self.sequence_button.setText("Start Auto Sequence")
         self.sequence_button.setEnabled(True)
-        self.queue_view.refresh()
+        # Clears the running highlight and refreshes in one step: a stopped
+        # sequence must not leave a row claiming to be in progress.
+        self.queue_view.set_running_point(None)
         self._status.showMessage(message)
         if not success:
             self.show_error("Auto Sequence", message)

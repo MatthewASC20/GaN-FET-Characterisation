@@ -48,7 +48,8 @@ class _Wavegen:
         return self.plant.wavegen_frequency_hz
 
     def ramp_to_frequency(
-        self, target_freq_hz, dual, *, rate_khz_s=None, cancel_check=None
+        self, target_freq_hz, dual, *, rate_khz_s=None, cancel_check=None,
+        on_step=None,
     ) -> float:
         current = float(self.plant.wavegen_frequency_hz)
         target = float(target_freq_hz)
@@ -58,6 +59,8 @@ class _Wavegen:
                 return current
             current += direction * min(10_000.0, abs(target - current))
             self.plant.wavegen_frequency_hz = current
+            if on_step is not None:
+                on_step(current)
         return current
 
 

@@ -196,8 +196,14 @@ class WavegenInterface(ABC):
         *,
         rate_khz_s: Optional[float] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        on_step: Optional[Callable[[float], None]] = None,
     ) -> float:
-        """Ramp frequency and return the last successfully applied value."""
+        """Ramp frequency and return the last successfully applied value.
+
+        ``on_step`` is called with every frequency actually written, so a
+        caller can report ramp progress without querying the instrument
+        mid-ramp. It must not raise.
+        """
         ...
 
     @abstractmethod

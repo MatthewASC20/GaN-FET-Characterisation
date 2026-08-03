@@ -147,9 +147,12 @@ class FakeWavegen(WavegenInterface):
         *,
         rate_khz_s: Optional[float] = None,
         cancel_check=None,
+        on_step=None,
     ) -> float:
         del dual, rate_khz_s, cancel_check
         self.set_frequency(target_freq_hz, False)
+        if on_step is not None:
+            on_step(float(target_freq_hz))
         return float(target_freq_hz)
 
     def set_duty(self, duty_pct: float, dual: bool) -> None:

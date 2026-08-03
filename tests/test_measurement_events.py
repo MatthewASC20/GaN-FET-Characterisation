@@ -13,8 +13,11 @@ import math
 
 import pytest
 
+from gan_fet.core.autotune import WavegenController
 from gan_fet.core.events import MeasurementEvent, SampleAcquiredEvent, bus
-from gan_fet.instruments.mock_scpi import SimulatedRigPlant
+from gan_fet.instruments.mock_scpi import MockScpiTcpClient, SimulatedRigPlant
+from gan_fet.instruments.wavegen import Sdg6022x
+from gan_fet.settings import WavegenSettings
 
 import sys
 
@@ -144,6 +147,67 @@ def test_a_measurement_event_defaults_to_nothing_measured():
     assert event.bus_voltage is None
     assert event.vds_peak is None
     assert event.dc_current is None
+
+
+# -- The apply and recall ramps report as they move ---------------------------
+#
+# At the bench rate of 200 kHz/s, moving the gate from 6 to 13 MHz is a
+# 35-second ramp. Without these events the frequency card sits on the previous
+# run's value the whole time, which reads as "the apply did nothing".
+
+
+def _controller() -> WavegenController:
+    plant = SimulatedRigPlant()
+    wavegen = Sdg6022x(MockScpiTcpClient("SDG6022X", shared_plant=plant))
+    return WavegenController(wavegen, WavegenSettings())
+
+
+def test_applying_new_settings_reports_the_ramp_as_it_moves(seen):
+    controller = _controller()
+    controller.apply("Single Device", 6_000_000, 50)
+    seen.clear()
+
+    controller.apply("Single Device", 13_000_000, 50, freq_rate_khz_s=1e9)
+
+    ramp = [e for e in seen if e.source == "frequency ramp"]
+    assert len(ramp) > 3, "a multi-step ramp should report more than once"
+    frequencies = [e.frequency_hz for e in ramp]
+    assert frequencies == sorted(frequencies), "the sweep climbs 6 → 13 MHz"
+    assert frequencies[-1] == pytest.approx(13_000_000.0)
+
+
+def test_the_first_apply_reports_the_configured_frequency(seen):
+    """A configuration change sets the frequency directly rather than
+    ramping; the display still needs to hear about it."""
+    controller = _controller()
+    controller.apply("Single Device", 6_000_000, 50)
+    ramp = [e for e in seen if e.source == "frequency ramp"]
+    assert [e.frequency_hz for e in ramp] == [pytest.approx(6_000_000.0)]
+
+
+def test_a_no_op_apply_still_reports_where_the_gate_is(seen):
+    """Re-applying identical settings moves nothing, but publishing the
+    actual frequency lets a stale display resynchronise."""
+    controller = _controller()
+    controller.apply("Single Device", 13_000_000, 50)
+    seen.clear()
+
+    controller.apply("Single Device", 13_000_000, 50)
+
+    ramp = [e for e in seen if e.source == "frequency ramp"]
+    assert [e.frequency_hz for e in ramp] == [pytest.approx(13_000_000.0)]
+
+
+def test_the_recall_ramp_reports_like_the_apply_ramp(seen):
+    controller = _controller()
+    controller.apply("Single Device", 6_000_000, 50)
+    seen.clear()
+
+    controller.ramp_to_frequency(6_500_000.0, "Single Device", rate_khz_s=1e9)
+
+    ramp = [e for e in seen if e.source == "frequency ramp"]
+    assert len(ramp) > 3
+    assert ramp[-1].frequency_hz == pytest.approx(6_500_000.0)
 
 
 def test_a_reading_that_trips_the_rig_is_not_published_as_an_operating_point(

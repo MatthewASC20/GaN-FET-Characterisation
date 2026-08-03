@@ -234,6 +234,21 @@ def test_a_full_simulated_experiment_runs_through_the_qt_window(
     ]
 
 
+def test_apply_wavegen_settings_moves_the_frequency_card(qapp, spine) -> None:
+    """The report that motivated ramp telemetry: select a new frequency,
+    click Apply, and f_sw must land on it without a run being started."""
+    card = spine._telemetry_values["freq_hz"]
+    assert spine.param_selectors["frequencies"].set_value(6_000_000)
+    spine.apply_button.click()
+    assert pump(qapp, lambda: card.text() == "6.00 MHz", 30.0)
+
+    assert spine.param_selectors["frequencies"].set_value(13_000_000)
+    spine.apply_button.click()
+    assert pump(qapp, lambda: card.text() == "13.00 MHz", 30.0)
+    assert pump(qapp, lambda: spine.operations.active_kind is None)
+    assert "applied" in spine.statusBar().currentMessage().lower()
+
+
 def test_tune_dc_voltage_now_runs_and_makes_the_rig_safe(
     qapp, spine
 ) -> None:
@@ -259,6 +274,29 @@ def test_closing_shuts_down_and_closes_resources_exactly_once(
     assert spine._resources_closed_calls == [True]
     assert not spine.smu.output_is_on
     assert not spine.wavegen_controller.outputs_armed
+
+
+def test_the_live_plot_keeps_one_trace_and_clears_between_runs(qapp) -> None:
+    """The stacked-lines report: three queued runs drew on top of each other.
+
+    Each append must extend the run's single trace, not add another line
+    artist, and reset must leave a blank, retitled axes for the next run.
+    """
+    from gan_fet.ui_qt.plot import QtLivePlot
+
+    plot = QtLivePlot()
+    plot.reset("first point")
+    for i in range(5):
+        plot.append(float(i), 0.055 + i * 1e-4, 94.5 + i * 0.1)
+    assert plot.sample_count == 5
+    assert len(plot._ax_current.lines) == 1
+    assert len(plot._ax_volts.lines) == 1
+
+    plot.reset("second point")
+    assert plot.sample_count == 0
+    assert plot.title == "second point"
+    assert [list(line.get_xdata()) for line in plot._ax_current.lines] == [[]]
+    assert [list(line.get_xdata()) for line in plot._ax_volts.lines] == [[]]
 
 
 def test_a_planned_sequence_runs_its_points_through_the_qt_window(
@@ -305,5 +343,9 @@ def test_a_planned_sequence_runs_its_points_through_the_qt_window(
     for point in points:
         record = spine.db.find_run(point)
         assert record is not None and record.status == "completed", point
+    # The plot restarts per sequence point: it must end the sequence showing
+    # only the final point's run, not every run stacked on one axes.
+    assert spine.plot.title == points[-1].describe()
+    assert len(spine.plot._ax_current.lines) == 1
     assert not spine.smu.output_is_on
     assert not spine.wavegen_controller.outputs_armed

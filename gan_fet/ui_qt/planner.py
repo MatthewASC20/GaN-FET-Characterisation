@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from gan_fet.core.models import sanitize_device_name
+from gan_fet.core.models import MatrixPoint, sanitize_device_name
 from gan_fet.core.sequence import PlanSummary, build_matrix_plan
 from gan_fet.settings import Settings
 from gan_fet.storage.db import Database
@@ -106,7 +106,13 @@ def fill_plan_table(
     count = 0
     for index, row in enumerate(rows, start=1):
         values, tag = plan_values(
-            index, row.point, row.is_completed, duration_minutes
+            index,
+            row.point,
+            row.is_completed,
+            duration_minutes,
+            # Only the queue's PlanRow knows about running; the planner's
+            # PlannedTestPoint predates the idea and nothing there runs.
+            is_running=getattr(row, "is_running", False),
         )
         style = _TAG_STYLES[tag]
         foreground = QColor(style["foreground"])
@@ -497,6 +503,9 @@ class QueueView(QWidget):
     def __init__(self, plan_store: PlanStore) -> None:
         super().__init__()
         self.plan_store = plan_store
+        # The point the auto sequence is on right now, reported via on_step
+        # and cleared when the sequence ends. Highlighted, not persisted.
+        self._running_point: Optional[MatrixPoint] = None
 
         layout = QVBoxLayout(self)
         self.heading_label = QLabel(NO_PLAN_HEADING)
@@ -508,6 +517,11 @@ class QueueView(QWidget):
 
         self.refresh()
 
+    def set_running_point(self, point: Optional[MatrixPoint]) -> None:
+        """Highlight the point the sequence is measuring; None clears it."""
+        self._running_point = point
+        self.refresh()
+
     def refresh(self) -> None:
         """Show the applied plan's outstanding points, or say there is none."""
         self.table.setRowCount(0)
@@ -515,6 +529,6 @@ class QueueView(QWidget):
         if applied is None:
             self.heading_label.setText(NO_PLAN_HEADING)
             return
-        contents = applied_queue(applied)
+        contents = applied_queue(applied, running_point=self._running_point)
         self.heading_label.setText(contents.heading)
         fill_plan_table(self.table, contents.rows)

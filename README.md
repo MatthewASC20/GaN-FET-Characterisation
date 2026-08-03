@@ -68,7 +68,7 @@ Requires Python ≥ 3.10 with tkinter available (`python3-tk` on Debian/Ubuntu).
 gan-fet                 # GUI with live bench hardware
 gan-fet --simulate      # GUI with isolated virtual instruments and data
 gan-fet --diagnose      # hardware connectivity self-test
-gan-fet --qt --simulate # PyQt6 interface preview (simulation only for now)
+gan-fet --qt            # PyQt6 interface (add --simulate to practise)
 ```
 
 On macOS, you can also double-click `RUN-GAN-FET-SIMULATION.command` in the

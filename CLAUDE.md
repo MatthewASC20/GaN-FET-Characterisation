@@ -15,7 +15,7 @@ pip install -e ".[macos]"    # + tkmacosx coloured buttons
 gan-fet                      # GUI against live bench hardware
 gan-fet --simulate           # GUI against virtual instruments, isolated data
 gan-fet --diagnose           # hardware connectivity self-test
-gan-fet --qt --simulate      # PyQt6 shell preview; refuses live hardware
+gan-fet --qt                 # PyQt6 interface; --simulate to practise
 
 ruff check gan_fet scripts tests
 mypy gan_fet                 # must stay clean; CI gates on it
@@ -40,9 +40,8 @@ Dependencies point **down** this list. Do not introduce an upward import.
 1. `app.py` — composition root and CLI. Owns process resources; closes the
    database, clients, Sheets worker and SCPI logger idempotently.
 2. `ui/` — tkinter (plus toolkit-free policy modules shared with `ui_qt/`).
-   `ui_qt/` — the PyQt6 front-end being built in parallel; launched with
-   `--qt`, simulation-only until its operations spine lands. Both translate
-   operator actions into core operations.
+   `ui_qt/` — the PyQt6 front-end built in parallel; launched with `--qt`.
+   Both translate operator actions into core operations.
 3. `core/` — experiment engine, sequence, peak control, voltage tune, autotune, safety.
    **No Tk dependency, ever.** This boundary is enforced by tests.
 4. `instruments/` — hardware interfaces. `rig.py` is the *only* place mapping

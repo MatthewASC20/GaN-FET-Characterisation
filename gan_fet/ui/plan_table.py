@@ -57,13 +57,17 @@ PLAN_COLUMNS: tuple[tuple[str, str, int, str], ...] = (
 PLAN_COLUMN_IDS = tuple(spec[0] for spec in PLAN_COLUMNS)
 
 #: Completed rows stay visible but recede. Pending rows are the ones the
-#: operator is being asked to read.
+#: operator is being asked to read. The running row is the one the rig is on
+#: right now, and it is highlighted so a glance at the queue answers "what is
+#: it doing" without reading the status column.
 COMPLETED_TAG = "completed"
 PENDING_TAG = "pending"
+RUNNING_TAG = "running"
 
 _TAG_STYLES = {
     COMPLETED_TAG: {"foreground": "#666666", "background": "#f0f0f0"},
     PENDING_TAG: {"foreground": "#0d47a1"},
+    RUNNING_TAG: {"foreground": "#1b5e20", "background": "#c8e6c9"},
 }
 
 
@@ -72,6 +76,7 @@ def plan_values(
     point: MatrixPoint,
     is_completed: bool,
     duration_minutes: Optional[float] = None,
+    is_running: bool = False,
 ) -> tuple[tuple, str]:
     """The cell values and row tag for one planned point.
 
@@ -81,7 +86,17 @@ def plan_values(
 
     ``duration_minutes`` of None leaves the estimate blank rather than
     guessing, because the queue has no per-point duration to show.
+
+    ``is_completed`` wins over ``is_running``: completion is a stored fact,
+    while "running" is a transient claim from the sequence worker, and a row
+    must never report a measured point as still in progress.
     """
+    if is_completed:
+        status, tag = "Completed", COMPLETED_TAG
+    elif is_running:
+        status, tag = "Running", RUNNING_TAG
+    else:
+        status, tag = "Pending", PENDING_TAG
     return (
         (
             f"{index}",
@@ -90,10 +105,10 @@ def plan_values(
             freq_label(point.frequency_hz),
             f"{point.duty_pct} %",
             f"{point.voltage_v} V",
-            "Completed" if is_completed else "Pending",
+            status,
             "" if duration_minutes is None else f"{duration_minutes:.1f}",
         ),
-        COMPLETED_TAG if is_completed else PENDING_TAG,
+        tag,
     )
 
 
@@ -121,7 +136,13 @@ def fill_plan_tree(
     count = 0
     for index, row in enumerate(rows, start=1):
         values, tag = plan_values(
-            index, row.point, row.is_completed, duration_minutes
+            index,
+            row.point,
+            row.is_completed,
+            duration_minutes,
+            # Only the queue's PlanRow knows about running; the planner's
+            # PlannedTestPoint predates the idea and nothing there runs.
+            is_running=getattr(row, "is_running", False),
         )
         tree.insert("", "end", values=values, tags=(tag,))
         count += 1

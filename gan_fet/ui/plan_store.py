@@ -366,10 +366,15 @@ def pending_points(applied: AppliedPlan) -> list[MatrixPoint]:
 
 @dataclass(frozen=True)
 class PlanRow:
-    """One row of a plan table: the point, and whether it has been measured."""
+    """One row of a plan table: the point, and whether it has been measured.
+
+    ``is_running`` is transient UI state, never persisted: the sequence
+    worker reports the point it is on, and the queue highlights it.
+    """
 
     point: MatrixPoint
     is_completed: bool
+    is_running: bool = False
 
 
 @dataclass(frozen=True)
@@ -380,19 +385,35 @@ class QueueContents:
     heading: str
 
 
-def plan_rows(applied: AppliedPlan) -> list[PlanRow]:
+def plan_rows(
+    applied: AppliedPlan,
+    running_point: Optional[MatrixPoint] = None,
+) -> list[PlanRow]:
     """The outstanding points, in run order.
 
     All pending: measured points are marked in the stored plan and filtered
     out here, so the table drains as the sequence works through it. The flag
     is carried anyway so these rows render through the same table code as the
     planner's listing, where completed points *are* shown.
+
+    ``running_point`` marks the first matching row as in progress. First
+    only, deliberately: a plan may queue the same point twice, and the rig is
+    on one of them — the same convention ``complete_point`` uses to tick off
+    one occurrence per run.
     """
-    return [PlanRow(point, False) for point in applied.pending]
+    rows = []
+    for point in applied.pending:
+        is_running = running_point is not None and point == running_point
+        if is_running:
+            running_point = None
+        rows.append(PlanRow(point, False, is_running))
+    return rows
 
 
 def applied_queue(
-    applied: AppliedPlan, selected_device: str = ""
+    applied: AppliedPlan,
+    selected_device: str = "",
+    running_point: Optional[MatrixPoint] = None,
 ) -> QueueContents:
     """Rows and heading for an applied plan.
 
@@ -400,7 +421,7 @@ def applied_queue(
     a broken one on screen, and a bug in here could only be found by running
     the application. Now it can be exercised without a display.
     """
-    rows = plan_rows(applied)
+    rows = plan_rows(applied, running_point)
     return QueueContents(rows, queue_heading(applied, selected_device))
 
 

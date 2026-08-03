@@ -14,10 +14,12 @@ from __future__ import annotations
 from gan_fet.core.models import MatrixPoint
 from gan_fet.ui.plan_store import PlanRow
 from gan_fet.ui.plan_table import (
+    _TAG_STYLES,
     COMPLETED_TAG,
     PENDING_TAG,
     PLAN_COLUMN_IDS,
     PLAN_COLUMNS,
+    RUNNING_TAG,
     plan_values,
 )
 
@@ -82,6 +84,26 @@ def test_the_status_cell_says_which():
 
     assert "Completed" in done
     assert "Pending" in todo
+
+
+def test_the_running_row_says_so_and_is_highlighted():
+    """The sequence's current point used to sit in the queue saying "Pending",
+    which reads as "not started" while the rig is driving 400 V into it."""
+    values, tag = plan_values(1, _point(), False, None, is_running=True)
+
+    assert "Running" in values
+    assert tag == RUNNING_TAG
+    assert tag in _TAG_STYLES, "a tag with no style renders as plain pending"
+    assert "background" in _TAG_STYLES[tag], "the highlight is the point"
+
+
+def test_a_completed_row_is_never_reported_as_running():
+    """Completion is a stored fact; "running" is a transient claim from the
+    sequence worker. Where they disagree, the stored fact wins."""
+    values, tag = plan_values(1, _point(), True, None, is_running=True)
+
+    assert "Completed" in values
+    assert tag == COMPLETED_TAG
 
 
 def test_the_index_is_the_position_in_the_plan():

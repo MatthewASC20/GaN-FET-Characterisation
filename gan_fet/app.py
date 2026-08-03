@@ -180,10 +180,11 @@ def run_gui(
         resources.sheets = sheets
 
         if use_qt:
-            # Operations spine only: experiment screens are still Tk, so
-            # the composition root offers this against virtual instruments.
             from gan_fet.ui_qt.app import run_qt_shell
 
+            # Worker thread: results hand off to the (optional) Sheets
+            # mirror, exactly as the Tk window wires it.
+            engine.on_run_completed = sheets.enqueue_run
             return run_qt_shell(
                 settings=settings,
                 db=db,
@@ -191,7 +192,10 @@ def run_gui(
                 safety=safety,
                 smu=smu,
                 wavegen_controller=wavegen_controller,
+                sheets=sheets,
                 is_simulated=simulate,
+                hardware_offline=hardware_offline,
+                recovered_runs=recovered_runs,
                 close_resources=resources.close,
             )
 
@@ -257,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--qt",
         action="store_true",
-        help="use the PyQt6 interface preview (requires --simulate for now)",
+        help="use the PyQt6 interface (works with and without --simulate)",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="debug logging")
     args = parser.parse_args(argv)
@@ -279,13 +283,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.diagnose:
         return run_diagnostics(settings)
-    if args.qt and not args.simulate:
-        print(
-            "--qt currently requires --simulate: the Qt front-end has no "
-            "operations spine yet and must not drive the bench.",
-            file=sys.stderr,
-        )
-        return 2
     return run_gui(settings, simulate=args.simulate, use_qt=args.qt)
 
 

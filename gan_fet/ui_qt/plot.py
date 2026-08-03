@@ -11,6 +11,7 @@ from typing import Optional
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 
 
 class QtLivePlot(FigureCanvasQTAgg):
@@ -22,6 +23,8 @@ class QtLivePlot(FigureCanvasQTAgg):
         self._times: list[float] = []
         self._currents: list[float] = []
         self._volts: list[Optional[float]] = []
+        self._line_current: Line2D
+        self._line_volts: Line2D
         self.reset("No run yet")
 
     def reset(self, title: str) -> None:
@@ -34,6 +37,14 @@ class QtLivePlot(FigureCanvasQTAgg):
         self._ax_current.set_xlabel("Elapsed (s)")
         self._ax_current.set_ylabel("DC input current (A)", color="tab:blue")
         self._ax_volts.set_ylabel("SMU voltage (V)", color="tab:red")
+        # One artist per axis, updated in place by append(). Plotting a new
+        # line per sample stacks artists for the run's whole duration.
+        (self._line_current,) = self._ax_current.plot(
+            [], [], color="tab:blue", linewidth=1.2
+        )
+        (self._line_volts,) = self._ax_volts.plot(
+            [], [], color="tab:red", linewidth=1.0
+        )
         self.draw_idle()
 
     def append(
@@ -45,23 +56,26 @@ class QtLivePlot(FigureCanvasQTAgg):
         self._times.append(elapsed_s)
         self._currents.append(current_a)
         self._volts.append(smu_voltage_v)
-        self._ax_current.plot(
-            self._times, self._currents, color="tab:blue", linewidth=1.2
-        )
+        self._line_current.set_data(self._times, self._currents)
         known = [
             (t, v)
             for t, v in zip(self._times, self._volts)
             if v is not None
         ]
         if known:
-            self._ax_volts.plot(
+            self._line_volts.set_data(
                 [t for t, _ in known],
                 [v for _, v in known],
-                color="tab:red",
-                linewidth=1.0,
             )
+        for ax in (self._ax_current, self._ax_volts):
+            ax.relim()
+            ax.autoscale_view()
         self.draw_idle()
 
     @property
     def sample_count(self) -> int:
         return len(self._times)
+
+    @property
+    def title(self) -> str:
+        return self._ax_current.get_title()

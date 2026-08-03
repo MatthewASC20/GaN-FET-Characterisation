@@ -196,6 +196,7 @@ class Sdg6022x(WavegenInterface):
         *,
         rate_khz_s: Optional[float] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        on_step: Optional[Callable[[float], None]] = None,
     ) -> float:
         """Gradually ramp frequency to target goal at configured rate (kHz/s)."""
         self._validate_frequency(target_freq_hz)
@@ -210,11 +211,15 @@ class Sdg6022x(WavegenInterface):
                     "Frequency ramp cancelled before the current value was known"
                 )
             self._raw_set_frequency(target_freq_hz, dual)
+            if on_step is not None:
+                on_step(float(target_freq_hz))
             return float(target_freq_hz)
         if abs(target_freq_hz - start) < 1.0:
             if cancel_check is not None and cancel_check():
                 return float(start)
             self._raw_set_frequency(target_freq_hz, dual)
+            if on_step is not None:
+                on_step(float(target_freq_hz))
             return float(target_freq_hz)
 
         rate = float(rate_khz_s if rate_khz_s is not None and rate_khz_s > 0 else DEFAULT_FREQ_RATE_KHZ_S)
@@ -237,6 +242,8 @@ class Sdg6022x(WavegenInterface):
             else:
                 current += direction * step_hz
             self._raw_set_frequency(current, dual)
+            if on_step is not None:
+                on_step(current)
             if current != target:
                 time.sleep(delay)
 
