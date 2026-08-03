@@ -18,3 +18,17 @@ def mode_banner_presentation(is_simulated: bool) -> tuple[str, str]:
             "#6a1b9a",
         )
     return ("LIVE HARDWARE — REAL BENCH OUTPUTS", "#b71c1c")
+
+
+#: Operator-facing names for the operations that need the hardware online.
+#: Keyed by operation kind; both front-ends quote these in refusals.
+HARDWARE_OPERATION_LABELS = {
+    "apply_wavegen": "apply wavegen settings",
+    "autotune": "recall the tuned frequency",
+    "bus_off": "control the bus output",
+    "experiment": "start an experiment",
+    "reset_safety": "reset the safety interlock",
+    "sequence": "start an auto sequence",
+    "simulation_validation": "start the simulated validation run",
+    "voltage_tune": "tune the DC voltage",
+}

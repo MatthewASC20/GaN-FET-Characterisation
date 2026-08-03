@@ -180,13 +180,18 @@ def run_gui(
         resources.sheets = sheets
 
         if use_qt:
-            # Phase-1 shell: no operations spine yet, so the composition
-            # root only offers it against virtual instruments.
+            # Operations spine only: experiment screens are still Tk, so
+            # the composition root offers this against virtual instruments.
             from gan_fet.ui_qt.app import run_qt_shell
 
             return run_qt_shell(
+                settings=settings,
+                engine=engine,
+                safety=safety,
+                smu=smu,
+                wavegen_controller=wavegen_controller,
                 is_simulated=simulate,
-                on_emergency_stop=engine.request_emergency_stop,
+                close_resources=resources.close,
             )
 
         window = MainWindow(

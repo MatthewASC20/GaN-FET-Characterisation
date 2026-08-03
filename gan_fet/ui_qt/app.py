@@ -1,8 +1,9 @@
 """Qt application runner.
 
-Owns the ``QApplication`` for the lifetime of the window; the caller keeps
-owning process resources (database, clients, loggers) and closes them after
-this returns, exactly as with the Tk main loop.
+Owns the ``QApplication`` for the lifetime of the window. The caller keeps
+owning process resources and closes them idempotently after this returns;
+the window's own closing sequence also closes them before accepting the
+close, whichever happens first.
 """
 
 from __future__ import annotations
@@ -12,8 +13,13 @@ from typing import Callable
 
 def run_qt_shell(
     *,
+    settings,
+    engine,
+    safety,
+    smu,
+    wavegen_controller,
     is_simulated: bool,
-    on_emergency_stop: Callable[[], object],
+    close_resources: Callable[[], None],
 ) -> int:
     from PyQt6.QtWidgets import QApplication
 
@@ -21,8 +27,13 @@ def run_qt_shell(
 
     app = QApplication.instance() or QApplication([])
     window = QtMainWindow(
+        settings=settings,
+        engine=engine,
+        safety=safety,
+        smu=smu,
+        wavegen_controller=wavegen_controller,
         is_simulated=is_simulated,
-        on_emergency_stop=on_emergency_stop,
+        close_resources=close_resources,
     )
     window.resize(960, 640)
     window.show()

@@ -146,16 +146,9 @@ class ExperimentRow(IntEnum):
 
 EXPERIMENT_PLOT_ROWSPAN = int(ExperimentRow.FLEX_SPACER) + 1
 
-HARDWARE_OPERATION_LABELS = {
-    "apply_wavegen": "apply wavegen settings",
-    "autotune": "recall the tuned frequency",
-    "bus_off": "control the bus output",
-    "experiment": "start an experiment",
-    "reset_safety": "reset the safety interlock",
-    "sequence": "start an auto sequence",
-    "simulation_validation": "start the simulated validation run",
-    "voltage_tune": "tune the DC voltage",
-}
+from gan_fet.ui.presentation import (  # noqa: E402
+    HARDWARE_OPERATION_LABELS,
+)
 
 # Confirm-button state colours (unchanged from v1)
 COLOR_PENDING = "#e53935"    # red — selection differs from what's on the wavegen
