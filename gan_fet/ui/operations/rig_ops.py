@@ -140,3 +140,73 @@ def zvs_precondition(
         )
 
     return ZvsDecision(ZvsAction.LAUNCH)
+
+
+class AutotuneAction(Enum):
+    """What pressing Autotune should do."""
+
+    HARDWARE_OFFLINE = auto()
+    REFUSE = auto()
+    APPLY_WAVEGEN_FIRST = auto()
+    LAUNCH = auto()
+
+
+@dataclass(frozen=True)
+class AutotuneDecision:
+    action: AutotuneAction
+    refusal: Optional[Refusal] = None
+    prompt: Optional[tuple[str, str]] = None
+
+
+_AUTOTUNE_APPLY_FIRST = (
+    "Autotune",
+    "Wavegen settings have not been applied yet. Apply them first?",
+)
+
+#: Why autotune is refused with the bus live. Spelled out rather than
+#: shortened: the operator is being told to do something else instead, and
+#: needs to know that the alternative is not the same operation.
+BUS_ENERGISED_MESSAGE = (
+    "The SMU bus is energised.\n\n"
+    "Autotune ramps the gate frequency, which moves the resonant operating "
+    "point and therefore Vds peak, with no closed-loop peak control.\n\n"
+    "Switch the bus off first, or use 'Find frequency before run', which "
+    "holds Vds peak on target throughout the search."
+)
+
+
+def autotune_precondition(
+    *,
+    hardware_offline: bool,
+    bus_energised: bool,
+    has_candidate: bool,
+    wavegen_pending: bool,
+) -> AutotuneDecision:
+    """Decide whether the gate frequency may be ramped to a stored value.
+
+    The bus check is the substance. Autotune moves frequency with no
+    closed-loop peak control behind it, so with the bus live the resonant
+    operating point — and therefore Vds peak — moves uncontrolled. It is
+    checked here as well as on the button because widget state is refreshed by
+    callbacks and can lag the rig.
+    """
+    if hardware_offline:
+        return AutotuneDecision(AutotuneAction.HARDWARE_OFFLINE)
+    if bus_energised:
+        return AutotuneDecision(
+            AutotuneAction.REFUSE, Refusal("Autotune", BUS_ENERGISED_MESSAGE)
+        )
+    if not has_candidate:
+        return AutotuneDecision(
+            AutotuneAction.REFUSE,
+            Refusal(
+                "Autotune",
+                "No tuned frequency is available for the current settings.",
+                severity="info",
+            ),
+        )
+    if wavegen_pending:
+        return AutotuneDecision(
+            AutotuneAction.APPLY_WAVEGEN_FIRST, prompt=_AUTOTUNE_APPLY_FIRST
+        )
+    return AutotuneDecision(AutotuneAction.LAUNCH)

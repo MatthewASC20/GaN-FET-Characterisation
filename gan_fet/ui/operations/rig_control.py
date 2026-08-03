@@ -17,6 +17,7 @@ import logging
 import threading
 from typing import Any, Callable, Optional, Protocol
 
+from gan_fet.core.autotune import FrequencyRampAborted
 from gan_fet.ui.operations.background import Dispatcher, run_in_background
 from gan_fet.ui.operations.worker_pool import WorkerPool
 from gan_fet.ui.widgets import OperationCoordinator, OperationToken
@@ -116,6 +117,12 @@ class RigUi(Protocol):
 
     def set_status_async(self, message: str) -> None:
         """Set the status line from a worker thread."""
+
+    def set_tuning(self, active: bool) -> None:
+        """Show that the gate frequency is being ramped, or has stopped."""
+
+    def flash(self, message: str) -> None:
+        """Show a brief confirmation that disappears on its own."""
 
 
 class RigOperations:
@@ -445,3 +452,86 @@ class RigOperations:
         )
         self.ui.smu_state_changed()
         self.ui.refresh_controls()
+
+    # -- autotune -------------------------------------------------------------
+
+    def autotune(self, candidate: tuple[float, str, int], config: str) -> None:
+        """Ramp the gate to a frequency this device was tuned to before.
+
+        ``candidate`` is ``(frequency_hz, source_config, source_temperature)``:
+        the reading is quoted back on success because a frequency borrowed from
+        a different configuration or temperature is a weaker result than one
+        measured at this point, and the operator should see which they got.
+        """
+        token = self.begin("autotune")
+        if token is None:
+            return
+        target, src_config, src_temp = candidate
+        self.ui.set_tuning(True)
+
+        def work() -> None:
+            self.wavegen_controller.ramp_to_frequency(
+                target,
+                config,
+                rate_khz_s=self.settings.zvs.autotune_freq_rate_khz_s,
+                cancel_check=token.cancel_event.is_set,
+                status=self.ui.set_status_async,
+            )
+            actual = self.wavegen_controller.tuned_freq_hz
+            if token.cancel_event.is_set():
+                raise InterruptedError("autotune cancelled")
+            # Readback, not "the call returned": a ramp that stopped short
+            # leaves the gate at a frequency nobody chose.
+            if actual is None or abs(actual - target) > 1.0:
+                raise RuntimeError(
+                    "Autotune stopped before the target frequency was applied"
+                )
+
+        self.run(
+            work,
+            lambda error: self.on_autotune_done(
+                token, target, src_config, src_temp, error
+            ),
+            name="autotune",
+        )
+
+    def on_autotune_done(
+        self,
+        token: OperationToken,
+        target: float,
+        src_config: str,
+        src_temp: int,
+        error: Optional[BaseException],
+    ) -> None:
+        self.ui.set_tuning(False)
+        self.finish(token)
+        if error is not None:
+            if isinstance(error, FrequencyRampAborted):
+                # Not a trip. The ramp stopped short deliberately, so the gate
+                # sits at an intermediate frequency and the rig is still live —
+                # which is why this says where it stopped and what to do, not
+                # just that it failed.
+                self.ui.show_error(
+                    "Autotune Stopped",
+                    f"{error}\n\nThe gate is left at the frequency reached, "
+                    "not the target. Reduce the bus voltage before retrying.",
+                )
+                self.ui.set_status(
+                    f"Autotune stopped at {error.frequency_hz / 1e6:.4f} MHz "
+                    f"(Vds peak {error.peak_v:.0f} V)"
+                )
+            elif not isinstance(error, InterruptedError):
+                self.ui.show_error("Autotune Error", f"Autotune failed: {error}")
+                self.ui.set_status("Autotune failed.")
+            else:
+                self.ui.set_status("Autotune cancelled.")
+        else:
+            self.ui.flash(
+                f"Tuned frequency {int(target)} Hz applied\n"
+                f"({src_config} @ {src_temp}\u00b0C)"
+            )
+            self.ui.set_status(
+                f"Tuned frequency {int(target)} Hz applied from "
+                f"{src_config} @ {src_temp}\u00b0C"
+            )
+        self.ui.refresh_confirm()

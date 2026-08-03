@@ -194,3 +194,76 @@ def test_the_guard_is_re_evaluated_on_every_call():
     state["cancelled"] = True
     with pytest.raises(InterruptedError):
         guard()
+
+
+# -- autotune ------------------------------------------------------------------
+#
+# Autotune ramps the gate frequency with no closed-loop peak control behind it,
+# so the bus check is not a convenience: with the bus live the resonant
+# operating point, and therefore Vds peak, moves uncontrolled.
+
+
+def _autotune(**overrides):
+    from gan_fet.ui.operations.rig_ops import autotune_precondition
+
+    request = {
+        "hardware_offline": False,
+        "bus_energised": False,
+        "has_candidate": True,
+        "wavegen_pending": False,
+    }
+    request.update(overrides)
+    return autotune_precondition(**request)
+
+
+def test_autotune_launches_with_the_bus_off_and_a_candidate():
+    from gan_fet.ui.operations.rig_ops import AutotuneAction
+
+    assert _autotune().action is AutotuneAction.LAUNCH
+
+
+def test_a_live_bus_refuses_autotune():
+    from gan_fet.ui.operations.rig_ops import AutotuneAction
+
+    decision = _autotune(bus_energised=True)
+    assert decision.action is AutotuneAction.REFUSE
+    assert "no closed-loop peak control" in decision.refusal.message
+
+
+def test_the_refusal_names_the_alternative_that_is_safe():
+    """The operator is being told to do something else. 'Find frequency before
+    run' holds Vds peak on target throughout, which autotune does not."""
+    decision = _autotune(bus_energised=True)
+    assert "Find frequency before run" in decision.refusal.message
+
+
+def test_a_live_bus_outranks_a_missing_candidate():
+    """Both refuse, but only one of them is about the rig being unsafe."""
+    decision = _autotune(bus_energised=True, has_candidate=False)
+    assert "bus is energised" in decision.refusal.message
+
+
+def test_no_stored_frequency_is_reported_as_information_not_a_warning():
+    """Nothing is wrong; there is simply nothing to tune to yet."""
+    from gan_fet.ui.operations.rig_ops import AutotuneAction
+
+    decision = _autotune(has_candidate=False)
+    assert decision.action is AutotuneAction.REFUSE
+    assert decision.refusal.severity == "info"
+
+
+def test_a_stale_wavegen_offers_to_apply_before_autotuning():
+    from gan_fet.ui.operations.rig_ops import AutotuneAction
+
+    decision = _autotune(wavegen_pending=True)
+    assert decision.action is AutotuneAction.APPLY_WAVEGEN_FIRST
+    assert decision.prompt[0] == "Autotune"
+
+
+def test_a_live_bus_is_refused_before_the_wavegen_is_offered():
+    """Applying settings and then refusing to autotune would have moved the
+    gate for nothing, with the bus still live."""
+    from gan_fet.ui.operations.rig_ops import AutotuneAction
+
+    decision = _autotune(bus_energised=True, wavegen_pending=True)
+    assert decision.action is AutotuneAction.REFUSE

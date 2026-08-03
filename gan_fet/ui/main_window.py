@@ -17,7 +17,6 @@ from tkinter import messagebox, simpledialog, ttk
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from gan_fet.core.autotune import (
-    FrequencyRampAborted,
     WavegenController,
     find_prior_tuned_frequency,
 )
@@ -47,7 +46,9 @@ from gan_fet.ui.operations.experiment_ops import (
     run_finished_report,
 )
 from gan_fet.ui.operations.rig_ops import (
+    AutotuneAction,
     ZvsAction,
+    autotune_precondition,
     raise_if_aborted,
     zvs_precondition,
 )
@@ -1010,6 +1011,16 @@ class MainWindow(tk.Tk):
     def set_status_async(self, message: str) -> None:
         self._status_async(message)
 
+    def set_tuning(self, active: bool) -> None:
+        self._tuner_busy = active
+        if active:
+            self.autotune_button.set_style(
+                bg="#1976D2", fg="white", text="Autotuning...", state="disabled"
+            )
+
+    def flash(self, message: str) -> None:
+        show_temporary_popup(self, message, duration_ms=2000)
+
     def _safety_is_tripped(self) -> bool:
         return bool(getattr(self.safety, "is_tripped", False))
 
@@ -1446,118 +1457,40 @@ class MainWindow(tk.Tk):
 
 
     def _start_autotune(self) -> None:
-        if not self._ensure_hardware_online(
-            HARDWARE_OPERATION_LABELS["autotune"]
-        ):
-            return
-        # Checked here as well as on the button: widget state is refreshed by
-        # callbacks and can lag the rig, and this operation moves the gate
-        # frequency with no closed-loop peak control behind it.
-        if self._bus_is_energised():
-            messagebox.showwarning(
-                "Autotune",
-                "The SMU bus is energised.\n\n"
-                "Autotune ramps the gate frequency, which moves the resonant "
-                "operating point and therefore Vds peak, with no closed-loop "
-                "peak control.\n\n"
-                "Switch the bus off first, or use 'Find frequency before run', "
-                "which holds Vds peak on target throughout the search.",
-                parent=self,
-            )
-            return
         candidate = self._tuning_candidate()
-        if candidate is None:
-            messagebox.showinfo("Autotune", "No tuned frequency is available for the current settings.")
-            return
-        if self.wavegen_controller.has_pending_changes(
-            self.config_var.get(), int(self.frequency_var.get()), int(self.duty_var.get())
-        ):
-            if not messagebox.askyesno(
-                "Autotune",
-                "Wavegen settings have not been applied yet. Apply them first?",
-                parent=self,
-            ):
-                return
-            self._apply_wavegen(
-                after_success=partial(self._launch_autotune, candidate)
+        try:
+            wavegen_pending = self.wavegen_controller.has_pending_changes(
+                self.config_var.get(),
+                int(self.frequency_var.get()),
+                int(self.duty_var.get()),
             )
-            return
+        except (ValueError, tk.TclError):
+            wavegen_pending = True
 
-        self._launch_autotune(candidate)
+        decision = autotune_precondition(
+            hardware_offline=self.hardware_offline,
+            bus_energised=self._bus_is_energised(),
+            has_candidate=candidate is not None,
+            wavegen_pending=wavegen_pending,
+        )
+        if decision.action is AutotuneAction.HARDWARE_OFFLINE:
+            self._ensure_hardware_online(HARDWARE_OPERATION_LABELS["autotune"])
+        elif decision.action is AutotuneAction.REFUSE:
+            assert decision.refusal is not None
+            self._show_refusal(decision.refusal)
+        elif decision.action is AutotuneAction.APPLY_WAVEGEN_FIRST:
+            assert decision.prompt is not None and candidate is not None
+            if messagebox.askyesno(*decision.prompt, parent=self):
+                self._apply_wavegen(
+                    after_success=partial(self._launch_autotune, candidate)
+                )
+        else:
+            assert candidate is not None
+            self._launch_autotune(candidate)
 
     def _launch_autotune(self, candidate: Tuple[float, str, int]) -> None:
-        token = self._begin_operation("autotune")
-        if token is None:
-            return
-        target, src_config, src_temp = candidate
-        self._tuner_busy = True
-        self.autotune_button.set_style(
-            bg="#1976D2", fg="white", text="Autotuning...", state="disabled"
-        )
+        self.rig.autotune(candidate, self.config_var.get())
 
-        config = self.config_var.get()
-
-        def work() -> None:
-            self.wavegen_controller.ramp_to_frequency(
-                target,
-                config,
-                rate_khz_s=self.settings.zvs.autotune_freq_rate_khz_s,
-                cancel_check=token.cancel_event.is_set,
-                status=self._status_async,
-            )
-            actual = self.wavegen_controller.tuned_freq_hz
-            if token.cancel_event.is_set():
-                raise InterruptedError("autotune cancelled")
-            # Readback, not "the call returned": a ramp that stopped short
-            # leaves the gate at a frequency nobody chose.
-            if actual is None or abs(actual - target) > 1.0:
-                raise RuntimeError(
-                    "Autotune stopped before the target frequency was applied"
-                )
-
-        self._run_operation(
-            work,
-            partial(self._on_autotune_done, token, target, src_config, src_temp),
-            name="autotune",
-        )
-
-    def _on_autotune_done(
-        self, token, target, src_config, src_temp, error
-    ) -> None:
-        self._tuner_busy = False
-        self._finish_operation(token)
-        if error is not None:
-            if isinstance(error, FrequencyRampAborted):
-                # Not a trip: the ramp stopped short deliberately, so the gate
-                # is at an intermediate frequency and the rig is still live.
-                messagebox.showwarning(
-                    "Autotune Stopped",
-                    f"{error}\n\n"
-                    "The gate is left at the frequency reached, not the "
-                    "target. Reduce the bus voltage before retrying.",
-                    parent=self,
-                )
-                self.status_bar.set_message(
-                    f"Autotune stopped at {error.frequency_hz / 1e6:.4f} MHz "
-                    f"(Vds peak {error.peak_v:.0f} V)"
-                )
-            elif not isinstance(error, InterruptedError):
-                messagebox.showerror(
-                    "Autotune Error", f"Autotune failed: {error}", parent=self
-                )
-                self.status_bar.set_message("Autotune failed.")
-            else:
-                self.status_bar.set_message("Autotune cancelled.")
-        else:
-            show_temporary_popup(
-                self,
-                f"Tuned frequency {int(target)} Hz applied\n({src_config} @ {src_temp}°C)",
-                duration_ms=2000,
-            )
-            self.status_bar.set_message(
-                f"Tuned frequency {int(target)} Hz applied from {src_config} @ {src_temp}°C"
-            )
-        self._refresh_confirm_state()
 
     # ------------------------------------------------------------------
     # SMU panel: ZVS / bus off / E-STOP
