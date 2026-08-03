@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from gan_fet.core.models import MatrixPoint
 
@@ -80,7 +80,7 @@ class ApplyAction(Enum):
 
 @dataclass(frozen=True)
 class ApplyDecision:
-    action: ApplyAction
+    action: Any
     title: str = ""
     message: str = ""
 
@@ -173,3 +173,44 @@ def queue_heading(
         f"remaining, {len(applied)} total. Parameter selections are ignored "
         "until the plan is cleared."
     )
+
+
+class ClearAction(Enum):
+    """What pressing "Clear Plan" should do."""
+
+    #: Nothing applied; the queue already follows the selectors.
+    NOTHING_TO_CLEAR = auto()
+    #: A sequence is running on this plan. Confirm before pulling it away.
+    CONFIRM_STOP_AND_CLEAR = auto()
+    #: Nothing in the way.
+    CLEAR = auto()
+
+
+def clear_plan_decision(
+    *, sequence_running: bool, existing: Optional[AppliedPlan]
+) -> ApplyDecision:
+    """Decide what clearing the applied plan should do.
+
+    Clearing during a run is offered as a stop, for the same reason applying
+    is: the running sequence holds its own copy of the point list, so clearing
+    the store alone would leave the queue describing the live matrix while a
+    plan was still executing — which is the divergence this module exists to
+    prevent.
+    """
+    if existing is None:
+        return ApplyDecision(
+            ClearAction.NOTHING_TO_CLEAR,  # type: ignore[arg-type]
+            "Clear Test Plan",
+            "No test plan is applied. The queue already follows the "
+            "parameter selections.",
+        )
+    if sequence_running:
+        return ApplyDecision(
+            ClearAction.CONFIRM_STOP_AND_CLEAR,  # type: ignore[arg-type]
+            "Sequence Running",
+            "An auto sequence is running this plan.\n\n"
+            "Stop it and clear the plan?\n\n"
+            "Points already completed stay recorded, and the queue goes back "
+            "to following the parameter selections.",
+        )
+    return ApplyDecision(ClearAction.CLEAR, "", "")  # type: ignore[arg-type]

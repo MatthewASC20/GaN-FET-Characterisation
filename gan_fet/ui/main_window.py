@@ -94,8 +94,10 @@ from gan_fet.ui.analytics_tab import AnalyticsTab
 from gan_fet.ui.planner_tab import PlannerTab
 from gan_fet.ui.plan_store import (
     ApplyAction,
+    ClearAction,
     PlanStore,
     apply_plan_decision,
+    clear_plan_decision,
     pending_points,
 )
 from gan_fet.ui.plot import LivePlot
@@ -705,15 +707,6 @@ class MainWindow(tk.Tk):
         self.cancel_button = ttk.Button(bar, text="Cancel", command=self._cancel_experiment,
                                         state="disabled")
         self.cancel_button.pack(side="left", padx=(0, 10))
-        sequence_label = (
-            "Start Simulated Sequence"
-            if self.is_simulated
-            else "Start Auto Sequence"
-        )
-        self.sequence_button = ttk.Button(
-            bar, text=sequence_label, command=self._toggle_sequence
-        )
-        self.sequence_button.pack(side="left", padx=(0, 10))
         self.report_button = ttk.Button(
             bar, text="Generate Report", command=self._generate_report
         )
@@ -805,6 +798,25 @@ class MainWindow(tk.Tk):
             plan_store=self.plan_store,
         )
         self.up_next_view.grid(row=0, column=0, sticky="nsew")
+
+        # Beside the queue rather than in the action bar: these two act on the
+        # plan the queue is showing, and putting them anywhere else means
+        # pressing them without the list they change in view.
+        plan_controls = ttk.Frame(tracker_frame)
+        plan_controls.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        sequence_label = (
+            "Start Simulated Sequence"
+            if self.is_simulated
+            else "Start Auto Sequence"
+        )
+        self.sequence_button = ttk.Button(
+            plan_controls, text=sequence_label, command=self._toggle_sequence
+        )
+        self.sequence_button.pack(side="left", padx=(0, 10))
+        self.clear_plan_button = ttk.Button(
+            plan_controls, text="Clear Plan", command=self._clear_test_plan
+        )
+        self.clear_plan_button.pack(side="left")
 
         self.tracker = self.planner_tab.tracker
 
@@ -1759,7 +1771,12 @@ class MainWindow(tk.Tk):
             self._finish_operation(active)
         self._on_engine_state(ExperimentState.IDLE)
         self._update_smu_panel()
-        self.tracker.refresh()
+        # Follow the point that just finished, not whichever frequency the
+        # tracker was last set to by hand: a sequence working through a
+        # multi-frequency plan otherwise ticks off points out of view.
+        outcome = self.engine.last_outcome
+        finished_at = getattr(getattr(outcome, "record", None), "frequency_hz", None)
+        self.tracker.follow_frequency(finished_at)
         if hasattr(self, "up_next_view"):
             self.up_next_view.refresh()
         self.planner_tab.generate_plan(show_errors=False)
@@ -1921,6 +1938,31 @@ class MainWindow(tk.Tk):
         )
         self._refresh_control_states()
         return True
+
+    def _clear_test_plan(self) -> None:
+        """Go back to the queue following the parameter selections."""
+        decision = clear_plan_decision(
+            sequence_running=(
+                self.operations.active_kind == "sequence" or self.sequence.active
+            ),
+            existing=self.plan_store.applied,
+        )
+        if decision.action is ClearAction.NOTHING_TO_CLEAR:
+            messagebox.showinfo(decision.title, decision.message, parent=self)
+            return
+        if decision.action is ClearAction.CONFIRM_STOP_AND_CLEAR:
+            if not messagebox.askyesno(
+                decision.title, decision.message, icon="warning", parent=self
+            ):
+                return
+            self._cancel_experiment()
+        self.plan_store.clear()
+        if hasattr(self, "up_next_view"):
+            self.up_next_view.refresh()
+        self.status_bar.set_message(
+            "Test plan cleared. The queue follows the parameter selections again."
+        )
+        self._refresh_control_states()
 
     def _start_planned_sequence(
         self, plan_summary: Any, duration_minutes: float, find_zvs: bool

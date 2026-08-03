@@ -159,6 +159,25 @@ class TrackerView(tk.Frame):
 
     # -- data -------------------------------------------------------------
 
+    def follow_frequency(self, frequency_hz: Optional[int]) -> None:
+        """Show the matrix for the frequency that was just measured.
+
+        The completed grid reads this widget's own frequency selector, so a
+        sequence working through a multi-frequency plan would tick off points
+        the operator could not see. Following the run keeps "already
+        completed" describing what just happened rather than whichever
+        frequency was last chosen by hand.
+        """
+        if not frequency_hz:
+            self.refresh()
+            return
+        try:
+            if int(self.selected_freq.get()) != int(frequency_hz):
+                self.selected_freq.set(int(frequency_hz))
+        except (ValueError, tk.TclError):  # pragma: no cover - defensive
+            pass
+        self.refresh()
+
     def refresh(self) -> None:
         device = self.get_device_name().strip()
         freq_val = self.selected_freq.get()

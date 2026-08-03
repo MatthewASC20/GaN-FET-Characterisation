@@ -223,3 +223,54 @@ def test_a_point_differing_only_in_voltage_is_not_treated_as_done():
     store = PlanStore()
     applied = store.apply([_point(300)], source="Planner")
     assert len(pending_points(applied, {_key(_point(200))})) == 1
+
+
+# -- clearing the applied plan -------------------------------------------------
+
+
+def _clear(**overrides):
+    from gan_fet.ui.plan_store import clear_plan_decision
+
+    request = {"sequence_running": False, "existing": None}
+    request.update(overrides)
+    return clear_plan_decision(**request)
+
+
+def test_clearing_with_nothing_applied_says_so():
+    """Silently doing nothing would look like the button is broken."""
+    from gan_fet.ui.plan_store import ClearAction
+
+    decision = _clear()
+    assert decision.action is ClearAction.NOTHING_TO_CLEAR
+    assert "already follows the parameter selections" in decision.message
+
+
+def test_clearing_an_idle_plan_needs_no_confirmation():
+    from gan_fet.ui.plan_store import ClearAction
+
+    store = PlanStore()
+    assert _clear(existing=store.apply([_point()], source="Planner")).action is (
+        ClearAction.CLEAR
+    )
+
+
+def test_clearing_mid_sequence_is_offered_as_a_stop():
+    """The running sequence holds its own copy of the point list, so clearing
+    the store alone would leave the queue showing the live matrix while a plan
+    was still executing."""
+    from gan_fet.ui.plan_store import ClearAction
+
+    store = PlanStore()
+    decision = _clear(
+        sequence_running=True, existing=store.apply([_point()], source="Planner")
+    )
+    assert decision.action is ClearAction.CONFIRM_STOP_AND_CLEAR
+    assert "Stop it and clear" in decision.message
+    assert "stay recorded" in decision.message
+
+
+def test_a_running_sequence_with_no_applied_plan_still_has_nothing_to_clear():
+    """It is running the live matrix, which clearing does not affect."""
+    from gan_fet.ui.plan_store import ClearAction
+
+    assert _clear(sequence_running=True).action is ClearAction.NOTHING_TO_CLEAR
