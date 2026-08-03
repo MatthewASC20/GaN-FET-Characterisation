@@ -3,6 +3,7 @@ database (v1 scanned the CSV file tree)."""
 
 from __future__ import annotations
 
+import logging
 import tkinter as tk
 import webbrowser
 from pathlib import Path
@@ -11,7 +12,9 @@ from typing import Callable, List, Optional, Tuple
 
 from gan_fet.core.models import MatrixPoint, RunRecord, freq_label
 from gan_fet.storage.db import Database
-from gan_fet.ui.plan_store import pending_points, queue_heading
+from gan_fet.ui.plan_store import applied_queue
+
+log = logging.getLogger(__name__)
 
 
 def _sample_plot_axis(
@@ -509,18 +512,29 @@ class UpNextView(ttk.LabelFrame):
         queue of what is left to run, and a plan half-finished from a previous
         session should not look like it is about to repeat itself.
         """
-        completed: set = set()
-        for frequency in {pt.frequency_hz for pt in applied.points}:
-            for config, duty, voltage, temp in self.db.completed_points(
-                self.get_device_name().strip(), frequency
-            ):
-                completed.add((frequency, config, duty, voltage, temp))
-        pending = pending_points(applied, completed)
-        next_5 = pending[:5]
-        self.status_lbl.config(
-            text=queue_heading(applied, len(pending), len(next_5), "")
-        )
-        self._fill(next_5)
+        try:
+            completed: set = set()
+            for frequency in {pt.frequency_hz for pt in applied.points}:
+                for config, duty, voltage, temp in self.db.completed_points(
+                    self.get_device_name().strip(), frequency
+                ):
+                    completed.add((frequency, config, duty, voltage, temp))
+            contents = applied_queue(applied, completed)
+        except Exception:
+            # A blank table and an unchanged heading is what this used to look
+            # like, which reads as "the plan is empty" rather than "something
+            # went wrong". Say which it is.
+            log.exception("Could not render the applied test plan")
+            self.status_lbl.config(
+                text=(
+                    f"Applied plan ({applied.source}, {len(applied)} points) "
+                    "could not be displayed — see the log. The plan is still "
+                    "applied; Clear Plan returns to the parameter selections."
+                )
+            )
+            return
+        self.status_lbl.config(text=contents.heading)
+        self._fill(contents.rows)
 
     def _fill(self, points) -> None:
         for idx, pt in enumerate(points, start=1):

@@ -242,7 +242,7 @@ def test_clearing_with_nothing_applied_says_so():
 
     decision = _clear()
     assert decision.action is ClearAction.NOTHING_TO_CLEAR
-    assert "already follows the parameter selections" in decision.message
+    assert "No test plan is applied" in decision.message
 
 
 def test_clearing_an_idle_plan_needs_no_confirmation():
@@ -274,3 +274,50 @@ def test_a_running_sequence_with_no_applied_plan_still_has_nothing_to_clear():
     from gan_fet.ui.plan_store import ClearAction
 
     assert _clear(sequence_running=True).action is ClearAction.NOTHING_TO_CLEAR
+
+
+# -- what the queue renders ----------------------------------------------------
+
+
+def test_an_applied_queue_shows_the_pending_points_in_order():
+    from gan_fet.ui.plan_store import applied_queue
+
+    a, b, c = _point(200), _point(300), _point(400)
+    store = PlanStore()
+    applied = store.apply([a, b, c], source="Planner")
+    contents = applied_queue(applied, set())
+    assert contents.rows == [a, b, c]
+    assert "Applied plan" in contents.heading
+
+
+def test_an_applied_queue_is_capped_but_the_heading_says_the_total():
+    """Five rows fit; the operator still needs to know how many there are."""
+    from gan_fet.ui.plan_store import applied_queue
+
+    store = PlanStore()
+    applied = store.apply([_point(v) for v in range(100, 900, 100)], source="Planner")
+    contents = applied_queue(applied, set())
+    assert len(contents.rows) == 5
+    assert "next 5 of 8" in contents.heading
+
+
+def test_a_fully_measured_applied_queue_says_complete_rather_than_going_blank():
+    """A blank table with no explanation is indistinguishable from a bug —
+    which is exactly how this was reported from the bench."""
+    from gan_fet.ui.plan_store import applied_queue
+
+    points = [_point(200), _point(300)]
+    store = PlanStore()
+    applied = store.apply(points, source="Planner")
+    contents = applied_queue(applied, {_key(p) for p in points})
+    assert contents.rows == []
+    assert "complete" in contents.heading
+    assert contents.heading, "an empty queue must still say something"
+
+
+def test_clearing_explains_that_the_live_matrix_is_not_a_plan():
+    """Reported from the bench: an eighteen-row queue looks like a plan, so
+    "no test plan is applied" reads as the button being broken."""
+    decision = _clear()
+    assert "live matrix" in decision.message
+    assert "not a plan" in decision.message

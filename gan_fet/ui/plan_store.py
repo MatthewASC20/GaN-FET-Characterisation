@@ -155,6 +155,28 @@ def pending_points(
     ]
 
 
+@dataclass(frozen=True)
+class QueueContents:
+    """What the Auto Testing Queue should show right now."""
+
+    rows: list[MatrixPoint]
+    heading: str
+
+
+def applied_queue(
+    applied: AppliedPlan, completed: set, *, limit: int = 5
+) -> QueueContents:
+    """Rows and heading for an applied plan.
+
+    Extracted from the widget because a blank queue is indistinguishable from
+    a broken one on screen, and a bug in here could only be found by running
+    the application. Now it can be exercised without a display.
+    """
+    pending = pending_points(applied, completed)
+    shown = pending[:limit]
+    return QueueContents(shown, queue_heading(applied, len(pending), len(shown), ""))
+
+
 def queue_heading(
     applied: Optional[AppliedPlan], pending: int, shown: int, live_label: str
 ) -> str:
@@ -201,8 +223,11 @@ def clear_plan_decision(
         return ApplyDecision(
             ClearAction.NOTHING_TO_CLEAR,  # type: ignore[arg-type]
             "Clear Test Plan",
-            "No test plan is applied. The queue already follows the "
-            "parameter selections.",
+            "No test plan is applied.\n\n"
+            "The Auto Testing Queue is showing the live matrix — every "
+            "combination of the parameters selected on this tab that has not "
+            "been measured yet. That is not a plan and there is nothing to "
+            "clear; it updates by itself as you change the selections.",
         )
     if sequence_running:
         return ApplyDecision(
