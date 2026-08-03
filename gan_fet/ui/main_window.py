@@ -427,10 +427,7 @@ class MainWindow(tk.Tk):
 
     def _wire_engine(self) -> None:
         self.engine.callbacks = EngineCallbacks(
-            # Sampling/status are delivered once through typed EventBus events.
-            on_sample=lambda _elapsed, _amps: None,
             on_state=self._queue_engine_state,
-            on_status=lambda _message: None,
             on_finished=self._queue_run_finished,
             confirm_overwrite=self._confirm_overwrite,
             report_error=self._queue_engine_error,
@@ -1745,12 +1742,6 @@ class MainWindow(tk.Tk):
                 ),
             )
         )
-
-    def _on_sample(self, elapsed: float, amps: float) -> None:
-        """Compatibility callback for older engines; not wired in this UI."""
-        self.last_current_label.config(text=last_current_text(amps))
-        self.plot.append(elapsed, amps)
-        self._update_smu_panel()
 
     def _on_engine_state(self, state: ExperimentState) -> None:
         self.pause_button.config(

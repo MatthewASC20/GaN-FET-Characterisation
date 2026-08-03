@@ -72,11 +72,13 @@ def _noop(*_args, **_kwargs):
 
 @dataclass
 class EngineCallbacks:
-    """All invoked from the engine's worker thread."""
+    """Owner decisions, invoked from the engine's worker thread.
 
-    on_sample: Callable[[float, float], None] = _noop          # (elapsed_s, amps)
+    Broadcast telemetry (samples, status, measurements, trips) travels on the
+    typed event bus; callbacks exist only for things the owning UI must decide
+    or route (state, completion, errors, overwrite confirmation)."""
+
     on_state: Callable[[ExperimentState], None] = _noop
-    on_status: Callable[[str], None] = _noop
     on_finished: Callable[[bool, str], None] = _noop           # (success, message)
     confirm_overwrite: Callable[[str], bool] = field(default=lambda _desc: True)
     report_error: Callable[[str, str], None] = _noop           # (title, message)
@@ -171,10 +173,6 @@ class ExperimentEngine:
             log.exception("Engine state callback failed")
 
     def _update_status(self, msg: str) -> None:
-        try:
-            self.callbacks.on_status(msg)
-        except Exception:
-            log.exception("Engine status callback failed")
         bus.publish(StatusUpdatedEvent(message=msg))
 
     def _report_error(self, title: str, message: str) -> None:
@@ -869,10 +867,6 @@ class ExperimentEngine:
                 isw_rms=isw,
                 elapsed_s=elapsed,
             )
-            try:
-                self.callbacks.on_sample(elapsed, amps)
-            except Exception:
-                log.exception("Engine sample callback failed")
             bus.publish(
                 SampleAcquiredEvent(
                     elapsed_s=elapsed,
