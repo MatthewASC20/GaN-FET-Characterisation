@@ -18,9 +18,6 @@ from gan_fet.ui.plan_store import (
     queue_heading,
 )
 
-LIVE = "Next 5 test(s) to execute (12 total pending)"
-
-
 def _point(voltage: int = 200) -> MatrixPoint:
     return MatrixPoint(
         device_name="EPC2001C",
@@ -143,25 +140,26 @@ def test_an_empty_plan_is_refused_even_mid_sequence():
 # -- what the queue heading says ----------------------------------------------
 
 
-def test_with_no_applied_plan_the_heading_is_the_live_one():
-    assert queue_heading(None, 12, 5, LIVE) == LIVE
+def test_with_no_applied_plan_the_queue_says_to_build_one():
+    """There is no computed fallback any more. An empty queue means nothing
+    has been asked for, which is different from having finished."""
+    heading = queue_heading(None, 0, 0)
+    assert "No test plan applied" in heading
+    assert "Test Planner" in heading
 
 
-def test_an_applied_plan_says_so_and_says_selections_are_ignored():
-    """The operator will change a parameter, see the queue not move, and
-    otherwise conclude the application is broken."""
+def test_an_applied_plan_names_where_it_came_from():
     store = PlanStore()
     applied = store.apply([_point()] * 10, source="Planner")
-    heading = queue_heading(applied, 7, 5, LIVE)
+    heading = queue_heading(applied, 7, 5)
     assert "Applied plan" in heading
     assert "Planner" in heading
-    assert "ignored" in heading
 
 
 def test_an_applied_plan_shows_how_much_is_left_of_how_much():
     store = PlanStore()
     applied = store.apply([_point()] * 10, source="Planner")
-    heading = queue_heading(applied, 7, 5, LIVE)
+    heading = queue_heading(applied, 7, 5)
     assert "next 5 of 7" in heading
     assert "10 total" in heading
 
@@ -170,7 +168,7 @@ def test_a_finished_applied_plan_says_it_is_complete():
     """Not "0 remaining", which reads like something went wrong."""
     store = PlanStore()
     applied = store.apply([_point()] * 4, source="Planner")
-    assert "complete" in queue_heading(applied, 0, 0, LIVE)
+    assert "complete" in queue_heading(applied, 0, 0)
 
 
 # -- what is left of an applied plan ------------------------------------------
@@ -315,9 +313,53 @@ def test_a_fully_measured_applied_queue_says_complete_rather_than_going_blank():
     assert contents.heading, "an empty queue must still say something"
 
 
-def test_clearing_explains_that_the_live_matrix_is_not_a_plan():
-    """Reported from the bench: an eighteen-row queue looks like a plan, so
-    "no test plan is applied" reads as the button being broken."""
+def test_clearing_says_where_a_plan_would_come_from():
+    """Reported from the bench: the queue looked like it already had a plan,
+    so "no test plan is applied" read as the button being broken. There is
+    nothing to mistake for a plan now, but the message still has to point at
+    the one place a plan comes from."""
     decision = _clear()
-    assert "live matrix" in decision.message
-    assert "not a plan" in decision.message
+    assert "nothing to clear" in decision.message
+    assert "Test Planner" in decision.message
+
+
+# -- starting a sequence -------------------------------------------------------
+
+
+def _start(**overrides):
+    from gan_fet.ui.plan_store import start_sequence_decision
+
+    request = {"applied": None, "pending": 0}
+    request.update(overrides)
+    return start_sequence_decision(**request)
+
+
+def test_starting_with_no_plan_offers_the_planner_rather_than_just_refusing():
+    """The queue is fed from another tab. Saying only "no" leaves the operator
+    to work that out for themselves."""
+    from gan_fet.ui.plan_store import StartAction
+
+    decision = _start()
+    assert decision.action is StartAction.OFFER_PLANNER
+    assert "Open the Test Planner" in decision.message
+
+
+def test_starting_an_applied_plan_with_work_left_just_starts():
+    from gan_fet.ui.plan_store import StartAction
+
+    store = PlanStore()
+    applied = store.apply([_point()] * 3, source="Planner")
+    assert _start(applied=applied, pending=3).action is StartAction.START
+
+
+def test_starting_a_finished_plan_says_so_rather_than_offering_the_planner():
+    """A finished plan is not a missing one, and the operator has a choice to
+    make about it — apply a new one, or clear this."""
+    from gan_fet.ui.plan_store import StartAction
+
+    store = PlanStore()
+    applied = store.apply([_point()] * 3, source="Planner")
+    decision = _start(applied=applied, pending=0)
+    assert decision.action is StartAction.ALREADY_COMPLETE
+    assert "already been measured" in decision.message
+    assert "clear this one" in decision.message

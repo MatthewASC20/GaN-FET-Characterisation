@@ -12,7 +12,7 @@ from typing import Callable, List, Optional, Tuple
 
 from gan_fet.core.models import MatrixPoint, RunRecord, freq_label
 from gan_fet.storage.db import Database
-from gan_fet.ui.plan_store import applied_queue
+from gan_fet.ui.plan_store import NO_PLAN_HEADING, applied_queue
 
 log = logging.getLogger(__name__)
 
@@ -420,14 +420,12 @@ class UpNextView(ttk.LabelFrame):
         master,
         db: Database,
         get_device_name: Callable[[], str],
-        get_current_params: Callable[[], Optional[Tuple[int, list, list, list, list]]],
         plan_store=None,
         **kwargs,
     ):
         super().__init__(master, text="Auto Testing Queue (Next 5 Tests)", **kwargs)
         self.db = db
         self.get_device_name = get_device_name
-        self.get_current_params = get_current_params
         # When a plan has been applied, it is what runs, so it is what this
         # shows. Without one the live matrix drives the queue as before.
         self.plan_store = plan_store
@@ -465,45 +463,20 @@ class UpNextView(ttk.LabelFrame):
         self.tree.pack(side="left", fill="both", expand=True)
 
     def refresh(self) -> None:
-        device = self.get_device_name().strip()
-        params = self.get_current_params()
+        """Show the applied plan, or say that there is none.
+
+        There is no computed fallback. The queue used to build a plan from the
+        cross-product of every configured option, which nobody had asked for
+        and which looked enough like a real plan to make "Clear Plan" seem
+        broken. Now it shows what was applied, or nothing.
+        """
         self.tree.delete(*self.tree.get_children())
-
         applied = getattr(self.plan_store, "applied", None)
-        if applied is not None:
-            self._show_applied(applied)
+        if applied is None:
+            self.status_lbl.config(text=NO_PLAN_HEADING)
             return
+        self._show_applied(applied)
 
-        if not device or not params:
-            self.status_lbl.config(text="Select a device to view scheduled tests.")
-            return
-
-        frequency_hz, configs, duties, voltages, temps = params
-        from gan_fet.core.sequence import build_plan
-
-        plan = build_plan(
-            db=self.db,
-            device_name=device,
-            frequency_hz=frequency_hz,
-            configs=configs,
-            duties=duties,
-            voltages=voltages,
-            temperatures=temps,
-        )
-
-        if not plan:
-            self.status_lbl.config(
-                text=f"All tests complete for {device} at {freq_label(frequency_hz)}! (0 pending)"
-            )
-            return
-
-        total_pending = len(plan)
-        next_5 = plan[:5]
-        self.status_lbl.config(
-            text=f"Next {len(next_5)} test(s) to execute ({total_pending} total pending for {device} @ {freq_label(frequency_hz)}):"
-        )
-
-        self._fill(next_5)
 
     def _show_applied(self, applied) -> None:
         """Render the applied plan, skipping points already measured.

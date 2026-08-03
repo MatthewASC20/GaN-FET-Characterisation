@@ -77,7 +77,7 @@ from gan_fet.core.models import (
     sanitize_device_name,
 )
 from gan_fet.core.safety import SafetyMonitor
-from gan_fet.core.sequence import AutoSequence, SequenceCallbacks, build_plan
+from gan_fet.core.sequence import AutoSequence, SequenceCallbacks
 from gan_fet.instruments.base import SmuInterface
 from gan_fet.settings import SIMULATION_DEFAULT_DEVICE_NAME, Settings
 from gan_fet.sheets.sync import SheetsSync
@@ -95,10 +95,12 @@ from gan_fet.ui.planner_tab import PlannerTab
 from gan_fet.ui.plan_store import (
     ApplyAction,
     ClearAction,
+    StartAction,
     PlanStore,
     apply_plan_decision,
     clear_plan_decision,
     pending_points,
+    start_sequence_decision,
 )
 from gan_fet.ui.plot import LivePlot
 from gan_fet.ui.tracker_view import UpNextView
@@ -788,13 +790,6 @@ class MainWindow(tk.Tk):
             tracker_frame,
             self.db,
             get_device_name=lambda: self.device_name_var.get(),
-            get_current_params=lambda: (
-                self.frequency_var.get(),
-                self._values("configurations"),
-                self._values("duties"),
-                self._values("voltages"),
-                self._values("temperatures"),
-            ) if hasattr(self, "frequency_var") else None,
             plan_store=self.plan_store,
         )
         self.up_next_view.grid(row=0, column=0, sticky="nsew")
@@ -1838,35 +1833,27 @@ class MainWindow(tk.Tk):
         if self.operations.busy:
             self._begin_operation("sequence")
             return
+        # The queue is the plan, and the plan comes from the Test Planner.
+        applied = self.plan_store.applied
+        plan = (
+            pending_points(applied, self._completed_keys(applied))
+            if applied is not None
+            else []
+        )
+        decision = start_sequence_decision(applied=applied, pending=len(plan))
+        if decision.action is StartAction.OFFER_PLANNER:
+            if messagebox.askyesno(
+                decision.title, decision.message, parent=self
+            ):
+                self.notebook.select(self.planner_tab)
+            return
+        if decision.action is StartAction.ALREADY_COMPLETE:
+            messagebox.showinfo(
+                decision.title, decision.message, parent=self
+            )
+            return
         params = self._build_params()
         if params is None:
-            return
-        # Whatever the queue is showing is what runs. With a plan applied the
-        # Experiment tab's selectors are not consulted at all, which is the
-        # point of applying one.
-        applied = self.plan_store.applied
-        if applied is not None:
-            plan = pending_points(applied, self._completed_keys(applied))
-            empty_message = (
-                "Every point in the applied test plan has already been "
-                "measured. Apply a new plan, or clear this one."
-            )
-        else:
-            plan = build_plan(
-                self.db,
-                params.point.device_name,
-                params.point.frequency_hz,
-                configs=self._values("configurations"),
-                duties=self._values("duties"),
-                voltages=self._values("voltages"),
-                temperatures=self._values("temperatures"),
-            )
-            empty_message = (
-                "All parameter combinations at this frequency are already "
-                "complete."
-            )
-        if not plan:
-            messagebox.showwarning("Auto Sequence", empty_message, parent=self)
             return
         if not messagebox.askyesno(
             "Start Auto Sequence",

@@ -174,26 +174,35 @@ def applied_queue(
     """
     pending = pending_points(applied, completed)
     shown = pending[:limit]
-    return QueueContents(shown, queue_heading(applied, len(pending), len(shown), ""))
+    return QueueContents(shown, queue_heading(applied, len(pending), len(shown)))
+
+
+#: Shown when no plan has been applied. The queue is empty because nothing has
+#: been asked for, which is a different thing from having finished.
+NO_PLAN_HEADING = (
+    "No test plan applied. Build one in the Test Planner and press "
+    "\u201cApply Test Plan\u201d — nothing runs until you do."
+)
 
 
 def queue_heading(
-    applied: Optional[AppliedPlan], pending: int, shown: int, live_label: str
+    applied: Optional[AppliedPlan], pending: int, shown: int
 ) -> str:
-    """The queue's heading, which has to say which plan is on screen.
+    """The queue's heading.
 
-    An applied plan ignores the Experiment tab's selectors, so without this the
-    operator would change a parameter, see the queue not move, and reasonably
-    conclude the application was broken.
+    There is no computed fallback. The queue shows the plan the operator
+    applied and nothing else: a cross-product assembled from whatever options
+    happened to be configured is a guess at what someone wants, and it looked
+    enough like a real plan that "Clear Plan" appeared broken when it correctly
+    reported there was none.
     """
     if applied is None:
-        return live_label
+        return NO_PLAN_HEADING
     if pending <= 0:
         return f"Applied plan complete — all {len(applied)} points measured."
     return (
         f"Applied plan ({applied.source}): next {shown} of {pending} "
-        f"remaining, {len(applied)} total. Parameter selections are ignored "
-        "until the plan is cleared."
+        f"remaining, {len(applied)} total."
     )
 
 
@@ -223,11 +232,9 @@ def clear_plan_decision(
         return ApplyDecision(
             ClearAction.NOTHING_TO_CLEAR,  # type: ignore[arg-type]
             "Clear Test Plan",
-            "No test plan is applied.\n\n"
-            "The Auto Testing Queue is showing the live matrix — every "
-            "combination of the parameters selected on this tab that has not "
-            "been measured yet. That is not a plan and there is nothing to "
-            "clear; it updates by itself as you change the selections.",
+            "No test plan is applied, so there is nothing to clear. The "
+            "Auto Testing Queue is empty until you apply one from the Test "
+            "Planner.",
         )
     if sequence_running:
         return ApplyDecision(
@@ -235,7 +242,45 @@ def clear_plan_decision(
             "Sequence Running",
             "An auto sequence is running this plan.\n\n"
             "Stop it and clear the plan?\n\n"
-            "Points already completed stay recorded, and the queue goes back "
-            "to following the parameter selections.",
+            "Points already completed stay recorded, and the queue is left "
+            "empty until you apply another plan.",
         )
     return ApplyDecision(ClearAction.CLEAR, "", "")  # type: ignore[arg-type]
+
+
+class StartAction(Enum):
+    """What "Start Auto Sequence" should do."""
+
+    #: Nothing to run. Offer to go and build a plan.
+    OFFER_PLANNER = auto()
+    #: The applied plan has no points left.
+    ALREADY_COMPLETE = auto()
+    #: Run it.
+    START = auto()
+
+
+def start_sequence_decision(
+    *, applied: Optional[AppliedPlan], pending: int
+) -> ApplyDecision:
+    """Decide what starting a sequence should do.
+
+    With nothing applied the operator is offered the Test Planner rather than
+    told no. Refusing alone leaves them to work out for themselves that the
+    queue is fed from another tab, which is exactly the confusion the implicit
+    cross-product used to hide.
+    """
+    if applied is None:
+        return ApplyDecision(
+            StartAction.OFFER_PLANNER,
+            "No Test Plan",
+            "There is no test plan to run.\n\n"
+            "Open the Test Planner to build one?",
+        )
+    if pending <= 0:
+        return ApplyDecision(
+            StartAction.ALREADY_COMPLETE,
+            "Test Plan Complete",
+            f"Every point in the applied plan ({len(applied)}) has already "
+            "been measured.\n\nApply a new plan, or clear this one.",
+        )
+    return ApplyDecision(StartAction.START, "", "")
