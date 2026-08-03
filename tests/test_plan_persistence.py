@@ -636,3 +636,88 @@ def test_reopening_an_upgraded_database_does_not_rebuild_again(tmp_path):
         assert [p.voltage_v for p in points] == [200, 300]
     finally:
         db.close()
+
+
+def _schema_8_plan_options(tmp_path, *, tune_voltage: bool = False):
+    """A database at schema 8, where the column was still called find_zvs."""
+    import sqlite3
+
+    from gan_fet.storage.schema import SCHEMA
+
+    path = tmp_path / "v8" / "gan_fet.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA)
+    conn.execute("DROP TABLE plan_options")
+    conn.executescript(
+        """
+        CREATE TABLE plan_options (
+            device_name TEXT PRIMARY KEY,
+            include_completed INTEGER NOT NULL DEFAULT 0,
+            duration_minutes REAL NOT NULL DEFAULT 1.0,
+            find_zvs INTEGER NOT NULL DEFAULT 1
+        );
+        """
+    )
+    conn.execute("INSERT INTO schema_version(version) VALUES (8)")
+    conn.execute(
+        "INSERT INTO plan_options VALUES ('EPC2001C', 1, 2.5, ?)",
+        (int(tune_voltage),),
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
+def test_the_find_zvs_column_is_renamed_on_upgrade(tmp_path):
+    """The operation it gates is tuning the DC bus voltage, not searching for
+    ZVS — a separate thing the rig also does. Storage was the last place still
+    using the old word."""
+    from gan_fet.storage.db import Database
+
+    path = _schema_8_plan_options(tmp_path)
+
+    db = Database(path)
+    try:
+        columns = {
+            row[1] for row in db._conn.execute("PRAGMA table_info(plan_options)")
+        }
+        assert "tune_voltage" in columns
+        assert "find_zvs" not in columns
+    finally:
+        db.close()
+
+
+def test_the_operators_saved_preference_survives_the_rename(tmp_path):
+    """A rebuild would have reset it to the default. The stored value was
+    always correct; only its name was wrong."""
+    from gan_fet.storage.db import Database
+
+    path = _schema_8_plan_options(tmp_path, tune_voltage=False)
+
+    db = Database(path)
+    try:
+        selections, include_completed, duration, tune_voltage = (
+            db.load_plan_selections("EPC2001C")
+        )
+        assert tune_voltage is False, "the saved 'off' must not become 'on'"
+        assert include_completed is True
+        assert duration == 2.5
+    finally:
+        db.close()
+
+
+def test_reopening_after_the_rename_is_a_no_op(tmp_path):
+    """The migration is keyed on find_zvs still being present."""
+    from gan_fet.storage.db import Database
+
+    path = _schema_8_plan_options(tmp_path, tune_voltage=True)
+
+    db = Database(path)
+    db.close()
+    db = Database(path)
+    try:
+        _, _, _, tune_voltage = db.load_plan_selections("EPC2001C")
+        assert tune_voltage is True
+    finally:
+        db.close()

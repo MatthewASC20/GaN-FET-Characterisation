@@ -292,6 +292,7 @@ class AutoSequence:
                         # there is nothing to recall and the whole matrix ran
                         # off resonance, with tuned_frequency_hz NULL
                         # throughout.
+                        tune_frequency=True,
                     )
                 ):
                     success = False
