@@ -25,10 +25,7 @@ from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from gan_fet.core.events import (
-    ErrorReportedEvent,
-    RunCompletedEvent,
     SampleAcquiredEvent,
-    StateChangedEvent,
     StatusUpdatedEvent,
     bus,
 )
@@ -172,7 +169,6 @@ class ExperimentEngine:
             self.callbacks.on_state(state)
         except Exception:
             log.exception("Engine state callback failed")
-        bus.publish(StateChangedEvent(old_state=old_state, new_state=state))
 
     def _update_status(self, msg: str) -> None:
         try:
@@ -186,7 +182,6 @@ class ExperimentEngine:
             self.callbacks.report_error(title, message)
         except Exception:
             log.exception("Engine error callback failed")
-        bus.publish(ErrorReportedEvent(title=title, message=message))
 
     def _cancelled(self) -> bool:
         return self._cancel_event.is_set()
@@ -204,7 +199,6 @@ class ExperimentEngine:
             ):
                 return False
             safety_event_watermark = self.db.latest_safety_event_id()
-            old_state = self._state
             self._state = ExperimentState.RUNNING
             self._last_outcome = None
             self._outcome_event.clear()
@@ -223,12 +217,6 @@ class ExperimentEngine:
             self.callbacks.on_state(ExperimentState.RUNNING)
         except Exception:
             log.exception("Engine state callback failed")
-        bus.publish(
-            StateChangedEvent(
-                old_state=old_state,
-                new_state=ExperimentState.RUNNING,
-            )
-        )
         try:
             thread.start()
         except Exception:
@@ -240,12 +228,6 @@ class ExperimentEngine:
                 self.callbacks.on_state(ExperimentState.IDLE)
             except Exception:
                 log.exception("Engine state callback failed")
-            bus.publish(
-                StateChangedEvent(
-                    old_state=ExperimentState.RUNNING,
-                    new_state=ExperimentState.IDLE,
-                )
-            )
             raise
         return True
 
@@ -277,9 +259,6 @@ class ExperimentEngine:
                 self.callbacks.on_state(new_state)
             except Exception:
                 log.exception("Engine state callback failed")
-            bus.publish(
-                StateChangedEvent(old_state=old_state, new_state=new_state)
-            )
 
     def cancel(self) -> None:
         cancelled = False
@@ -296,9 +275,6 @@ class ExperimentEngine:
                 self.callbacks.on_state(new_state)
             except Exception:
                 log.exception("Engine state callback failed")
-            bus.publish(
-                StateChangedEvent(old_state=old_state, new_state=new_state)
-            )
 
     def wait_until_idle(
         self,
@@ -704,13 +680,6 @@ class ExperimentEngine:
                 self.callbacks.on_finished(success, message)
             except Exception:
                 log.exception("Engine finished callback failed")
-            bus.publish(
-                RunCompletedEvent(
-                    success=success,
-                    message=message,
-                    record=record,
-                )
-            )
 
     def _apply_zvs_threshold(self, target_peak_v: float) -> None:
         """Scale the scope's ZVS dwell threshold to this point's target peak.

@@ -59,7 +59,6 @@ def test_simulated_rig_shares_one_electrical_plant(settings):
         assert rig.scope.client.shared_plant is rig.smu.client.shared_plant
         assert rig.scope.client.name == SCOPE_INSTRUMENT_KEY
         assert rig.dmm is None
-        assert len(rig.legacy_tuple()) == 5
     finally:
         rig.close_clients()
 

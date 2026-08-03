@@ -60,10 +60,6 @@ class PrologixFraming(Transport):
             commands.append(f"++read_tmo_ms {self.read_timeout_ms}")
         return tuple(commands)
 
-    def preamble(self) -> tuple[str, ...]:
-        """Backward-compatible callable view of configuration commands."""
-        return self.configuration_commands
-
     def open(self) -> None:
         if self.is_open:
             return

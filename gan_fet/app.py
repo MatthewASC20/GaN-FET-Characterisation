@@ -24,12 +24,6 @@ if TYPE_CHECKING:
     from gan_fet.sheets.sync import SheetsSync
 
 
-def _build_instruments(settings: Settings, simulate: bool = False):
-    """Compatibility wrapper around the application-facing rig builder."""
-    from gan_fet.instruments.rig import build_instrument_rig
-
-    return build_instrument_rig(settings, simulate=simulate).legacy_tuple()
-
 
 class _ApplicationResources:
     """Idempotent owner for every process-scoped resource."""

@@ -14,13 +14,15 @@ from typing import Any, Iterable, Optional
 
 from gan_fet.core.autotune import WavegenController
 from gan_fet.instruments.base import (
-    InstrumentFactory,
     MultimeterInterface,
     OscilloscopeInterface,
     SmuInterface,
     WavegenInterface,
 )
 from gan_fet.instruments.multimeter import Sdm3055
+from gan_fet.instruments.oscilloscope import LeCroyHdo4054
+from gan_fet.instruments.smu import Keithley2410
+from gan_fet.instruments.wavegen import Sdg6022x
 from gan_fet.settings import SCOPE_INSTRUMENT_KEY, Settings
 
 log = logging.getLogger(__name__)
@@ -49,21 +51,6 @@ class InstrumentRig:
             except Exception:
                 log.exception("Could not close instrument client")
 
-    def legacy_tuple(self) -> tuple[
-        WavegenInterface,
-        OscilloscopeInterface,
-        Optional[MultimeterInterface],
-        SmuInterface,
-        WavegenController,
-    ]:
-        """Compatibility shape used by older composition/tests."""
-        return (
-            self.wavegen,
-            self.scope,
-            self.dmm,
-            self.smu,
-            self.wavegen_controller,
-        )
 
 
 def _first_configured(settings: Settings, names: Iterable[str], role: str) -> str:
@@ -142,16 +129,14 @@ def build_instrument_rig(settings: Settings, *, simulate: bool = False) -> Instr
         return created
 
     try:
-        wavegen = InstrumentFactory.create_wavegen(make_client(roles["wavegen"]))
-        scope = InstrumentFactory.create_oscilloscope(make_client(roles["scope"]))
+        wavegen = Sdg6022x(make_client(roles["wavegen"]))
+        scope = LeCroyHdo4054(make_client(roles["scope"]))
         dmm = (
             Sdm3055(make_client("SDM3055"))
             if "SDM3055" in settings.instruments
             else None
         )
-        smu = InstrumentFactory.create_smu(
-            make_client(roles["smu"], is_smu=True), settings.smu
-        )
+        smu = Keithley2410(make_client(roles["smu"], is_smu=True), settings.smu)
         # The controller gets the scope and a ramp ceiling below the interlock,
         # so a standalone frequency move is halted before a trip rather than
         # after one. Sits under the hard ceiling by the same margin the

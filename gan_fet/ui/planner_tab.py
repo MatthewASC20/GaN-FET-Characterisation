@@ -19,7 +19,7 @@ from gan_fet.ui.plan_table import (
     fill_plan_tree,
 )
 from gan_fet.ui.tracker_view import TrackerView
-from gan_fet.ui.widgets import parse_positive_duration
+from gan_fet.ui.run_request import parse_positive_duration
 
 log = logging.getLogger(__name__)
 

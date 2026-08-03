@@ -572,7 +572,6 @@ def test_immediate_estop_backfills_audit_after_run_creation(
         *,
         status: str = "running",
         started_at: Optional[str] = None,
-        replace_existing: bool = True,
     ) -> int:
         create_entered.set()
         if not release_create.wait(timeout=3.0):
@@ -582,7 +581,6 @@ def test_immediate_estop_backfills_audit_after_run_creation(
             duration_minutes,
             status=status,
             started_at=started_at,
-            replace_existing=replace_existing,
         )
 
     monkeypatch.setattr(database, "create_run", delayed_create)

@@ -579,15 +579,12 @@ class Database:
         *,
         status: str = "running",
         started_at: Optional[str] = None,
-        replace_existing: bool = True,
     ) -> int:
         """Append a run attempt without deleting prior measurements.
 
-        ``replace_existing`` is retained for API compatibility. Replacements
-        are now logical: selectors prefer the newest successful attempt while
-        all attempts remain available for audit and recovery.
+        Replacements are logical: selectors prefer the newest successful
+        attempt while all attempts remain available for audit and recovery.
         """
-        del replace_existing
         with self._write_scope():
             name = point.device_name.strip()
             if not name:

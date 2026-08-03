@@ -184,7 +184,6 @@ def migrate_legacy_tree(db: Database, root: Path) -> MigrationReport:
                         duration_minutes=0.0,
                         status="importing" if is_complete else "legacy_partial",
                         started_at=started_at,
-                        replace_existing=False,
                     )
                     if samples:
                         db.add_samples(run_id, samples)

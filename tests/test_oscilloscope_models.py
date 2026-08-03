@@ -9,7 +9,6 @@ from typing import Optional
 
 import pytest
 
-from gan_fet.instruments.base import InstrumentFactory
 from gan_fet.instruments.mock_scpi import MockScpiTcpClient, SimulatedRigPlant
 from gan_fet.instruments.oscilloscope import LeCroyHdo4054
 from gan_fet.scpi import ScpiClient
@@ -265,8 +264,8 @@ def test_simulated_scope_without_renderer_never_uses_adapter(tmp_path) -> None:
     assert not destination.exists()
 
 
-def test_factory_constructs_hdo4054_driver() -> None:
-    scope = InstrumentFactory.create_oscilloscope(RecordingSession())
+def test_driver_constructs_from_a_bare_session() -> None:
+    scope = LeCroyHdo4054(RecordingSession())
 
     assert isinstance(scope, LeCroyHdo4054)
 

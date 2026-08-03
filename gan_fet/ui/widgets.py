@@ -18,10 +18,6 @@ from functools import partial
 from tkinter import ttk
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
-from gan_fet.ui.run_request import (
-    parse_positive_duration as _parse_positive_duration,
-)
-
 try:
     from tkmacosx import Button as _ColorButtonBase  # type: ignore
     _HAVE_TKMACOSX = True
@@ -324,7 +320,6 @@ def resolve_rig_control_state(
 
 # Re-exported so existing importers keep working. The parsing itself is pure
 # and lives in ui/run_request.py, which does not import tkinter.
-parse_positive_duration = _parse_positive_duration
 
 
 def set_widget_enabled(widget, enabled: bool) -> None:

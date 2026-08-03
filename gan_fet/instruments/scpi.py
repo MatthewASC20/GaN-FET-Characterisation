@@ -75,6 +75,4 @@ class ScpiTcpClient(_ScpiClient):
 
 
 # Historical alias retained for imports from gan_fet.instruments.scpi.
-ScpiClient = ScpiTcpClient
-
-__all__ = ["ScpiClient", "ScpiTcpClient"]
+__all__ = ["ScpiTcpClient"]

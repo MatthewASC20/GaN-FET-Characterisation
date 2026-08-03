@@ -33,6 +33,7 @@ from gan_fet.ui.run_request import (
     InputRejected,
     build_experiment_params,
     build_matrix_point,
+    parse_positive_duration,
     require_populated_options,
     tuning_candidate,
 )
@@ -114,7 +115,6 @@ from gan_fet.ui.widgets import (
     StatusBar,
     UiDispatcher,
     call_on_ui_thread,
-    parse_positive_duration,
     resolve_rig_control_state,
     show_temporary_popup,
 )

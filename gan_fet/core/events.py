@@ -12,7 +12,6 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Type, TypeVar
 
-from gan_fet.core.models import ExperimentState, RunRecord
 
 log = logging.getLogger(__name__)
 
@@ -60,14 +59,6 @@ class MeasurementEvent:
 
 
 @dataclass(frozen=True)
-class StateChangedEvent:
-    """Emitted when the experiment engine state transitions."""
-
-    old_state: ExperimentState
-    new_state: ExperimentState
-
-
-@dataclass(frozen=True)
 class StatusUpdatedEvent:
     """Emitted for human-readable progress updates."""
 
@@ -80,23 +71,6 @@ class SafetyTripEvent:
 
     reason: str
     value: float
-
-
-@dataclass(frozen=True)
-class RunCompletedEvent:
-    """Emitted when an experiment run finishes (successfully or failed)."""
-
-    success: bool
-    message: str
-    record: Optional[RunRecord] = None
-
-
-@dataclass(frozen=True)
-class ErrorReportedEvent:
-    """Emitted when an error dialog should be presented."""
-
-    title: str
-    message: str
 
 
 @dataclass(frozen=True)

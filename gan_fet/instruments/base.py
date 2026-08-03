@@ -12,10 +12,8 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple
 
-from gan_fet.scpi.protocol import ScpiSession
-from gan_fet.settings import SmuSettings
 
 log = logging.getLogger(__name__)
 
@@ -242,25 +240,3 @@ class WavegenInterface(ABC):
     def outputs_off(self) -> None:
         """Turn off all wavegen outputs."""
         ...
-
-class InstrumentFactory:
-    """Factory creating HAL instrument driver instances based on configuration."""
-
-    @staticmethod
-    def create_oscilloscope(client: ScpiSession) -> OscilloscopeInterface:
-        from gan_fet.instruments.oscilloscope import LeCroyHdo4054
-
-        log.info("Creating Teledyne LeCroy HDO4054 oscilloscope driver")
-        return LeCroyHdo4054(client)
-
-    @staticmethod
-    def create_smu(client: Any, settings: SmuSettings) -> SmuInterface:
-        from gan_fet.instruments.smu import Keithley2410
-        log.info("Creating Keithley 2410/2400 SMU driver")
-        return Keithley2410(client, settings)
-
-    @staticmethod
-    def create_wavegen(client: Any, settings: Optional[Any] = None) -> WavegenInterface:
-        from gan_fet.instruments.wavegen import Sdg6022x
-        log.info("Creating Siglent SDG6022X wavegen driver")
-        return Sdg6022x(client)
