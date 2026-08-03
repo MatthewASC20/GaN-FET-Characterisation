@@ -1,0 +1,45 @@
+# Python bytecode and build artefacts
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tool caches
+.mplconfig/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# OS cruft
+.DS_Store
+._*
+
+# Secrets — never commit the Google service-account key
+credentials.json
+
+# Runtime state (live tree)
+settings.json
+screenshots/
+reports/
+exports/
+
+# Databases and logs — generated at run time, never source
+*.db
+*.db-wal
+*.db-shm
+*.log
+logs/
+
+# Network lease files: per-session state, never source
+*.lock
+
+# Legacy bench records imported via --migrate: 41 MB of measurement data and
+# scope screenshots. Live data belongs in the per-user data directory, and this
+# tree is a one-off import source, not source code.
+Device Data/
