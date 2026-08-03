@@ -118,7 +118,7 @@ class PseudoCommandEvent:
     """Emitted for high-level pseudo-commands, sequence intent, or loop updates."""
 
     timestamp: float  # time.time()
-    category: str  # e.g., 'TRIM', 'RAMP', 'ZVS', 'SEQUENCE'
+    category: str  # e.g., 'TRIM', 'RAMP', 'VOLTAGE TUNE', 'SEQUENCE'
     title: str  # e.g., 'Trimming Gate Threshold'
     detail: str  # e.g., 'Target: 2.50V | Step +10mV'
     loop_id: Optional[str] = None  # Unique ID if updating a dynamic loop row

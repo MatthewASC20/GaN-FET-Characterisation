@@ -147,10 +147,10 @@ def test_params_carry_the_search_flags_through():
         voltage_v=200,
     )
     params = build_experiment_params(
-        point, "1.5", find_zvs=True, tune_frequency=False
+        point, "1.5", tune_voltage=True, tune_frequency=False
     )
     assert params.duration_minutes == pytest.approx(1.5)
-    assert params.find_zvs is True
+    assert params.tune_voltage is True
     assert params.tune_frequency is False
 
 
@@ -164,7 +164,7 @@ def test_a_bad_duration_rejects_the_whole_request():
         voltage_v=200,
     )
     with pytest.raises(InputRejected, match="duration"):
-        build_experiment_params(point, "-5", find_zvs=False, tune_frequency=True)
+        build_experiment_params(point, "-5", tune_voltage=False, tune_frequency=True)
 
 
 def test_no_tuning_candidate_when_already_at_the_prior_frequency():

@@ -209,11 +209,11 @@ class PlannerTab(ttk.Frame):
             "<FocusOut>", lambda _event: self.generate_plan(show_errors=False)
         )
 
-        self.find_zvs_var = tk.BooleanVar(value=True)
+        self.tune_voltage_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             ctrl_frame,
             text="Tune DC Voltage before each run",
-            variable=self.find_zvs_var,
+            variable=self.tune_voltage_var,
         ).pack(side="left", padx=15)
 
         # The plan is already rebuilt live on every selection change, so
@@ -446,7 +446,7 @@ class PlannerTab(ttk.Frame):
             ),
             bool(self.include_completed_var.get()),
             self.duration_entry.get(),
-            bool(self.find_zvs_var.get()),
+            bool(self.tune_voltage_var.get()),
         )
 
     def _save_selections(self) -> None:
@@ -483,7 +483,9 @@ class PlannerTab(ttk.Frame):
                 duration_minutes=parse_positive_duration(
                     self.duration_entry.get()
                 ),
-                find_zvs=self.find_zvs_var.get(),
+                # save_plan_selections speaks schema names; find_zvs is the
+                # column until the storage migration renames it.
+                find_zvs=self.tune_voltage_var.get(),
             )
         except Exception:
             log.exception("Could not save the planner selections")
@@ -508,11 +510,11 @@ class PlannerTab(ttk.Frame):
             return False
         if stored is None:
             return False
-        selections, include_completed, duration, find_zvs = stored
+        selections, include_completed, duration, tune_voltage = stored
         for key, box in self.select_boxes.items():
             box.set_selected_values(selections.get(key, ()))
         self.include_completed_var.set(include_completed)
-        self.find_zvs_var.set(find_zvs)
+        self.tune_voltage_var.set(tune_voltage)
         self.duration_entry.delete(0, tk.END)
         self.duration_entry.insert(0, f"{duration:g}")
         self._saved_selection_state = self._selection_state()
@@ -545,14 +547,14 @@ class PlannerTab(ttk.Frame):
             )
             return
 
-        find_zvs = self.find_zvs_var.get()
+        tune_voltage = self.tune_voltage_var.get()
         # Apply first, and only start if it took. Declining the "replace the
         # applied plan?" prompt and then starting anyway would leave the
         # Planned Tests table describing one plan while the sequence ran
         # another — the divergence this whole arrangement exists to prevent.
         if not self.on_apply_plan(plan):
             return
-        self.on_start_sequence(plan, duration, find_zvs)
+        self.on_start_sequence(plan, duration, tune_voltage)
 
     def _export_csv(self) -> None:
         if not self.current_plan or not self.current_plan.points:

@@ -54,7 +54,7 @@ def format_run_details(run: RunRecord, sample_count: int) -> str:
             f"Started: {run.started_at or '—'}",
             f"Completed: {run.completed_at or '—'}",
             f"Bus voltage: {value(run.bus_voltage_v, 'V')}",
-            f"Tuned DC voltage: {value(run.v_zvs, 'V')}",
+            f"Tuned DC voltage: {value(run.tuned_voltage_v, 'V')}",
             f"Vin: {value(readings.vin, 'V')}",
             f"Iin: {value(readings.iin, 'A', 6)}",
             f"Switching frequency: {value(readings.fsw_hz, 'Hz')}",

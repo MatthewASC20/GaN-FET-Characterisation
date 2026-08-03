@@ -141,7 +141,7 @@ def generate_device_report(
             f"<tr><td>{html.escape(p.config)}</td>"
             f"<td>{freq_label(p.frequency_hz)}</td>"
             f"<td>{p.duty_pct}</td><td>{p.temperature_c}</td><td>{p.voltage_v}</td>"
-            f"<td>{_fmt(run.bus_voltage_v)}</td><td>{_fmt(run.v_zvs)}</td>"
+            f"<td>{_fmt(run.bus_voltage_v)}</td><td>{_fmt(run.tuned_voltage_v)}</td>"
             f"<td>{_fmt(r.vin)}</td><td>{_fmt(r.iin)}</td>"
             f"<td>{_fmt(r.fsw_hz and r.fsw_hz / 1e6, 4)}</td>"
             f"<td>{_fmt(r.irms)}</td><td>{_fmt(r.vds_pk)}</td>"

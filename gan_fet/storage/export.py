@@ -62,7 +62,7 @@ def export_device(
                 writer.writerow(origin + [
                     run.id, p.device_name, p.config, p.frequency_hz, p.duty_pct,
                     p.temperature_c, p.voltage_v, run.attempt_no, run.status, run.started_at,
-                    run.completed_at, run.bus_voltage_v, run.v_zvs, r.vin, r.iin,
+                    run.completed_at, run.bus_voltage_v, run.tuned_voltage_v, r.vin, r.iin,
                     r.fsw_hz, r.irms, r.vds_pk, r.isw_rms, run.screenshot_path,
                 ])
 

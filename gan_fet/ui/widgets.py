@@ -279,7 +279,7 @@ class RigControlState:
     configuration: bool
     reset_safety: bool
     stop_sequence: bool
-    stop_zvs: bool
+    stop_voltage_tune: bool
     pause_experiment: bool
     cancel_operation: bool
 
@@ -299,7 +299,7 @@ def resolve_rig_control_state(
     hardware_reachable = not hardware_offline
     hardware_actions = idle and hardware_reachable and not safety_tripped
     sequence_active = active_kind == "sequence"
-    zvs_active = active_kind == "zvs"
+    voltage_tune_active = active_kind == "voltage_tune"
 
     return RigControlState(
         edit_inputs=idle,
@@ -315,9 +315,9 @@ def resolve_rig_control_state(
         configuration=idle,
         reset_safety=idle and hardware_reachable and safety_tripped,
         stop_sequence=sequence_active and not closing,
-        stop_zvs=zvs_active and not closing,
+        stop_voltage_tune=voltage_tune_active and not closing,
         pause_experiment=engine_running and not closing,
-        cancel_operation=(engine_running or sequence_active or zvs_active)
+        cancel_operation=(engine_running or sequence_active or voltage_tune_active)
         and not closing,
     )
 

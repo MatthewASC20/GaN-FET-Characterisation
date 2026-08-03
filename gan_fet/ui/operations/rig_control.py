@@ -128,7 +128,7 @@ class RigUi(Protocol):
         autotune restyles its own button.
         """
 
-    def zvs_stopping(self) -> None:
+    def voltage_tune_stopping(self) -> None:
         """Show that a cooperative stop has been asked for."""
 
     def flash(self, message: str) -> None:
@@ -551,23 +551,23 @@ class RigOperations:
             )
         self.ui.refresh_confirm()
 
-    # -- the manual ZVS search ------------------------------------------------
+    # -- the manual DC voltage tune -------------------------------------------
 
-    def request_zvs_stop(self) -> bool:
-        """Ask a running ZVS search to stop, returning whether one was running.
+    def request_voltage_tune_stop(self) -> bool:
+        """Ask a running DC voltage tune to stop, returning whether one was running.
 
         Cooperative: the search checks the cancel flag between every step that
         arms or energises something, so it stops at a point where the rig is in
         a known state rather than wherever the command happened to land.
         """
-        if self.operations.active_kind != "zvs":
+        if self.operations.active_kind != "voltage_tune":
             return False
         self.operations.cancel_active()
-        self.ui.zvs_stopping()
+        self.ui.voltage_tune_stopping()
         self.ui.set_status("Stopping the DC voltage tune safely...")
         return True
 
-    def launch_zvs(self, *, target_peak_v: float, config: str) -> None:
+    def launch_voltage_tune(self, *, target_peak_v: float, config: str) -> None:
         """Arm, energise, hold the peak, and sweep the bus for the ZVS point.
 
         The interlock guard runs between every step that arms or energises,
@@ -576,7 +576,7 @@ class RigOperations:
         a ``finally`` and behaves differently either side of a failure, which
         is why this operation does not use the shared background helper.
         """
-        token = self.begin("zvs")
+        token = self.begin("voltage_tune")
         if token is None:
             return
         self.ui.set_tuning(True)
@@ -598,7 +598,8 @@ class RigOperations:
                 self.ui.set_status_async("Verifying LeCroy HDO4054 identity...")
                 identity = self.engine.scope.verify_identity()
                 log.info(
-                    "Verified oscilloscope identity for manual ZVS: %s", identity
+                    "Verified oscilloscope identity for manual voltage tune: %s",
+                    identity,
                 )
 
                 abort_check()
@@ -616,7 +617,7 @@ class RigOperations:
                     cancel_check=token.cancel_event.is_set,
                     status=self.ui.set_status_async,
                 )
-                result = self.engine.zvs_tuner.find_minimum(
+                result = self.engine.voltage_tuner.find_minimum(
                     cancel_check=token.cancel_event.is_set,
                     status=self.ui.set_status_async,
                 )
@@ -625,15 +626,15 @@ class RigOperations:
             except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
                 error = exc
             finally:
-                error = self._make_safe_after_zvs(error)
-            self.dispatcher.post(self.on_zvs_done, token, result, error)
+                error = self._make_safe_after_voltage_tune(error)
+            self.dispatcher.post(self.on_voltage_tune_done, token, result, error)
 
-        self.pool.start(worker, name="zvs")
+        self.pool.start(worker, name="voltage-tune")
 
-    def _make_safe_after_zvs(
+    def _make_safe_after_voltage_tune(
         self, error: Optional[BaseException]
     ) -> Optional[BaseException]:
-        """Bring the rig down after a ZVS search, whichever way it ended.
+        """Bring the rig down after a DC voltage tune, whichever way it ended.
 
         The two paths differ, and deliberately. After a *successful* search the
         ordinary shutdown is expected to work, so a failure to confirm it is
@@ -663,7 +664,9 @@ class RigOperations:
                             f"{error}; emergency output-off was unconfirmed"
                         )
                 except Exception:
-                    log.exception("Emergency fallback failed after ZVS cleanup")
+                    log.exception(
+                        "Emergency fallback failed after voltage-tune cleanup"
+                    )
             return error
 
         try:
@@ -673,10 +676,12 @@ class RigOperations:
                         f"{error}; emergency output-off was unconfirmed"
                     )
         except Exception:
-            log.exception("Failed to make outputs safe after ZVS search error")
+            log.exception(
+                "Failed to make outputs safe after a voltage-tune error"
+            )
         return error
 
-    def on_zvs_done(self, token: OperationToken, result, error) -> None:
+    def on_voltage_tune_done(self, token: OperationToken, result, error) -> None:
         self.ui.set_tuning(False)
         self.finish(token)
         self.ui.smu_state_changed()
@@ -692,7 +697,7 @@ class RigOperations:
             self.ui.set_status("DC voltage tune found no improvement.")
         else:
             self.ui.set_status(
-                f"DC voltage tuned to {result.v_zvs:.1f} V "
+                f"DC voltage tuned to {result.tuned_voltage_v:.1f} V "
                 f"(ZVS point, {result.i_min * 1000:.2f} mA). "
                 "Bus and gate outputs are OFF."
             )

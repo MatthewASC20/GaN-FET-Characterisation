@@ -31,7 +31,7 @@ class SmuPanel(ttk.LabelFrame):
         self,
         parent: tk.Misc,
         *,
-        on_find_zvs: Callable[[], None],
+        on_tune_voltage: Callable[[], None],
         on_bus_off: Callable[[], None],
         on_reset_safety: Callable[[], None],
         on_emergency_stop: Callable[[], None],
@@ -44,10 +44,10 @@ class SmuPanel(ttk.LabelFrame):
         )
         self.status_label.grid(row=0, column=0, sticky="w", padx=8, pady=4)
 
-        self.zvs_button = ttk.Button(
-            self, text="Tune DC Voltage Now", command=on_find_zvs
+        self.voltage_tune_button = ttk.Button(
+            self, text="Tune DC Voltage Now", command=on_tune_voltage
         )
-        self.zvs_button.grid(row=0, column=1, padx=6, pady=4)
+        self.voltage_tune_button.grid(row=0, column=1, padx=6, pady=4)
 
         self.bus_off_button = ttk.Button(self, text="Bus Off", command=on_bus_off)
         self.bus_off_button.grid(row=0, column=2, padx=6, pady=4)
@@ -85,20 +85,20 @@ class SmuPanel(ttk.LabelFrame):
         situations in which it is needed. Adding it here would be a mistake
         even if every current state happened to leave it enabled.
         """
-        if controls.stop_zvs:
-            self.zvs_button.config(state="normal", text="Stop Voltage Tune")
+        if controls.stop_voltage_tune:
+            self.voltage_tune_button.config(state="normal", text="Stop Voltage Tune")
         else:
-            self.zvs_button.config(
+            self.voltage_tune_button.config(
                 state="normal" if controls.hardware_actions else "disabled",
                 text="Tune DC Voltage Now",
             )
         set_widget_enabled(self.bus_off_button, controls.shutdown_actions)
         set_widget_enabled(self.reset_safety_button, controls.reset_safety)
 
-    def set_zvs_stopping(self) -> None:
+    def set_voltage_tune_stopping(self) -> None:
         """Show that a cooperative stop has been requested but not completed.
 
         Disabled so the request cannot be repeated while it is in flight; the
         next control-state refresh restores whichever label is then correct.
         """
-        self.zvs_button.config(text="Stopping...", state="disabled")
+        self.voltage_tune_button.config(text="Stopping...", state="disabled")

@@ -79,7 +79,7 @@ def test_the_decision_is_made_before_the_run_request_is_built():
 
 
 def test_cancel_stops_a_running_zvs_search():
-    assert cancel_target("zvs") is CancelTarget.ZVS_SEARCH
+    assert cancel_target("voltage_tune") is CancelTarget.VOLTAGE_TUNE
 
 
 def test_cancel_stops_a_sequence_at_the_sequence_level():

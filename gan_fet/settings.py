@@ -287,7 +287,7 @@ class WavegenSettings:
 
 
 @dataclass
-class ZvsSettings:
+class VoltageTuneSettings:
     """Search for the bus voltage that minimises DC input current."""
 
     step_v: float = 1.0
@@ -515,7 +515,7 @@ class Settings:
     )
     smu: SmuSettings = field(default_factory=SmuSettings)
     wavegen: WavegenSettings = field(default_factory=WavegenSettings)
-    zvs: ZvsSettings = field(default_factory=ZvsSettings)
+    zvs: VoltageTuneSettings = field(default_factory=VoltageTuneSettings)
     frequency_tune: FrequencyTuneSettings = field(
         default_factory=FrequencyTuneSettings
     )
@@ -832,7 +832,7 @@ class Settings:
         sections = {
             "smu": (SmuSettings, settings.smu),
             "wavegen": (WavegenSettings, settings.wavegen),
-            "zvs": (ZvsSettings, settings.zvs),
+            "zvs": (VoltageTuneSettings, settings.zvs),
             "frequency_tune": (FrequencyTuneSettings, settings.frequency_tune),
             "peak_control": (PeakControlSettings, settings.peak_control),
             "safety": (SafetySettings, settings.safety),

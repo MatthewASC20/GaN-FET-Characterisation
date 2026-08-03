@@ -5,7 +5,7 @@ Flow per run:
   2. SMU on (soft start from 0 V) and closed-loop ramp until the scope's
      Vds peak equals the selected test voltage (replaces the manual bench
      supply + validation dialog of v1)
-  3. optional ZVS search (minimise DC input current vs bus voltage)
+  3. optional DC voltage tune (minimise DC input current vs bus voltage)
   4. timed sampling loop → `samples` table (+ live UI callbacks)
   5. final readings + oscilloscope screenshot → `runs` row
   6. safe shutdown (bus ramped to 0 V, output off)
@@ -43,7 +43,7 @@ from gan_fet.core.models import (
 from gan_fet.core.frequency_tune import FrequencyTuner
 from gan_fet.core.safety import SafetyMonitor, SafetyTrip
 from gan_fet.core.voltage_control import PeakControlError, PeakVoltageController
-from gan_fet.core.zvs import ZvsMeasurementError, ZvsTuner
+from gan_fet.core.voltage_tune import VoltageTuneMeasurementError, VoltageTuner
 from gan_fet.instruments.base import (
     MultimeterInterface,
     OscilloscopeInterface,
@@ -130,7 +130,7 @@ class ExperimentEngine:
         self.peak_controller = PeakVoltageController(
             smu, scope, settings.peak_control, safety
         )
-        self.zvs_tuner = ZvsTuner(smu, settings.zvs, safety, scope=scope)
+        self.voltage_tuner = VoltageTuner(smu, settings.zvs, safety, scope=scope)
         self.frequency_tuner = FrequencyTuner(
             wavegen,
             smu,
@@ -479,7 +479,7 @@ class ExperimentEngine:
                 status=self._update_status,
             )
 
-            # The frequency search runs before the ZVS voltage search: it
+            # The frequency search runs before the DC voltage tune: it
             # holds the peak on target throughout, so it leaves a well-defined
             # operating point for anything that follows.
             tune_result = None
@@ -521,12 +521,12 @@ class ExperimentEngine:
                     message = "Cancelled after the frequency search."
                     return
 
-            v_zvs: Optional[float] = None
-            if params.find_zvs:
+            tuned_voltage_v: Optional[float] = None
+            if params.tune_voltage:
                 self._update_status(
                     "Tuning DC voltage (searching for the ZVS point)..."
                 )
-                result = self.zvs_tuner.find_minimum(
+                result = self.voltage_tuner.find_minimum(
                     cancel_check=self._cancelled, status=self._update_status
                 )
                 if result is None:
@@ -534,14 +534,14 @@ class ExperimentEngine:
                         raise ExperimentCancelled(
                             "Experiment cancelled during the DC voltage tune."
                         )
-                    raise ZvsMeasurementError(
+                    raise VoltageTuneMeasurementError(
                         "Requested DC voltage tune returned no measurement "
                         "result"
                     )
-                v_zvs = result.v_zvs
-                bus_voltage = result.v_zvs
+                tuned_voltage_v = result.tuned_voltage_v
+                bus_voltage = result.tuned_voltage_v
                 self._update_status(
-                    f"DC voltage tuned to {result.v_zvs:.1f} V "
+                    f"DC voltage tuned to {result.tuned_voltage_v:.1f} V "
                     f"(ZVS point, {result.i_min * 1000:.2f} mA)"
                 )
 
@@ -574,12 +574,12 @@ class ExperimentEngine:
             self._validate_final_readings(
                 readings,
                 point.config,
-                # A requested ZVS search deliberately moves the bus away from
-                # the pre-ZVS peak target.  The target is a safe search seed in
+                # A requested DC voltage tune deliberately moves the bus away
+                # from the pre-tune peak target.  The target is a safe search seed in
                 # that mode; the final point must remain finite and within all
                 # safety ceilings, but is not forced back to the seed.
                 target_vds=(
-                    None if v_zvs is not None else float(point.voltage_v)
+                    None if tuned_voltage_v is not None else float(point.voltage_v)
                 ),
             )
             self._poll_energized_safety("before screenshot capture")
@@ -591,7 +591,9 @@ class ExperimentEngine:
                 run_id,
                 readings,
                 bus_voltage_v=bus_voltage,
-                v_zvs=v_zvs,
+                # complete_run speaks schema names; v_zvs is the column until
+                # the storage migration renames it.
+                v_zvs=tuned_voltage_v,
                 screenshot_path=str(screenshot) if screenshot else None,
                 tuned_frequency_hz=(
                     None if tune_result is None else tune_result.frequency_hz

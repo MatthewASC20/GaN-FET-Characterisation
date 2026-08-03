@@ -175,7 +175,7 @@ class AutoSequence:
         return self._thread is not None and self._thread.is_alive()
 
     def start(
-        self, plan: list[MatrixPoint], duration_minutes: float, find_zvs: bool
+        self, plan: list[MatrixPoint], duration_minutes: float, tune_voltage: bool
     ) -> bool:
         with self._lifecycle_lock:
             if self.active or self.engine.is_busy() or not plan:
@@ -183,7 +183,7 @@ class AutoSequence:
             self._cancel.clear()
             thread = threading.Thread(
                 target=self._run,
-                args=(plan, duration_minutes, find_zvs),
+                args=(plan, duration_minutes, tune_voltage),
                 daemon=False,
                 name="auto-sequence",
             )
@@ -215,7 +215,7 @@ class AutoSequence:
     def _cancelled(self) -> bool:
         return self._cancel.is_set()
 
-    def _run(self, plan: list[MatrixPoint], duration_minutes: float, find_zvs: bool) -> None:
+    def _run(self, plan: list[MatrixPoint], duration_minutes: float, tune_voltage: bool) -> None:
         total = len(plan)
         completed = 0
         success = True
@@ -277,7 +277,7 @@ class AutoSequence:
                     ExperimentParams(
                         point=point,
                         duration_minutes=duration_minutes,
-                        find_zvs=find_zvs,
+                        tune_voltage=tune_voltage,
                     )
                 ):
                     success = False

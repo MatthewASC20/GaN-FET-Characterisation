@@ -40,7 +40,7 @@ Dependencies point **down** this list. Do not introduce an upward import.
 1. `app.py` — composition root and CLI. Owns process resources; closes the
    database, clients, Sheets worker and SCPI logger idempotently.
 2. `ui/` — tkinter only. Translates operator actions into core operations.
-3. `core/` — experiment engine, sequence, peak control, ZVS, autotune, safety.
+3. `core/` — experiment engine, sequence, peak control, voltage tune, autotune, safety.
    **No Tk dependency, ever.** This boundary is enforced by tests.
 4. `instruments/` — hardware interfaces. `rig.py` is the *only* place mapping
    persisted instrument names to drivers.

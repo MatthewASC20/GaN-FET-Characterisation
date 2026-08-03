@@ -47,9 +47,9 @@ from gan_fet.ui.operations.experiment_ops import (
 )
 from gan_fet.ui.operations.rig_ops import (
     AutotuneAction,
-    ZvsAction,
+    VoltageTuneAction,
     autotune_precondition,
-    zvs_precondition,
+    voltage_tune_precondition,
 )
 from gan_fet.ui.operations.worker_pool import WorkerPool
 from gan_fet.ui.panels.device_bar import DeviceBar
@@ -155,7 +155,7 @@ HARDWARE_OPERATION_LABELS = {
     "reset_safety": "reset the safety interlock",
     "sequence": "start an auto sequence",
     "simulation_validation": "start the simulated validation run",
-    "zvs": "tune the DC voltage",
+    "voltage_tune": "tune the DC voltage",
 }
 
 # Confirm-button state colours (unchanged from v1)
@@ -393,11 +393,11 @@ class MainWindow(tk.Tk):
         self.duty_var = tk.IntVar(value=self._first("duties"))
         self.temperature_var = tk.IntVar(value=self._first("temperatures"))
         self.voltage_var = tk.IntVar(value=self._first("voltages"))
-        self.find_zvs_var = tk.BooleanVar(value=self.settings.find_zvs_before_run)
+        self.tune_voltage_var = tk.BooleanVar(value=self.settings.find_zvs_before_run)
         self.tune_frequency_var = tk.BooleanVar(
             value=self.settings.tune_frequency_at_operating_point
         )
-        self.show_zvs_sweep_var = tk.BooleanVar(
+        self.show_voltage_tune_var = tk.BooleanVar(
             value=self.settings.show_zvs_voltage_sweep
         )
 
@@ -406,17 +406,17 @@ class MainWindow(tk.Tk):
             self.tune_frequency_var.get()
         )
 
-    def _on_show_zvs_sweep_toggled(self) -> None:
-        self.settings.show_zvs_voltage_sweep = bool(self.show_zvs_sweep_var.get())
-        self._apply_zvs_visibility()
+    def _on_show_voltage_tune_toggled(self) -> None:
+        self.settings.show_zvs_voltage_sweep = bool(self.show_voltage_tune_var.get())
+        self._apply_voltage_tune_visibility()
         self._refresh_control_states()
 
-    def _apply_zvs_visibility(self) -> None:
+    def _apply_voltage_tune_visibility(self) -> None:
         """Show or hide the DC voltage tune control per the Config setting."""
         controls = getattr(self, "run_controls", None)
         if controls is None:
             return
-        controls.set_zvs_sweep_visible(bool(self.show_zvs_sweep_var.get()))
+        controls.set_voltage_tune_visible(bool(self.show_voltage_tune_var.get()))
 
     def _first(self, key: str) -> Any:
         options = self.param_options.get(key) or []
@@ -610,7 +610,7 @@ class MainWindow(tk.Tk):
             default_duration=str(
                 self.settings.default_duration_minutes(self.voltage_var.get())
             ),
-            find_zvs_var=self.find_zvs_var,
+            tune_voltage_var=self.tune_voltage_var,
             on_apply_wavegen=self._apply_wavegen,
             on_autotune=self._start_autotune,
         )
@@ -619,7 +619,7 @@ class MainWindow(tk.Tk):
         self.last_current_label = self.run_controls.last_current_label
         self.confirm_button = self.run_controls.confirm_button
         self.autotune_button = self.run_controls.autotune_button
-        self._apply_zvs_visibility()
+        self._apply_voltage_tune_visibility()
 
     def _build_telemetry_panel(self) -> None:
         self.telemetry_panel = TelemetryPanel(self.main_frame)
@@ -673,7 +673,7 @@ class MainWindow(tk.Tk):
     def _build_smu_panel(self) -> None:
         self.smu_panel = SmuPanel(
             self.main_frame,
-            on_find_zvs=self._find_zvs_now,
+            on_tune_voltage=self._tune_voltage_now,
             on_bus_off=self._bus_off,
             on_reset_safety=self._reset_safety,
             on_emergency_stop=self._emergency_stop,
@@ -752,7 +752,7 @@ class MainWindow(tk.Tk):
         params = ExperimentParams(
             point=point,
             duration_minutes=SIMULATION_VALIDATION_DURATION_MINUTES,
-            find_zvs=bool(self.find_zvs_var.get()),
+            tune_voltage=bool(self.tune_voltage_var.get()),
             tune_frequency=bool(self.tune_frequency_var.get()),
         )
 
@@ -922,8 +922,8 @@ class MainWindow(tk.Tk):
         ttk.Checkbutton(
             advanced,
             text="Show DC voltage tune controls",
-            variable=self.show_zvs_sweep_var,
-            command=self._on_show_zvs_sweep_toggled,
+            variable=self.show_voltage_tune_var,
+            command=self._on_show_voltage_tune_toggled,
         ).pack(anchor="w", padx=8, pady=6)
         ttk.Label(
             advanced,
@@ -1038,9 +1038,9 @@ class MainWindow(tk.Tk):
                 bg="#1976D2", fg="white", text="Autotuning...", state="disabled"
             )
 
-    def zvs_stopping(self) -> None:
+    def voltage_tune_stopping(self) -> None:
         if hasattr(self, "smu_panel"):
-            self.smu_panel.set_zvs_stopping()
+            self.smu_panel.set_voltage_tune_stopping()
 
     def flash(self, message: str) -> None:
         show_temporary_popup(self, message, duration_ms=2000)
@@ -1360,12 +1360,12 @@ class MainWindow(tk.Tk):
             "voltage": self.voltage_var.get(),
             "duration": self.run_controls.duration_entry.get(),
         }
-        self.settings.find_zvs_before_run = bool(self.find_zvs_var.get())
+        self.settings.find_zvs_before_run = bool(self.tune_voltage_var.get())
         self.settings.tune_frequency_at_operating_point = bool(
             self.tune_frequency_var.get()
         )
         self.settings.show_zvs_voltage_sweep = bool(
-            self.show_zvs_sweep_var.get()
+            self.show_voltage_tune_var.get()
         )
         self.settings.save()
 
@@ -1517,7 +1517,7 @@ class MainWindow(tk.Tk):
 
 
     # ------------------------------------------------------------------
-    # SMU panel: ZVS / bus off / E-STOP
+    # SMU panel: voltage tune / bus off / E-STOP
     # ------------------------------------------------------------------
 
     def _update_smu_panel(self) -> None:
@@ -1530,12 +1530,12 @@ class MainWindow(tk.Tk):
         )
         self.update_telemetry()
 
-    def _find_zvs_now(self) -> None:
+    def _tune_voltage_now(self) -> None:
         # Stopping comes first and reads nothing. An operator reaching for Stop
         # while the hardware has dropped offline, or after a trip, still needs
         # the search to stop — so it must not depend on any of the state that
         # decides whether one could be *started*.
-        if self._request_zvs_stop():
+        if self._request_voltage_tune_stop():
             return
         try:
             target_v: Optional[float] = float(self.voltage_var.get())
@@ -1552,7 +1552,7 @@ class MainWindow(tk.Tk):
             # it as out of date rather than assume it agrees.
             wavegen_pending = True
 
-        decision = zvs_precondition(
+        decision = voltage_tune_precondition(
             hardware_offline=self.hardware_offline,
             safety_tripped=self._safety_is_tripped(),
             target_peak_v=target_v,
@@ -1560,23 +1560,23 @@ class MainWindow(tk.Tk):
             wavegen_pending=wavegen_pending,
         )
 
-        if decision.action is ZvsAction.HARDWARE_OFFLINE:
-            self._ensure_hardware_online(HARDWARE_OPERATION_LABELS["zvs"])
-        elif decision.action is ZvsAction.REFUSE:
+        if decision.action is VoltageTuneAction.HARDWARE_OFFLINE:
+            self._ensure_hardware_online(HARDWARE_OPERATION_LABELS["voltage_tune"])
+        elif decision.action is VoltageTuneAction.REFUSE:
             assert decision.refusal is not None
             self._show_refusal(decision.refusal)
-        elif decision.action is ZvsAction.APPLY_WAVEGEN_FIRST:
+        elif decision.action is VoltageTuneAction.APPLY_WAVEGEN_FIRST:
             assert decision.prompt is not None
             if messagebox.askyesno(*decision.prompt, parent=self):
-                self._apply_wavegen(after_success=self._launch_zvs)
+                self._apply_wavegen(after_success=self._launch_voltage_tune)
         else:
-            self._launch_zvs()
+            self._launch_voltage_tune()
 
-    def _request_zvs_stop(self) -> bool:
-        return self.rig.request_zvs_stop()
+    def _request_voltage_tune_stop(self) -> bool:
+        return self.rig.request_voltage_tune_stop()
 
-    def _launch_zvs(self) -> None:
-        self.rig.launch_zvs(
+    def _launch_voltage_tune(self) -> None:
+        self.rig.launch_voltage_tune(
             target_peak_v=float(self.voltage_var.get()),
             config=self.config_var.get(),
         )
@@ -1655,7 +1655,7 @@ class MainWindow(tk.Tk):
             return build_experiment_params(
                 point,
                 self.run_controls.duration_entry.get(),
-                find_zvs=bool(self.find_zvs_var.get()),
+                tune_voltage=bool(self.tune_voltage_var.get()),
                 tune_frequency=bool(self.tune_frequency_var.get()),
             )
         except InputRejected as rejected:
@@ -1713,8 +1713,8 @@ class MainWindow(tk.Tk):
         self.engine.toggle_pause()
 
     def _cancel_experiment(self) -> None:
-        if cancel_target(self.operations.active_kind) is CancelTarget.ZVS_SEARCH:
-            self._request_zvs_stop()
+        if cancel_target(self.operations.active_kind) is CancelTarget.VOLTAGE_TUNE:
+            self._request_voltage_tune_stop()
             return
         self.operations.cancel_active()
         # Re-read after cancelling: what to stop is decided from the kind that
@@ -1882,7 +1882,7 @@ class MainWindow(tk.Tk):
         token = self._begin_operation("sequence")
         if token is None:
             return
-        if self.sequence.start(plan, params.duration_minutes, params.find_zvs):
+        if self.sequence.start(plan, params.duration_minutes, params.tune_voltage):
             self.sequence_button.config(
                 text=(
                     "Stop Simulated Sequence"
@@ -1961,7 +1961,7 @@ class MainWindow(tk.Tk):
         self._refresh_control_states()
 
     def _start_planned_sequence(
-        self, plan_summary: Any, duration_minutes: float, find_zvs: bool
+        self, plan_summary: Any, duration_minutes: float, tune_voltage: bool
     ) -> None:
         if not self._ensure_hardware_online(
             HARDWARE_OPERATION_LABELS["sequence"]
@@ -2004,7 +2004,7 @@ class MainWindow(tk.Tk):
         token = self._begin_operation("sequence")
         if token is None:
             return
-        if self.sequence.start(plan, duration_minutes, find_zvs):
+        if self.sequence.start(plan, duration_minutes, tune_voltage):
             self.sequence_button.config(
                 text=(
                     "Stop Simulated Sequence"

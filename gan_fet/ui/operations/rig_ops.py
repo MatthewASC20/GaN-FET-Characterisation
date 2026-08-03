@@ -1,6 +1,6 @@
 """Preconditions for the operator's rig controls.
 
-Deciding whether the ZVS search may start is a safety question, not a widget
+Deciding whether the DC voltage tune may start is a safety question, not a widget
 question, and the order of the checks is the substance of it: a latched trip is
 refused before anything can energise, and a search already running is stopped
 rather than started again. That chain lived inside the window interleaved with
@@ -53,8 +53,8 @@ def raise_if_aborted(
         raise trip_error(*reason)
 
 
-class ZvsAction(Enum):
-    """Whether a ZVS search may start, and what to do if not.
+class VoltageTuneAction(Enum):
+    """Whether a DC voltage tune may start, and what to do if not.
 
     Stopping a *running* search is deliberately not one of these. That check
     happens in the window before any of this is consulted, because it must not
@@ -75,8 +75,8 @@ class ZvsAction(Enum):
 
 
 @dataclass(frozen=True)
-class ZvsDecision:
-    action: ZvsAction
+class VoltageTuneDecision:
+    action: VoltageTuneAction
     refusal: Optional[Refusal] = None
     prompt: Optional[tuple[str, str]] = None
 
@@ -89,30 +89,30 @@ _APPLY_FIRST_PROMPT = (
 )
 
 
-def zvs_precondition(
+def voltage_tune_precondition(
     *,
     hardware_offline: bool,
     safety_tripped: bool,
     target_peak_v: Optional[float],
     max_vds_peak_v: float,
     wavegen_pending: bool,
-) -> ZvsDecision:
+) -> VoltageTuneDecision:
     """Decide what "Tune DC Voltage Now" does, in the order the checks must happen.
 
     ``target_peak_v`` is ``None`` when the field could not be read at all,
     which is treated exactly like an out-of-range value: an unreadable target
     is not a target.
 
-    Assumes no DC voltage tune is already running — see :class:`ZvsAction`.
+    Assumes no DC voltage tune is already running — see :class:`VoltageTuneAction`.
     """
     if hardware_offline:
-        return ZvsDecision(ZvsAction.HARDWARE_OFFLINE)
+        return VoltageTuneDecision(VoltageTuneAction.HARDWARE_OFFLINE)
 
     # Before the target is even looked at: a latched trip means the rig has
     # already been judged unsafe, and no value in that field makes it safe.
     if safety_tripped:
-        return ZvsDecision(
-            ZvsAction.REFUSE,
+        return VoltageTuneDecision(
+            VoltageTuneAction.REFUSE,
             Refusal(
                 "Tune DC Voltage",
                 "Reset the latched safety interlock before energizing the rig.",
@@ -124,8 +124,8 @@ def zvs_precondition(
         or target_peak_v <= 0
         or target_peak_v > max_vds_peak_v
     ):
-        return ZvsDecision(
-            ZvsAction.REFUSE,
+        return VoltageTuneDecision(
+            VoltageTuneAction.REFUSE,
             Refusal(
                 "Tune DC Voltage",
                 "The selected Vds target must be positive and no greater than "
@@ -135,11 +135,11 @@ def zvs_precondition(
         )
 
     if wavegen_pending:
-        return ZvsDecision(
-            ZvsAction.APPLY_WAVEGEN_FIRST, prompt=_APPLY_FIRST_PROMPT
+        return VoltageTuneDecision(
+            VoltageTuneAction.APPLY_WAVEGEN_FIRST, prompt=_APPLY_FIRST_PROMPT
         )
 
-    return ZvsDecision(ZvsAction.LAUNCH)
+    return VoltageTuneDecision(VoltageTuneAction.LAUNCH)
 
 
 class AutotuneAction(Enum):

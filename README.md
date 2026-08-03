@@ -206,7 +206,7 @@ gan_fet/
   transport/        TCP / serial / VISA plus Prologix wire framing
   scpi/             serialized SCPI conversations + command events
   instruments/      rig composition + SDG6022X / HDO4054 / SDM3055 / Keithley
-  core/             experiment engine, peak control, ZVS, autotune,
+  core/             experiment engine, peak control, voltage tune, autotune,
                     auto-sequence, safety — no UI dependencies
   storage/          SQLite schema/queries, lease, migration, exports, reports
   sheets/           optional Drive provisioning + background Sheets mirror

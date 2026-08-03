@@ -120,7 +120,7 @@ def build_experiment_params(
     point: MatrixPoint,
     duration_text: str,
     *,
-    find_zvs: bool,
+    tune_voltage: bool,
     tune_frequency: bool,
 ) -> ExperimentParams:
     """Attach a validated duration and the search flags to a matrix point."""
@@ -134,7 +134,7 @@ def build_experiment_params(
     return ExperimentParams(
         point=point,
         duration_minutes=duration,
-        find_zvs=find_zvs,
+        tune_voltage=tune_voltage,
         tune_frequency=tune_frequency,
     )
 

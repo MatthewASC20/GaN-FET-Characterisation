@@ -36,7 +36,7 @@ class MatrixPoint:
 class ExperimentParams:
     point: MatrixPoint
     duration_minutes: float
-    find_zvs: bool = False
+    tune_voltage: bool = False
     #: Tune the gate frequency for minimum input power *at the operating
     #: point* — after the bus has reached the target Vds peak, and holding
     #: that peak at every frequency tried. Tuning at any other amplitude
@@ -68,7 +68,7 @@ class RunRecord:
     status: str
     attempt_no: int = 1
     bus_voltage_v: Optional[float] = None
-    v_zvs: Optional[float] = None
+    tuned_voltage_v: Optional[float] = None
     readings: FinalReadings = field(default_factory=FinalReadings)
     screenshot_path: Optional[str] = None
     #: Gate frequency chosen by the frequency search, and the input power it

@@ -1,10 +1,10 @@
-"""ZVS voltage tuning.
+"""DC bus voltage tuning.
 
 In this resonant rig the DC input current dips at the zero-voltage-switching
 operating point (switching loss is minimal there, and the GaN output
 capacitance is bus-voltage dependent, so the ZVS condition moves with
 voltage). The tuner hill-descends the SMU bus voltage inside a bounded
-window to find the current minimum.
+window to find the current minimum — the ZVS point.
 """
 
 from __future__ import annotations
@@ -16,27 +16,27 @@ from typing import Callable, Optional
 from gan_fet.core.control_loop import finite_float, is_cancelled, settle
 from gan_fet.core.safety import SafetyMonitor
 from gan_fet.instruments.base import OscilloscopeInterface, SmuInterface
-from gan_fet.settings import ZvsSettings
+from gan_fet.settings import VoltageTuneSettings
 
 log = logging.getLogger(__name__)
 
 
 @dataclass
-class ZvsResult:
-    v_zvs: float
+class VoltageTuneResult:
+    tuned_voltage_v: float
     i_min: float
     steps: int
 
 
-class ZvsMeasurementError(RuntimeError):
-    """Required ZVS measurements were unavailable or invalid."""
+class VoltageTuneMeasurementError(RuntimeError):
+    """Required voltage-tune measurements were unavailable or invalid."""
 
 
-class ZvsTuner:
+class VoltageTuner:
     def __init__(
         self,
         smu: SmuInterface,
-        settings: ZvsSettings,
+        settings: VoltageTuneSettings,
         safety: SafetyMonitor,
         scope: Optional[OscilloscopeInterface] = None,
     ):
@@ -68,29 +68,29 @@ class ZvsTuner:
             try:
                 value = self.smu.measure_dc_current()
             except Exception as exc:
-                log.warning("SMU current query failed during ZVS search: %s", exc)
+                log.warning("SMU current query failed during the DC voltage tune: %s", exc)
                 value = None
             try:
                 vds_pk = (
                     self.scope.peak_voltage() if self.scope is not None else None
                 )
             except Exception as exc:
-                log.warning("Scope peak query failed during ZVS search: %s", exc)
+                log.warning("Scope peak query failed during the DC voltage tune: %s", exc)
                 vds_pk = None
 
             numeric_peak = finite_float(vds_pk)
             if self.scope is not None:
                 if numeric_peak is None:
-                    self.safety.record_read_failure("scope peak voltage (ZVS)")
+                    self.safety.record_read_failure("scope peak voltage (voltage tune)")
                 else:
-                    self.safety.record_read_success("scope peak voltage (ZVS)")
+                    self.safety.record_read_success("scope peak voltage (voltage tune)")
                     self.safety.check_sample(vds_peak=numeric_peak)
 
             current = finite_float(value)
             if current is None:
-                self.safety.record_read_failure("SMU current (ZVS)")
+                self.safety.record_read_failure("SMU current (voltage tune)")
             else:
-                self.safety.record_read_success("SMU current (ZVS)")
+                self.safety.record_read_success("SMU current (voltage tune)")
                 self.safety.check_sample(dc_current=current)
                 readings.append(current)
             self.safety.check_compliance()
@@ -117,7 +117,7 @@ class ZvsTuner:
         if current is None and not (
             cancel_check is not None and cancel_check()
         ):
-            raise ZvsMeasurementError(
+            raise VoltageTuneMeasurementError(
                 f"Could not measure input current at {volts:.2f} V"
             )
         return current
@@ -127,10 +127,11 @@ class ZvsTuner:
         *,
         cancel_check: Optional[Callable[[], bool]] = None,
         status: Optional[Callable[[str], None]] = None,
-    ) -> Optional[ZvsResult]:
+    ) -> Optional[VoltageTuneResult]:
         """Hill-descend I(V) from the present setpoint. Ends at the found
-        minimum (the SMU is left at v_zvs). Returns ``None`` only when
-        cancelled and raises :class:`ZvsMeasurementError` on bad telemetry."""
+        minimum (the SMU is left at the tuned voltage). Returns ``None`` only
+        when cancelled; raises :class:`VoltageTuneMeasurementError` on bad
+        telemetry."""
         cfg = self.settings
         v0 = self.smu.setpoint_v
         lo = max(0.0, v0 - cfg.window_v)
@@ -167,8 +168,12 @@ class ZvsTuner:
             if not self._wait(cfg.settle_s, cancel_check):
                 return None
             self.safety.check_compliance()
-            log.info("ZVS: already at minimum (%.2f V, %.4f A)", best_v, best_i)
-            return ZvsResult(best_v, best_i, steps)
+            log.info(
+                "Voltage tune: already at minimum (%.2f V, %.4f A)",
+                best_v,
+                best_i,
+            )
+            return VoltageTuneResult(best_v, best_i, steps)
 
         # Walk downhill until the current stops improving or a bound is hit.
         while steps < cfg.max_steps and not cancelled():
@@ -197,5 +202,10 @@ class ZvsTuner:
         if not self._wait(cfg.settle_s, cancel_check):
             return None
         self.safety.check_compliance()
-        log.info("ZVS minimum: %.2f V @ %.4f A (%d steps)", best_v, best_i, steps)
-        return ZvsResult(v_zvs=best_v, i_min=best_i, steps=steps)
+        log.info(
+            "Voltage tune minimum: %.2f V @ %.4f A (%d steps)",
+            best_v,
+            best_i,
+            steps,
+        )
+        return VoltageTuneResult(tuned_voltage_v=best_v, i_min=best_i, steps=steps)

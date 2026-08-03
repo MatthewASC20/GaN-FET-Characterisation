@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from gan_fet.core.autotune import WavegenController
-from gan_fet.core.zvs import ZvsTuner
+from gan_fet.core.voltage_tune import VoltageTuner
 from gan_fet.instruments.mock_scpi import SimulatedRigPlant
-from gan_fet.settings import WavegenSettings, ZvsSettings
+from gan_fet.settings import WavegenSettings, VoltageTuneSettings
 
 
 class _DutyWavegen:
@@ -65,12 +65,12 @@ class _NoTripSafety:
 
 def test_default_simulation_curve_is_tunable_with_default_zvs_threshold() -> None:
     plant = SimulatedRigPlant(zvs_voltage_v=95.0)
-    settings = ZvsSettings(samples_per_point=1, settle_s=0.0)
-    tuner = ZvsTuner(_PlantSmu(plant, 67.0), settings, _NoTripSafety())
+    settings = VoltageTuneSettings(samples_per_point=1, settle_s=0.0)
+    tuner = VoltageTuner(_PlantSmu(plant, 67.0), settings, _NoTripSafety())
     tuner._wait = lambda _seconds, _cancel: True
 
     result = tuner.find_minimum()
 
     assert result is not None
-    assert result.v_zvs >= 93.0
-    assert result.v_zvs > 67.0
+    assert result.tuned_voltage_v >= 93.0
+    assert result.tuned_voltage_v > 67.0

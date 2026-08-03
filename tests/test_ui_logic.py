@@ -73,13 +73,13 @@ class _FakeSmuPanel:
     """Stands in for SmuPanel, which cannot be built without a Tk root."""
 
     def __init__(self) -> None:
-        self.zvs_button = _FakeWidget()
+        self.voltage_tune_button = _FakeWidget()
         self.bus_off_button = _FakeWidget()
         self.reset_safety_button = _FakeWidget()
         self.estop_button = _FakeWidget()
 
-    def set_zvs_stopping(self) -> None:
-        self.zvs_button.config(text="Stopping...", state="disabled")
+    def set_voltage_tune_stopping(self) -> None:
+        self.voltage_tune_button.config(text="Stopping...", state="disabled")
 
     def apply_control_state(self, controls) -> None:
         SmuPanel.apply_control_state(self, controls)
@@ -163,7 +163,7 @@ def test_simulation_validation_launches_normal_engine_with_short_duration(
     window._safety_is_tripped = lambda: False
     window.operations = SimpleNamespace(busy=False)
     window._validated_current_point = lambda: matrix_point
-    window.find_zvs_var = _FakeVar(True)
+    window.tune_voltage_var = _FakeVar(True)
     window.tune_frequency_var = _FakeVar(True)
     window.wavegen_controller = SimpleNamespace(
         has_pending_changes=lambda *_args: False
@@ -178,7 +178,7 @@ def test_simulation_validation_launches_normal_engine_with_short_duration(
     assert len(launched) == 1
     assert launched[0].point == matrix_point
     assert launched[0].duration_minutes == SIMULATION_VALIDATION_DURATION_MINUTES
-    assert launched[0].find_zvs
+    assert launched[0].tune_voltage
     # The validation is the production path, so it must carry the frequency
     # search too rather than quietly running at nominal.
     assert launched[0].tune_frequency
@@ -265,7 +265,7 @@ def test_frequency_actions_inherit_every_hardware_restriction() -> None:
     for overrides in (
         {"safety_tripped": True},
         {"hardware_offline": True},
-        {"active_kind": "zvs"},
+        {"active_kind": "voltage_tune"},
         {"closing": True},
     ):
         kwargs = dict(
@@ -304,13 +304,13 @@ def test_control_policy_preserves_safety_and_cancellation_paths() -> None:
     assert not sequence.configuration
 
     zvs = resolve_rig_control_state(
-        active_kind="zvs",
+        active_kind="voltage_tune",
         closing=False,
         safety_tripped=False,
         hardware_offline=False,
         engine_running=False,
     )
-    assert zvs.stop_zvs
+    assert zvs.stop_voltage_tune
     assert zvs.cancel_operation
     assert not zvs.hardware_actions
 
@@ -698,7 +698,7 @@ def _controls(**overrides):
         "configuration": True,
         "reset_safety": True,
         "stop_sequence": False,
-        "stop_zvs": False,
+        "stop_voltage_tune": False,
         "pause_experiment": True,
         "cancel_operation": True,
     }
@@ -716,7 +716,7 @@ def test_emergency_stop_is_never_disabled_by_any_control_state() -> None:
         _controls(),
         _controls(hardware_actions=False, shutdown_actions=False),
         _controls(edit_inputs=False, reset_safety=False, configuration=False),
-        _controls(stop_zvs=True),
+        _controls(stop_voltage_tune=True),
     ):
         panel.apply_control_state(controls)
     assert panel.estop_button.options == {}, (
@@ -726,8 +726,8 @@ def test_emergency_stop_is_never_disabled_by_any_control_state() -> None:
 
 def test_the_zvs_button_becomes_a_stop_button_while_a_search_runs() -> None:
     panel = _FakeSmuPanel()
-    panel.apply_control_state(_controls(stop_zvs=True, hardware_actions=False))
-    assert panel.zvs_button.options == {
+    panel.apply_control_state(_controls(stop_voltage_tune=True, hardware_actions=False))
+    assert panel.voltage_tune_button.options == {
         "state": "normal",
         "text": "Stop Voltage Tune",
     }
@@ -737,8 +737,8 @@ def test_a_stoppable_search_stays_enabled_even_with_no_hardware_actions() -> Non
     """Stopping is not a new hardware action. A search that has become
     unstoppable because the rig went busy is a search that cannot be stopped."""
     panel = _FakeSmuPanel()
-    panel.apply_control_state(_controls(stop_zvs=True, hardware_actions=False))
-    assert panel.zvs_button.options["state"] == "normal"
+    panel.apply_control_state(_controls(stop_voltage_tune=True, hardware_actions=False))
+    assert panel.voltage_tune_button.options["state"] == "normal"
 
 
 def test_bus_off_follows_shutdown_actions_not_hardware_actions() -> None:

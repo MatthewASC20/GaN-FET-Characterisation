@@ -2,7 +2,7 @@
 
 Starting a run and stopping one are both decision chains that were interleaved
 with ``messagebox`` calls inside the window. The order matters in the same way
-it does for the manual ZVS search — a latched trip is refused before anything
+it does for the manual DC voltage tune — a latched trip is refused before anything
 is built or applied — and cancellation has to reach whichever thing is actually
 running, which is not always the experiment engine.
 
@@ -93,15 +93,15 @@ class CancelTarget(Enum):
     working.
     """
 
-    ZVS_SEARCH = auto()
+    VOLTAGE_TUNE = auto()
     SEQUENCE = auto()
     EXPERIMENT = auto()
 
 
 def cancel_target(active_kind: Optional[str]) -> CancelTarget:
     """Which layer a cancel request should reach."""
-    if active_kind == "zvs":
-        return CancelTarget.ZVS_SEARCH
+    if active_kind == "voltage_tune":
+        return CancelTarget.VOLTAGE_TUNE
     if active_kind == "sequence":
         return CancelTarget.SEQUENCE
     return CancelTarget.EXPERIMENT

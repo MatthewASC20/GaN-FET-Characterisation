@@ -54,7 +54,7 @@ def test_a_worker_that_raises_is_still_forgotten():
     def explode() -> None:
         raise RuntimeError("transport died mid-command")
 
-    pool.start(explode, name="zvs").join(2.0)
+    pool.start(explode, name="voltage-tune").join(2.0)
     assert pool.active_names() == []
     assert pool.join_all(timeout=0.1)
 
@@ -107,9 +107,9 @@ def test_a_worker_joining_does_not_wait_for_itself():
 def test_several_workers_are_tracked_together():
     pool = WorkerPool()
     release = threading.Event()
-    for name in ("apply-wavegen", "autotune", "zvs"):
+    for name in ("apply-wavegen", "autotune", "voltage-tune"):
         pool.start(lambda: release.wait(2.0), name=name)
-    assert pool.active_names() == ["apply-wavegen", "autotune", "zvs"]
+    assert pool.active_names() == ["apply-wavegen", "autotune", "voltage-tune"]
     release.set()
     assert pool.join_all(timeout=2.0)
     assert pool.active_names() == []

@@ -38,14 +38,14 @@ class RunControls:
         options_row: int,
         buttons_row: int,
         default_duration: str,
-        find_zvs_var: tk.BooleanVar,
+        tune_voltage_var: tk.BooleanVar,
         # Typed as tkinter types ``command``: the handlers take optional
         # arguments the button never supplies, and return values it ignores.
         on_apply_wavegen: Callable[..., object],
         on_autotune: Callable[..., object],
     ) -> None:
         self._options_row = options_row
-        self._find_zvs_var = find_zvs_var
+        self._tune_voltage_var = tune_voltage_var
 
         ttk.Label(parent, text="Duration (min):").grid(
             row=options_row, column=0, sticky="e", padx=5, pady=5
@@ -59,8 +59,8 @@ class RunControls:
         # The voltage-only DC voltage tune is kept mainly to exercise the
         # frequency search independently, so it stays hidden unless revealed
         # in Config.
-        self.find_zvs_checkbox = ttk.Checkbutton(
-            parent, text="Tune DC Voltage before run", variable=find_zvs_var
+        self.tune_voltage_checkbox = ttk.Checkbutton(
+            parent, text="Tune DC Voltage before run", variable=tune_voltage_var
         )
 
         self.last_current_label = ttk.Label(parent, text=last_current_text(None))
@@ -88,19 +88,19 @@ class RunControls:
             row=buttons_row, column=2, sticky="w", padx=5, pady=5
         )
 
-    def set_zvs_sweep_visible(self, visible: bool) -> None:
+    def set_voltage_tune_visible(self, visible: bool) -> None:
         """Show or hide the voltage-only DC voltage tune control.
 
         Hiding it clears it. A control the operator cannot see must not keep
         silently steering the run.
         """
         if visible:
-            self.find_zvs_checkbox.grid(
+            self.tune_voltage_checkbox.grid(
                 row=self._options_row, column=2, sticky="w", padx=5
             )
         else:
-            self.find_zvs_checkbox.grid_remove()
-            self._find_zvs_var.set(False)
+            self.tune_voltage_checkbox.grid_remove()
+            self._tune_voltage_var.set(False)
 
     def set_duration(self, minutes: str) -> None:
         """Replace the duration field, as the voltage default changes."""
@@ -120,7 +120,7 @@ class RunControls:
         that does nothing.
         """
         set_widget_enabled(self.duration_entry, controls.edit_inputs)
-        set_widget_enabled(self.find_zvs_checkbox, controls.edit_inputs)
+        set_widget_enabled(self.tune_voltage_checkbox, controls.edit_inputs)
         set_widget_enabled(self.confirm_button, controls.hardware_actions)
         if not controls.frequency_actions:
             self.autotune_button.config(state="disabled")

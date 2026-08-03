@@ -23,7 +23,7 @@ from gan_fet.ui.widgets import OperationCoordinator
 LABELS = {
     "apply_wavegen": "apply wavegen settings",
     "bus_off": "control the bus output",
-    "zvs": "tune the DC voltage",
+    "voltage_tune": "tune the DC voltage",
     "reset_safety": "reset the safety interlock",
 }
 
@@ -86,7 +86,7 @@ class _Ui:
     def set_tuning(self, active: bool, *, autotune: bool = False) -> None:
         self.tuning.append((active, autotune))
 
-    def zvs_stopping(self) -> None:
+    def voltage_tune_stopping(self) -> None:
         self.zvs_stops += 1
 
     def flash(self, message: str) -> None:
@@ -248,7 +248,7 @@ def test_an_idle_rig_can_be_claimed():
 def test_a_second_claim_is_refused_and_names_what_holds_the_rig():
     rig, ui = _build()
     rig.begin("bus_off")
-    assert rig.begin("zvs") is None
+    assert rig.begin("voltage_tune") is None
     assert ui.busy_reports == ["bus_off"]
 
 
@@ -284,7 +284,7 @@ def test_finishing_releases_the_rig_and_refreshes_both_presentations():
     rig.finish(token)
     assert rig.operations.active_kind is None
     assert ui.confirms == 1
-    assert rig.begin("zvs") is not None, "the rig should be claimable again"
+    assert rig.begin("voltage_tune") is not None, "the rig should be claimable again"
 
 
 # -- bus off -------------------------------------------------------------------
@@ -680,7 +680,7 @@ def test_a_sequence_that_will_not_stop_is_reported():
     assert _said(ui, "auto-sequence worker did not stop")
 
 
-# -- the manual ZVS search -----------------------------------------------------
+# -- the manual DC voltage tune -----------------------------------------------------
 #
 # The interlock guard sits between every step that arms or energises, because
 # cancellation and trips both arrive *during* the previous step. These tests
@@ -701,15 +701,15 @@ class _Scope:
         return "LECROY,HDO4054,1,1.0"
 
 
-class _ZvsEngine:
-    """Engine as the manual ZVS search uses it."""
+class _VoltageTuneEngine:
+    """Engine as the manual DC voltage tune uses it."""
 
     def __init__(self, *, scope=None, result=None) -> None:
         self.scope = scope or _Scope()
         self.peak_controller = SimpleNamespace(
             achieve_peak=lambda *a, **k: None
         )
-        self.zvs_tuner = SimpleNamespace(find_minimum=lambda **k: result)
+        self.voltage_tuner = SimpleNamespace(find_minimum=lambda **k: result)
 
     def request_emergency_stop(self):
         return _FinishedThread()
@@ -744,17 +744,17 @@ class _ZvsSafety(_Safety):
 def _zvs(safety=None, engine=None, wavegen=None, smu=None):
     safety = safety or _ZvsSafety()
     rig, ui = _build(
-        safety=safety, engine=engine or _ZvsEngine(), wavegen=wavegen, smu=smu
+        safety=safety, engine=engine or _VoltageTuneEngine(), wavegen=wavegen, smu=smu
     )
     rig.smu.output_is_on = False
     rig.wavegen_controller.outputs_armed = True
-    rig.launch_zvs(target_peak_v=300.0, config="Single Device")
+    rig.launch_voltage_tune(target_peak_v=300.0, config="Single Device")
     rig.pool.join_all(3.0)
     return rig, ui, safety
 
 
 def test_a_clean_zvs_search_reports_the_point_it_found():
-    engine = _ZvsEngine(result=SimpleNamespace(v_zvs=95.4, i_min=0.0327))
+    engine = _VoltageTuneEngine(result=SimpleNamespace(tuned_voltage_v=95.4, i_min=0.0327))
     rig, ui, _safety = _zvs(engine=engine)
     assert _said(ui, "DC voltage tuned to 95.4 V (ZVS point, 32.70 mA)")
     assert _said(ui, "outputs are OFF")
@@ -763,7 +763,7 @@ def test_a_clean_zvs_search_reports_the_point_it_found():
 def test_a_wrong_scope_identity_never_energizes_anything():
     """Fail closed: a valid-looking response from another SCPI instrument must
     not be read as safety telemetry."""
-    engine = _ZvsEngine(
+    engine = _VoltageTuneEngine(
         scope=_Scope(identity_error=ConnectionError("Expected LECROY HDO4054"))
     )
     rig, ui, safety = _zvs(engine=engine)
@@ -779,7 +779,7 @@ def test_cancelling_during_identity_verification_arms_nothing():
     def cancel_now() -> None:
         holder["token"].cancel_event.set()
 
-    engine = _ZvsEngine(scope=_Scope(on_verify=cancel_now))
+    engine = _VoltageTuneEngine(scope=_Scope(on_verify=cancel_now))
     safety = _ZvsSafety()
     rig, ui = _build(safety=safety, engine=engine)
     rig.smu.output_is_on = False
@@ -791,7 +791,7 @@ def test_cancelling_during_identity_verification_arms_nothing():
         return holder["token"]
 
     rig.operations.try_begin = capture  # type: ignore[method-assign]
-    rig.launch_zvs(target_peak_v=300.0, config="Single Device")
+    rig.launch_voltage_tune(target_peak_v=300.0, config="Single Device")
     rig.pool.join_all(3.0)
     assert safety.arm_attempts == 0, "armed after the search was cancelled"
 
@@ -799,7 +799,7 @@ def test_cancelling_during_identity_verification_arms_nothing():
 def test_cancelling_while_arming_never_energizes_the_bus():
     holder: dict = {}
     safety = _ZvsSafety(on_arm=lambda: holder["token"].cancel_event.set())
-    rig, ui = _build(safety=safety, engine=_ZvsEngine())
+    rig, ui = _build(safety=safety, engine=_VoltageTuneEngine())
     rig.smu.output_is_on = False
     rig.wavegen_controller.outputs_armed = True
     original = rig.operations.try_begin
@@ -809,7 +809,7 @@ def test_cancelling_while_arming_never_energizes_the_bus():
         return holder["token"]
 
     rig.operations.try_begin = capture  # type: ignore[method-assign]
-    rig.launch_zvs(target_peak_v=300.0, config="Single Device")
+    rig.launch_voltage_tune(target_peak_v=300.0, config="Single Device")
     rig.pool.join_all(3.0)
     assert safety.bus_enable_attempts == 0, (
         "the bus was energised after the search had been cancelled"
@@ -836,16 +836,16 @@ def test_a_gate_that_does_not_confirm_armed_never_energizes_the_bus():
 
 def test_stopping_a_running_search_reports_and_cancels():
     rig, ui = _build()
-    token = rig.begin("zvs")
+    token = rig.begin("voltage_tune")
     assert token is not None
-    assert rig.request_zvs_stop() is True
+    assert rig.request_voltage_tune_stop() is True
     assert token.cancel_event.is_set()
     assert _said(ui, "Stopping the DC voltage tune safely...")
 
 
 def test_stopping_when_nothing_is_running_does_nothing():
     rig, ui = _build()
-    assert rig.request_zvs_stop() is False
+    assert rig.request_voltage_tune_stop() is False
     assert ui.status == []
 
 
@@ -855,5 +855,5 @@ def test_stopping_does_not_touch_another_operation():
     rig, ui = _build()
     token = rig.begin("bus_off")
     assert token is not None
-    assert rig.request_zvs_stop() is False
+    assert rig.request_voltage_tune_stop() is False
     assert not token.cancel_event.is_set()

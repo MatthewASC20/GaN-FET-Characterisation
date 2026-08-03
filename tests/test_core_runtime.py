@@ -339,7 +339,7 @@ def test_zvs_result_completes_and_reports_actual_frequency(
             ExperimentParams(
                 point=_point("ZVS-RUNTIME"),
                 duration_minutes=0.0006,
-                find_zvs=True,
+                tune_voltage=True,
             )
         )
         outcome = engine.wait_until_idle(timeout=5.0)
@@ -350,7 +350,7 @@ def test_zvs_result_completes_and_reports_actual_frequency(
     assert outcome.success
     assert outcome.status == "completed"
     assert outcome.record is not None
-    assert outcome.record.v_zvs == pytest.approx(95.0)
+    assert outcome.record.tuned_voltage_v == pytest.approx(95.0)
     assert outcome.record.bus_voltage_v == pytest.approx(95.0)
     # The final 285 V peak is intentionally no longer rejected against the
     # 300 V pre-ZVS search seed.

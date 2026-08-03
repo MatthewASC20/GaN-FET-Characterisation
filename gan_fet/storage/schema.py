@@ -255,7 +255,7 @@ def row_to_run(row: sqlite3.Row | tuple) -> RunRecord:
         status=row[10],
         attempt_no=row[20],
         bus_voltage_v=row[11],
-        v_zvs=row[12],
+        tuned_voltage_v=row[12],
         readings=FinalReadings(
             vin=row[13],
             iin=row[14],
