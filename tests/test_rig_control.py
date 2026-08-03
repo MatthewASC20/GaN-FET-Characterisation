@@ -10,11 +10,15 @@ from __future__ import annotations
 
 from typing import Optional
 
-from gan_fet.ui.operations.rig_control import RigOperations
+from gan_fet.ui.operations.rig_control import RigOperations, reset_confirmation
 from gan_fet.ui.operations.worker_pool import WorkerPool
 from gan_fet.ui.widgets import OperationCoordinator
 
-LABELS = {"bus_off": "control the bus output", "zvs": "run a ZVS search"}
+LABELS = {
+    "bus_off": "control the bus output",
+    "zvs": "run a ZVS search",
+    "reset_safety": "reset the safety interlock",
+}
 
 
 class _Ui:
@@ -29,6 +33,10 @@ class _Ui:
         self.refreshes = 0
         self.confirms = 0
         self.smu_updates = 0
+        self.infos: list[tuple[str, str]] = []
+        self.errors: list[tuple[str, str]] = []
+        self.confirmations: list[tuple[str, str, bool]] = []
+        self.answer = True
 
     def set_status(self, message: str) -> None:
         self.status.append(message)
@@ -39,6 +47,16 @@ class _Ui:
 
     def report_busy(self, active_kind: Optional[str]) -> None:
         self.busy_reports.append(active_kind)
+
+    def show_info(self, title: str, message: str) -> None:
+        self.infos.append((title, message))
+
+    def show_error(self, title: str, message: str) -> None:
+        self.errors.append((title, message))
+
+    def confirm(self, title, message, *, dangerous=False) -> bool:
+        self.confirmations.append((title, message, dangerous))
+        return self.answer
 
     def is_closing(self) -> bool:
         return self.closing
@@ -85,11 +103,28 @@ class _Wavegen:
 
 
 class _Safety:
-    def __init__(self, *, shutdown_ok: bool = True, estop_ok: bool = True):
+    def __init__(
+        self,
+        *,
+        shutdown_ok: bool = True,
+        estop_ok: bool = True,
+        is_tripped: bool = False,
+        trip_reason=None,
+        reset_error: Optional[BaseException] = None,
+    ):
         self.shutdown_ok = shutdown_ok
         self.estop_ok = estop_ok
+        self.is_tripped = is_tripped
+        self.trip_reason = trip_reason
+        self.reset_error = reset_error
         self.shutdowns = 0
         self.estops = 0
+        self.resets = 0
+
+    def reset_trip(self) -> None:
+        self.resets += 1
+        if self.reset_error is not None:
+            raise self.reset_error
 
     def shutdown_outputs(self) -> bool:
         self.shutdowns += 1
@@ -242,3 +277,83 @@ def test_bus_off_refuses_when_the_hardware_is_offline():
     rig, ui = _bus_off(ui=_Ui(online=False))
     assert ui.status == []
     assert rig.operations.active_kind is None
+
+
+# -- resetting the safety latch ------------------------------------------------
+#
+# Nothing here makes the rig safe; it only stops the software refusing to
+# energise it. That asymmetry is what the guards are for.
+
+
+def _reset(ui=None, safety=None):
+    safety = safety or _Safety(is_tripped=True)
+    rig, ui = _build(ui=ui, safety=safety)
+    rig.reset_safety()
+    rig.pool.join_all(2.0)
+    return rig, ui, safety
+
+
+def test_resetting_a_latched_trip_clears_it():
+    rig, ui, safety = _reset()
+    assert safety.resets == 1
+    assert _said(ui, "Safety latch reset. Rig remains disarmed.")
+
+
+def test_resetting_when_nothing_is_latched_is_reported_not_attempted():
+    """An operator who believes they just cleared a trip, and did not, will
+    read the next refusal as the software misbehaving."""
+    rig, ui, safety = _reset(safety=_Safety(is_tripped=False))
+    assert safety.resets == 0
+    assert ui.infos == [("Reset Safety", "No safety trip is currently latched.")]
+    assert rig.operations.active_kind is None
+
+
+def test_the_confirmation_quotes_the_latched_reason():
+    """Clearing an interlock without being reminded what set it is how the
+    same fault gets reset twice instead of fixed."""
+    safety = _Safety(
+        is_tripped=True,
+        trip_reason=("overcurrent", "DC input current exceeded limit"),
+    )
+    rig, ui, _safety = _reset(safety=safety)
+    _title, message, dangerous = ui.confirmations[0]
+    assert "overcurrent" in message
+    assert "DC input current exceeded limit" in message
+    assert dangerous, "clearing an interlock is not a routine confirmation"
+
+
+def test_the_confirmation_still_asks_when_the_reason_is_unknown():
+    rig, ui, safety = _reset(safety=_Safety(is_tripped=True, trip_reason=None))
+    assert ui.confirmations, "an unknown reason must not skip the confirmation"
+    assert safety.resets == 1
+
+
+def test_declining_the_confirmation_resets_nothing_and_claims_nothing():
+    ui = _Ui()
+    ui.answer = False
+    rig, ui, safety = _reset(ui=ui)
+    assert safety.resets == 0
+    assert rig.operations.active_kind is None
+
+
+def test_a_failed_reset_says_the_latch_is_still_active():
+    """SafetyMonitor refuses a reset that races a fresh trip. The operator was
+    expecting the opposite and has to be told."""
+    safety = _Safety(is_tripped=True, reset_error=RuntimeError("trip landed mid-reset"))
+    rig, ui, _safety = _reset(safety=safety)
+    assert ui.errors and "trip landed mid-reset" in ui.errors[0][1]
+    assert _said(ui, "Safety latch remains active.")
+
+
+def test_a_failed_reset_still_releases_the_rig():
+    safety = _Safety(is_tripped=True, reset_error=RuntimeError("nope"))
+    rig, _ui, _safety = _reset(safety=safety)
+    assert rig.operations.active_kind is None
+
+
+def test_the_confirmation_text_is_built_from_the_reason():
+    title, message = reset_confirmation(("overcurrent", "1.2 A"))
+    assert title == "Reset Safety Interlock"
+    assert "inspected and both outputs are OFF" in message
+    assert "overcurrent — 1.2 A" in message
+    assert "Latched reason" not in reset_confirmation(None)[1]

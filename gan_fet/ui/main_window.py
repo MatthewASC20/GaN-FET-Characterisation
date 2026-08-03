@@ -960,6 +960,19 @@ class MainWindow(tk.Tk):
     def is_closing(self) -> bool:
         return self._closing
 
+    def show_info(self, title: str, message: str) -> None:
+        messagebox.showinfo(title, message, parent=self)
+
+    def show_error(self, title: str, message: str) -> None:
+        messagebox.showerror(title, message, parent=self)
+
+    def confirm(self, title: str, message: str, *, dangerous: bool = False) -> bool:
+        if dangerous:
+            return bool(
+                messagebox.askyesno(title, message, icon="warning", parent=self)
+            )
+        return bool(messagebox.askyesno(title, message, parent=self))
+
     def refresh_controls(self) -> None:
         self._refresh_control_states()
 
@@ -1080,50 +1093,7 @@ class MainWindow(tk.Tk):
             self.autotune_button.config(state="disabled")
 
     def _reset_safety(self) -> None:
-        if not self._ensure_hardware_online(
-            HARDWARE_OPERATION_LABELS["reset_safety"]
-        ):
-            return
-        if not self._safety_is_tripped():
-            messagebox.showinfo(
-                "Reset Safety", "No safety trip is currently latched.", parent=self
-            )
-            return
-        reason = getattr(self.safety, "trip_reason", None)
-        detail = f"\n\nLatched reason: {reason[0]} — {reason[1]}" if reason else ""
-        if not messagebox.askyesno(
-            "Reset Safety Interlock",
-            "Confirm that the rig has been inspected and both outputs are OFF."
-            f"{detail}\n\nReset the safety latch?",
-            icon="warning",
-            parent=self,
-        ):
-            return
-        token = self._begin_operation("reset_safety")
-        if token is None:
-            return
-
-        self._run_operation(
-            self.safety.reset_trip,
-            partial(self._on_reset_safety_done, token),
-            name="reset-safety",
-        )
-
-    def _on_reset_safety_done(
-        self, token: OperationToken, error: Optional[BaseException]
-    ) -> None:
-        self._finish_operation(token)
-        if error is not None:
-            messagebox.showerror(
-                "Reset Safety",
-                f"Safety reset failed: {error}",
-                parent=self,
-            )
-            self.status_bar.set_message("Safety latch remains active.")
-        else:
-            self.status_bar.set_message("Safety latch reset. Rig remains disarmed.")
-        self._update_smu_panel()
-        self._refresh_control_states()
+        self.rig.reset_safety()
 
     # ------------------------------------------------------------------
     # parameter/device management

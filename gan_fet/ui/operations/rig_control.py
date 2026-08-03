@@ -23,6 +23,25 @@ from gan_fet.ui.widgets import OperationCoordinator, OperationToken
 log = logging.getLogger(__name__)
 
 
+def reset_confirmation(trip_reason) -> tuple[str, str]:
+    """The prompt shown before clearing the safety latch.
+
+    The latched reason is quoted back. Clearing an interlock without being
+    reminded what set it is how an operator resets the same fault twice
+    instead of fixing it, and the reason is the only record of that on screen.
+    """
+    detail = (
+        f"\n\nLatched reason: {trip_reason[0]} — {trip_reason[1]}"
+        if trip_reason
+        else ""
+    )
+    return (
+        "Reset Safety Interlock",
+        "Confirm that the rig has been inspected and both outputs are OFF."
+        f"{detail}\n\nReset the safety latch?",
+    )
+
+
 class RigUi(Protocol):
     """What a rig operation needs from the window it runs in."""
 
@@ -38,6 +57,15 @@ class RigUi(Protocol):
 
     def report_busy(self, active_kind: Optional[str]) -> None:
         """Tell the operator which operation currently holds the rig."""
+
+    def show_info(self, title: str, message: str) -> None:
+        """Report something that is not a problem."""
+
+    def show_error(self, title: str, message: str) -> None:
+        """Report an operation that failed."""
+
+    def confirm(self, title: str, message: str, *, dangerous: bool = False) -> bool:
+        """Ask a yes/no question. ``dangerous`` marks it as a warning."""
 
     def is_closing(self) -> bool:
         """Whether the application is shutting down."""
@@ -168,3 +196,50 @@ class RigOperations:
             if error is None
             else f"Bus Off required the emergency shutdown path: {error}"
         )
+
+    # -- reset the safety latch ----------------------------------------------
+
+    def reset_safety(self) -> None:
+        """Clear the safety latch, after confirming the rig has been inspected.
+
+        Nothing here makes the rig safe; it only stops the software refusing to
+        energise it. That is why the operator is asked to confirm rather than
+        told, and why the latched reason is quoted back to them.
+        """
+        if not self.ui.hardware_online(self._hardware_labels["reset_safety"]):
+            return
+        if not getattr(self.safety, "is_tripped", False):
+            # Not an error. Resetting nothing is harmless, but reporting it
+            # matters: an operator who believes they just cleared a trip, and
+            # did not, will read the next refusal as the software misbehaving.
+            self.ui.show_info(
+                "Reset Safety", "No safety trip is currently latched."
+            )
+            return
+        title, message = reset_confirmation(
+            getattr(self.safety, "trip_reason", None)
+        )
+        if not self.ui.confirm(title, message, dangerous=True):
+            return
+        token = self.begin("reset_safety")
+        if token is None:
+            return
+        self.run(
+            self.safety.reset_trip,
+            lambda error: self.on_reset_safety_done(token, error),
+            name="reset-safety",
+        )
+
+    def on_reset_safety_done(
+        self, token: OperationToken, error: Optional[BaseException]
+    ) -> None:
+        self.finish(token)
+        if error is not None:
+            # The reset is allowed to fail — SafetyMonitor refuses one that
+            # races a fresh trip — and the operator has to be told, because
+            # the rig is still latched and they were expecting otherwise.
+            self.ui.show_error("Reset Safety", f"Safety reset failed: {error}")
+            self.ui.set_status("Safety latch remains active.")
+        else:
+            self.ui.set_status("Safety latch reset. Rig remains disarmed.")
+        self.ui.smu_state_changed()
