@@ -113,6 +113,11 @@ test you cannot run, to match a refactor you cannot run, is not a check; it is
 two unverified changes agreeing with each other. Moving that seam is the first
 item of Phase 3, to be done where `pytest -q` can include `test_ui_logic.py`.
 
+**Both conditions are now met (2026-08-02).** `tests/tkstub/` lets the 32
+UI-logic tests run without `python3-tk`, and a `gan-fet --simulate` pass has
+confirmed the window opens and runs a point through everything landed in
+Phases 1-3. The seam is unblocked.
+
 **About 160 lines out, not 700.** The estimate counted the parameter groups
 and option editors, which already live in `ParamButtonGroup` and
 `ParameterListEditor` — `_build_parameter_groups` is a ten-line loop over
