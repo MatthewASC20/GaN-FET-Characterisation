@@ -49,7 +49,6 @@ from gan_fet.ui.operations.rig_ops import (
     AutotuneAction,
     ZvsAction,
     autotune_precondition,
-    raise_if_aborted,
     zvs_precondition,
 )
 from gan_fet.ui.operations.worker_pool import WorkerPool
@@ -77,7 +76,7 @@ from gan_fet.core.models import (
     MatrixPoint,
     sanitize_device_name,
 )
-from gan_fet.core.safety import SafetyMonitor, SafetyTrip
+from gan_fet.core.safety import SafetyMonitor
 from gan_fet.core.sequence import AutoSequence, SequenceCallbacks, build_plan
 from gan_fet.instruments.base import SmuInterface
 from gan_fet.settings import SIMULATION_DEFAULT_DEVICE_NAME, Settings
@@ -1011,12 +1010,16 @@ class MainWindow(tk.Tk):
     def set_status_async(self, message: str) -> None:
         self._status_async(message)
 
-    def set_tuning(self, active: bool) -> None:
+    def set_tuning(self, active: bool, *, autotune: bool = False) -> None:
         self._tuner_busy = active
-        if active:
+        if active and autotune:
             self.autotune_button.set_style(
                 bg="#1976D2", fg="white", text="Autotuning...", state="disabled"
             )
+
+    def zvs_stopping(self) -> None:
+        if hasattr(self, "smu_panel"):
+            self.smu_panel.set_zvs_stopping()
 
     def flash(self, message: str) -> None:
         show_temporary_popup(self, message, duration_ms=2000)
@@ -1549,135 +1552,14 @@ class MainWindow(tk.Tk):
             self._launch_zvs()
 
     def _request_zvs_stop(self) -> bool:
-        """Request cooperative cancellation of the active manual ZVS search."""
-
-        if self.operations.active_kind != "zvs":
-            return False
-        self.operations.cancel_active()
-        if hasattr(self, "smu_panel"):
-            self.smu_panel.set_zvs_stopping()
-        if hasattr(self, "status_bar"):
-            self.status_bar.set_message("Stopping ZVS search safely...")
-        return True
+        return self.rig.request_zvs_stop()
 
     def _launch_zvs(self) -> None:
-        token = self._begin_operation("zvs")
-        if token is None:
-            return
-        target_v = int(self.voltage_var.get())
-        config = self.config_var.get()
-        self._tuner_busy = True
-        self.status_bar.set_message("Preparing the HDO4054-verified ZVS search...")
-
-        # Re-checked before every step that arms or energises: both conditions
-        # can arrive during the previous step.
-        abort_check = partial(
-            raise_if_aborted,
-            cancelled=token.cancel_event.is_set,
-            safety=self.safety,
-            trip_error=SafetyTrip,
-            what="ZVS search",
+        self.rig.launch_zvs(
+            target_peak_v=float(self.voltage_var.get()),
+            config=self.config_var.get(),
         )
 
-        def worker() -> None:
-            error = result = None
-            try:
-                abort_check()
-
-                self._status_async("Verifying LeCroy HDO4054 identity...")
-                identity = self.engine.scope.verify_identity()
-                log.info(
-                    "Verified oscilloscope identity for manual ZVS: %s",
-                    identity,
-                )
-
-                abort_check()
-
-                armed = self.safety.arm_wavegen(config)
-                if not armed or not self.wavegen_controller.outputs_armed:
-                    raise RuntimeError("Wavegen outputs did not confirm armed")
-
-                abort_check()
-
-                if not self.safety.enable_bus():
-                    raise ConnectionError("Could not enable the SMU output")
-                self.engine.peak_controller.achieve_peak(
-                    float(target_v),
-                    cancel_check=token.cancel_event.is_set,
-                    status=self._status_async,
-                )
-                result = self.engine.zvs_tuner.find_minimum(
-                    cancel_check=token.cancel_event.is_set,
-                    status=self._status_async,
-                )
-                if token.cancel_event.is_set():
-                    raise InterruptedError("ZVS search cancelled")
-            except BaseException as exc:
-                error = exc
-            finally:
-                if error is None:
-                    try:
-                        self.smu.ramp_to(0.0)
-                        if not self.smu.output_off():
-                            raise RuntimeError(
-                                "SMU output-off was not acknowledged"
-                            )
-                        self.wavegen_controller.disarm_outputs()
-                        if (
-                            self.smu.output_is_on
-                            or self.wavegen_controller.outputs_armed
-                        ):
-                            raise RuntimeError(
-                                "Output readback did not confirm the rig is safe"
-                            )
-                    except BaseException as cleanup_exc:
-                        error = RuntimeError(
-                            f"ZVS cleanup was not confirmed: {cleanup_exc}"
-                        )
-                        try:
-                            # A failed output-off confirmation is a safety
-                            # event, even if the emergency retry succeeds.
-                            if not self.safety.emergency_stop():
-                                error = RuntimeError(
-                                    f"{error}; emergency output-off was unconfirmed"
-                                )
-                        except Exception:
-                            log.exception(
-                                "Emergency fallback failed after ZVS cleanup"
-                            )
-                else:
-                    try:
-                        confirmed = self.safety.shutdown_outputs()
-                        if not confirmed:
-                            if not self.safety.emergency_stop():
-                                error = RuntimeError(
-                                    f"{error}; emergency output-off was unconfirmed"
-                                )
-                    except Exception:
-                        log.exception(
-                            "Failed to make outputs safe after ZVS search error"
-                        )
-            self.ui_dispatcher.post(self._on_zvs_done, token, result, error)
-
-        self._start_worker(worker, name="zvs")
-
-    def _on_zvs_done(self, token, result, error) -> None:
-        self._tuner_busy = False
-        self._finish_operation(token)
-        self._update_smu_panel()
-        if error is not None:
-            if not isinstance(error, InterruptedError):
-                messagebox.showerror("Find ZVS", f"ZVS search failed: {error}")
-                self.status_bar.set_message("ZVS search failed.")
-            else:
-                self.status_bar.set_message("ZVS search cancelled; outputs are OFF.")
-        elif result is None:
-            self.status_bar.set_message("ZVS search found no improvement.")
-        else:
-            self.status_bar.set_message(
-                f"ZVS point: {result.v_zvs:.1f} V ({result.i_min * 1000:.2f} mA). "
-                "Search complete; bus and gate outputs are OFF."
-            )
 
     def _bus_off(self) -> None:
         self.rig.bus_off()

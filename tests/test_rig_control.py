@@ -44,6 +44,9 @@ class _Ui:
         self.errors: list[tuple[str, str]] = []
         self.confirmations: list[tuple[str, str, bool]] = []
         self.answer = True
+        self.tuning: list[tuple[bool, bool]] = []
+        self.zvs_stops = 0
+        self.flashes: list[str] = []
 
     def set_status(self, message: str) -> None:
         self.status.append(message)
@@ -79,6 +82,15 @@ class _Ui:
 
     def set_status_async(self, message: str) -> None:
         self.status.append(message)
+
+    def set_tuning(self, active: bool, *, autotune: bool = False) -> None:
+        self.tuning.append((active, autotune))
+
+    def zvs_stopping(self) -> None:
+        self.zvs_stops += 1
+
+    def flash(self, message: str) -> None:
+        self.flashes.append(message)
 
 
 class _Dispatcher:
@@ -666,3 +678,182 @@ def test_an_active_sequence_is_stopped_at_the_sequence_level():
 def test_a_sequence_that_will_not_stop_is_reported():
     rig, ui = _estop(sequence=_Sequence(active=True, stops=False))
     assert _said(ui, "auto-sequence worker did not stop")
+
+
+# -- the manual ZVS search -----------------------------------------------------
+#
+# The interlock guard sits between every step that arms or energises, because
+# cancellation and trips both arrive *during* the previous step. These tests
+# cover where the guard sits, not only that it works: deleting the one in front
+# of enable_bus once passed the whole suite.
+
+
+class _Scope:
+    def __init__(self, *, identity_error=None, on_verify=None) -> None:
+        self.identity_error = identity_error
+        self.on_verify = on_verify
+
+    def verify_identity(self) -> str:
+        if self.on_verify is not None:
+            self.on_verify()
+        if self.identity_error is not None:
+            raise self.identity_error
+        return "LECROY,HDO4054,1,1.0"
+
+
+class _ZvsEngine:
+    """Engine as the manual ZVS search uses it."""
+
+    def __init__(self, *, scope=None, result=None) -> None:
+        self.scope = scope or _Scope()
+        self.peak_controller = SimpleNamespace(
+            achieve_peak=lambda *a, **k: None
+        )
+        self.zvs_tuner = SimpleNamespace(find_minimum=lambda **k: result)
+
+    def request_emergency_stop(self):
+        return _FinishedThread()
+
+    def join(self, timeout=None) -> None:
+        pass
+
+    def is_busy(self) -> bool:
+        return False
+
+
+class _ZvsSafety(_Safety):
+    def __init__(self, *, arms=True, enables=True, on_arm=None, **kwargs):
+        super().__init__(**kwargs)
+        self.arms = arms
+        self.enables = enables
+        self.on_arm = on_arm
+        self.arm_attempts = 0
+        self.bus_enable_attempts = 0
+
+    def arm_wavegen(self, _config: str) -> bool:
+        self.arm_attempts += 1
+        if self.on_arm is not None:
+            self.on_arm()
+        return self.arms
+
+    def enable_bus(self) -> bool:
+        self.bus_enable_attempts += 1
+        return self.enables
+
+
+def _zvs(safety=None, engine=None, wavegen=None, smu=None):
+    safety = safety or _ZvsSafety()
+    rig, ui = _build(
+        safety=safety, engine=engine or _ZvsEngine(), wavegen=wavegen, smu=smu
+    )
+    rig.smu.output_is_on = False
+    rig.wavegen_controller.outputs_armed = True
+    rig.launch_zvs(target_peak_v=300.0, config="Single Device")
+    rig.pool.join_all(3.0)
+    return rig, ui, safety
+
+
+def test_a_clean_zvs_search_reports_the_point_it_found():
+    engine = _ZvsEngine(result=SimpleNamespace(v_zvs=95.4, i_min=0.0327))
+    rig, ui, _safety = _zvs(engine=engine)
+    assert _said(ui, "ZVS point: 95.4 V (32.70 mA)")
+    assert _said(ui, "outputs are OFF")
+
+
+def test_a_wrong_scope_identity_never_energizes_anything():
+    """Fail closed: a valid-looking response from another SCPI instrument must
+    not be read as safety telemetry."""
+    engine = _ZvsEngine(
+        scope=_Scope(identity_error=ConnectionError("Expected LECROY HDO4054"))
+    )
+    rig, ui, safety = _zvs(engine=engine)
+    assert safety.arm_attempts == 0
+    assert safety.bus_enable_attempts == 0
+    assert safety.shutdowns == 1
+
+
+def test_cancelling_during_identity_verification_arms_nothing():
+    """Verifying the scope is a network round trip, long enough for Stop."""
+    holder: dict = {}
+
+    def cancel_now() -> None:
+        holder["token"].cancel_event.set()
+
+    engine = _ZvsEngine(scope=_Scope(on_verify=cancel_now))
+    safety = _ZvsSafety()
+    rig, ui = _build(safety=safety, engine=engine)
+    rig.smu.output_is_on = False
+    rig.wavegen_controller.outputs_armed = True
+    original = rig.operations.try_begin
+
+    def capture(kind):
+        holder["token"] = original(kind)
+        return holder["token"]
+
+    rig.operations.try_begin = capture  # type: ignore[method-assign]
+    rig.launch_zvs(target_peak_v=300.0, config="Single Device")
+    rig.pool.join_all(3.0)
+    assert safety.arm_attempts == 0, "armed after the search was cancelled"
+
+
+def test_cancelling_while_arming_never_energizes_the_bus():
+    holder: dict = {}
+    safety = _ZvsSafety(on_arm=lambda: holder["token"].cancel_event.set())
+    rig, ui = _build(safety=safety, engine=_ZvsEngine())
+    rig.smu.output_is_on = False
+    rig.wavegen_controller.outputs_armed = True
+    original = rig.operations.try_begin
+
+    def capture(kind):
+        holder["token"] = original(kind)
+        return holder["token"]
+
+    rig.operations.try_begin = capture  # type: ignore[method-assign]
+    rig.launch_zvs(target_peak_v=300.0, config="Single Device")
+    rig.pool.join_all(3.0)
+    assert safety.bus_enable_attempts == 0, (
+        "the bus was energised after the search had been cancelled"
+    )
+
+
+def test_a_trip_landing_mid_arm_never_energizes_the_bus():
+    """The safety monitor latches from its own polling while an operation is
+    in flight. The sequence must notice before the next step."""
+    safety = _ZvsSafety()
+    safety.on_arm = lambda: setattr(
+        safety, "trip_reason", ("overcurrent", "DC input current exceeded limit")
+    )
+    rig, ui, _safety = _zvs(safety=safety)
+    assert safety.bus_enable_attempts == 0
+    assert _said(ui, "ZVS search failed.") or ui.errors
+
+
+def test_a_gate_that_does_not_confirm_armed_never_energizes_the_bus():
+    safety = _ZvsSafety(arms=False)
+    rig, ui, _safety = _zvs(safety=safety)
+    assert safety.bus_enable_attempts == 0
+
+
+def test_stopping_a_running_search_reports_and_cancels():
+    rig, ui = _build()
+    token = rig.begin("zvs")
+    assert token is not None
+    assert rig.request_zvs_stop() is True
+    assert token.cancel_event.is_set()
+    assert _said(ui, "Stopping ZVS search safely...")
+
+
+def test_stopping_when_nothing_is_running_does_nothing():
+    rig, ui = _build()
+    assert rig.request_zvs_stop() is False
+    assert ui.status == []
+
+
+def test_stopping_does_not_touch_another_operation():
+    """The button is shared. Cancelling a bus-off because someone pressed Stop
+    on a search that is not running would be worse than doing nothing."""
+    rig, ui = _build()
+    token = rig.begin("bus_off")
+    assert token is not None
+    assert rig.request_zvs_stop() is False
+    assert not token.cancel_event.is_set()

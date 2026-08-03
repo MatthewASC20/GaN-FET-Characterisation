@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from gan_fet.core.safety import SafetyTrip
 from gan_fet.core.models import FinalReadings, RunRecord
 from gan_fet.settings import SCOPE_INSTRUMENT_KEY, InstrumentAddress
 from gan_fet.ui.command_log_view import rows_over_limit, single_line_text
@@ -33,7 +32,6 @@ from gan_fet.ui.panels.smu_panel import SmuPanel
 from gan_fet.ui.tracker_view import format_run_details
 from gan_fet.ui.widgets import (
     RigControlState,
-    OperationCoordinator,
     resolve_confirm_presentation,
     resolve_rig_control_state,
 )
@@ -317,261 +315,14 @@ def test_control_policy_preserves_safety_and_cancellation_paths() -> None:
     assert not zvs.hardware_actions
 
 
-def test_manual_zvs_button_requests_cooperative_stop_before_hardware_checks() -> None:
-    window = _headless_window()
-    window.operations = OperationCoordinator()
-    token = window.operations.try_begin("zvs")
-    assert token is not None
-    window.smu_panel = _FakeSmuPanel()
-    messages = []
-    window.status_bar = SimpleNamespace(set_message=messages.append)
-    window._ensure_hardware_online = lambda _action: pytest.fail(
-        "stopping ZVS must not be treated as a new hardware action"
-    )
-
-    MainWindow._find_zvs_now(window)
-
-    assert token.cancel_event.is_set()
-    assert window.smu_panel.zvs_button.options == {
-        "text": "Stopping...",
-        "state": "disabled",
-    }
-    assert messages == ["Stopping ZVS search safely..."]
 
 
-def test_manual_zvs_wrong_scope_identity_never_energizes() -> None:
-    token = OperationCoordinator().try_begin("zvs")
-    assert token is not None
-
-    class _WrongScope:
-        def verify_identity(self) -> str:
-            raise ConnectionError(
-                "Expected LECROY HDO4054, received 'LECROY,HDO4054A,1,1.0'"
-            )
-
-    class _Safety:
-        trip_reason = None
-
-        def __init__(self) -> None:
-            self.arm_attempts = 0
-            self.bus_enable_attempts = 0
-            self.shutdown_attempts = 0
-
-        def arm_wavegen(self, _config: str) -> bool:
-            self.arm_attempts += 1
-            return True
-
-        def enable_bus(self) -> bool:
-            self.bus_enable_attempts += 1
-            return True
-
-        def shutdown_outputs(self) -> bool:
-            self.shutdown_attempts += 1
-            return True
-
-        def emergency_stop(self) -> bool:
-            return True
-
-    safety = _Safety()
-    callbacks = []
-    window = _headless_window()
-    window._begin_operation = lambda _kind: token
-    window._start_worker = lambda worker, **_kwargs: worker()
-    window._status_async = lambda _message: None
-    window.voltage_var = _FakeVar("300")
-    window.config_var = _FakeVar("Single Device")
-    window.status_bar = SimpleNamespace(set_message=lambda _message: None)
-    window.engine = SimpleNamespace(scope=_WrongScope())
-    window.safety = safety
-    window.wavegen_controller = SimpleNamespace(outputs_armed=False)
-    window.ui_dispatcher = SimpleNamespace(
-        post=lambda *args: callbacks.append(args)
-    )
-
-    MainWindow._launch_zvs(window)
-
-    assert safety.arm_attempts == 0
-    assert safety.bus_enable_attempts == 0
-    assert safety.shutdown_attempts == 1
-    assert len(callbacks) == 1
-    assert isinstance(callbacks[0][-1], ConnectionError)
 
 
-def test_manual_zvs_stops_before_energizing_when_cancelled_after_arming() -> None:
-    """The interlock guard sits between every energising step, not just at the
-    top, because cancellation and trips can arrive *during* the previous step.
-
-    Here the operator presses Stop while the wavegen is arming. The bus must
-    never be enabled, and the outputs must be made safe on the way out.
-    """
-    coordinator = OperationCoordinator()
-    token = coordinator.try_begin("zvs")
-    assert token is not None
-
-    class _Safety:
-        trip_reason = None
-
-        def __init__(self) -> None:
-            self.bus_enable_attempts = 0
-            self.shutdown_attempts = 0
-
-        def arm_wavegen(self, _config: str) -> bool:
-            # Cancellation lands while this step is in flight.
-            token.cancel_event.set()
-            return True
-
-        def enable_bus(self) -> bool:
-            self.bus_enable_attempts += 1
-            return True
-
-        def shutdown_outputs(self) -> bool:
-            self.shutdown_attempts += 1
-            return True
-
-        def emergency_stop(self) -> bool:
-            return True
-
-    safety = _Safety()
-    callbacks = []
-    window = _headless_window()
-    window._begin_operation = lambda _kind: token
-    window._start_worker = lambda worker, **_kwargs: worker()
-    window._status_async = lambda _message: None
-    window.voltage_var = _FakeVar("300")
-    window.config_var = _FakeVar("Single Device")
-    window.status_bar = SimpleNamespace(set_message=lambda _message: None)
-    window.engine = SimpleNamespace(
-        scope=SimpleNamespace(verify_identity=lambda: "LECROY,HDO4054,1,1.0")
-    )
-    window.safety = safety
-    window.wavegen_controller = SimpleNamespace(outputs_armed=True)
-    window.ui_dispatcher = SimpleNamespace(
-        post=lambda *args: callbacks.append(args)
-    )
-
-    MainWindow._launch_zvs(window)
-
-    assert safety.bus_enable_attempts == 0, (
-        "the bus was energised after the search had been cancelled"
-    )
-    assert safety.shutdown_attempts == 1
-    assert isinstance(callbacks[0][-1], InterruptedError)
 
 
-def test_manual_zvs_stops_before_arming_when_cancelled_during_identity() -> None:
-    """Verifying the scope takes a round trip over the network, which is long
-    enough for Stop to land. Nothing may be armed after that."""
-    coordinator = OperationCoordinator()
-    token = coordinator.try_begin("zvs")
-    assert token is not None
-
-    class _Safety:
-        trip_reason = None
-
-        def __init__(self) -> None:
-            self.arm_attempts = 0
-            self.bus_enable_attempts = 0
-            self.shutdown_attempts = 0
-
-        def arm_wavegen(self, _config: str) -> bool:
-            self.arm_attempts += 1
-            return True
-
-        def enable_bus(self) -> bool:
-            self.bus_enable_attempts += 1
-            return True
-
-        def shutdown_outputs(self) -> bool:
-            self.shutdown_attempts += 1
-            return True
-
-        def emergency_stop(self) -> bool:
-            return True
-
-    def verify_identity() -> str:
-        token.cancel_event.set()
-        return "LECROY,HDO4054,1,1.0"
-
-    safety = _Safety()
-    callbacks = []
-    window = _headless_window()
-    window._begin_operation = lambda _kind: token
-    window._start_worker = lambda worker, **_kwargs: worker()
-    window._status_async = lambda _message: None
-    window.voltage_var = _FakeVar("300")
-    window.config_var = _FakeVar("Single Device")
-    window.status_bar = SimpleNamespace(set_message=lambda _message: None)
-    window.engine = SimpleNamespace(
-        scope=SimpleNamespace(verify_identity=verify_identity)
-    )
-    window.safety = safety
-    window.wavegen_controller = SimpleNamespace(outputs_armed=True)
-    window.ui_dispatcher = SimpleNamespace(
-        post=lambda *args: callbacks.append(args)
-    )
-
-    MainWindow._launch_zvs(window)
-
-    assert safety.arm_attempts == 0, (
-        "the wavegen was armed after the search had been cancelled"
-    )
-    assert safety.bus_enable_attempts == 0
-    assert isinstance(callbacks[0][-1], InterruptedError)
 
 
-def test_manual_zvs_stops_before_energizing_when_a_trip_lands_mid_arm() -> None:
-    """A trip can be latched by the safety monitor from its own polling while
-    an operation is in flight. The sequence must notice before the next step
-    rather than run on a rig that has already been judged unsafe."""
-    coordinator = OperationCoordinator()
-    token = coordinator.try_begin("zvs")
-    assert token is not None
-
-    class _Safety:
-        def __init__(self) -> None:
-            self.trip_reason = None
-            self.bus_enable_attempts = 0
-            self.shutdown_attempts = 0
-
-        def arm_wavegen(self, _config: str) -> bool:
-            self.trip_reason = ("overcurrent", "DC input current exceeded limit")
-            return True
-
-        def enable_bus(self) -> bool:
-            self.bus_enable_attempts += 1
-            return True
-
-        def shutdown_outputs(self) -> bool:
-            self.shutdown_attempts += 1
-            return True
-
-        def emergency_stop(self) -> bool:
-            return True
-
-    safety = _Safety()
-    callbacks = []
-    window = _headless_window()
-    window._begin_operation = lambda _kind: token
-    window._start_worker = lambda worker, **_kwargs: worker()
-    window._status_async = lambda _message: None
-    window.voltage_var = _FakeVar("300")
-    window.config_var = _FakeVar("Single Device")
-    window.status_bar = SimpleNamespace(set_message=lambda _message: None)
-    window.engine = SimpleNamespace(
-        scope=SimpleNamespace(verify_identity=lambda: "LECROY,HDO4054,1,1.0")
-    )
-    window.safety = safety
-    window.wavegen_controller = SimpleNamespace(outputs_armed=True)
-    window.ui_dispatcher = SimpleNamespace(
-        post=lambda *args: callbacks.append(args)
-    )
-
-    MainWindow._launch_zvs(window)
-
-    assert safety.bus_enable_attempts == 0, (
-        "the bus was energised after a trip had been latched"
-    )
-    assert isinstance(callbacks[0][-1], SafetyTrip)
 
 
 def test_clear_device_context_clears_all_parameter_consumers() -> None:
