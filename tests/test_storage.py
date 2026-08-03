@@ -187,7 +187,7 @@ def test_newer_database_schema_is_rejected(tmp_path: Path):
         raise AssertionError("future schema should not open")
 
 
-def test_unrelated_unique_index_does_not_trigger_runs_rebuild(tmp_path: Path):
+def test_unrelated_unique_index_survives_reopening(tmp_path: Path):
     path = tmp_path / "project" / "index.db"
     db = Database(path)
     db.close()
@@ -292,3 +292,38 @@ def test_v8_tuning_columns_are_renamed_in_place(tmp_path: Path):
             assert stored[3] is False
         finally:
             db.close()
+
+
+def test_a_pre_attempts_database_is_refused_not_rebuilt(tmp_path: Path):
+    """The one-row-per-point era predates every database still in service.
+
+    The rebuild that used to converge it was retired; opening such a file
+    must fail closed with a pointer to a release that still carries the
+    migration, never silently query a table whose rows mean something else.
+    """
+    path = tmp_path / "ancient.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE devices (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE runs (
+            id INTEGER PRIMARY KEY,
+            device_id INTEGER NOT NULL REFERENCES devices(id),
+            config TEXT NOT NULL,
+            frequency_hz INTEGER NOT NULL,
+            duty_pct INTEGER NOT NULL,
+            temperature_c INTEGER NOT NULL,
+            voltage_v INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'running'
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    try:
+        Database(path)
+    except sqlite3.DatabaseError as exc:
+        assert "attempts migration" in str(exc)
+    else:
+        raise AssertionError("a pre-attempts database must be refused")

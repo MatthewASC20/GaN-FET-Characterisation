@@ -197,26 +197,6 @@ ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
 }
 
-RUNS_WITHOUT_LEGACY_UNIQUE = """
-CREATE TABLE runs_v2 (
-    id INTEGER PRIMARY KEY,
-    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-    config TEXT NOT NULL,
-    frequency_hz INTEGER NOT NULL,
-    duty_pct INTEGER NOT NULL,
-    temperature_c INTEGER NOT NULL,
-    voltage_v INTEGER NOT NULL,
-    duration_minutes REAL,
-    started_at TEXT,
-    completed_at TEXT,
-    status TEXT NOT NULL DEFAULT 'running',
-    bus_voltage_v REAL,
-    v_zvs REAL,
-    vin REAL, iin REAL, fsw_hz REAL, irms REAL, vds_pk REAL, isw_rms REAL,
-    screenshot_path TEXT,
-    attempt_no INTEGER NOT NULL DEFAULT 1
-)
-"""
 
 RUN_COLUMNS = (
     "r.id, d.name, r.config, r.frequency_hz, r.duty_pct, r.temperature_c, "
@@ -227,14 +207,6 @@ RUN_COLUMNS = (
     "r.zvs_dwell_fraction"
 )
 
-RUN_NATURAL_KEY_COLUMNS = (
-    "device_id",
-    "config",
-    "frequency_hz",
-    "duty_pct",
-    "temperature_c",
-    "voltage_v",
-)
 
 
 def row_to_run(row: sqlite3.Row | tuple) -> RunRecord:

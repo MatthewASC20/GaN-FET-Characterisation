@@ -16,7 +16,6 @@ if not "%~2"=="" goto invalid_args
 if /I "%~1"=="--simulate" set "GAN_LAUNCH_MODE=simulate"
 if /I "%~1"=="-s" set "GAN_LAUNCH_MODE=simulate"
 if /I "%~1"=="--diagnose" set "GAN_LAUNCH_MODE=diagnose"
-if /I "%~1"=="--migrate" set "GAN_LAUNCH_MODE=migrate"
 if /I "%~1"=="--setup" set "GAN_LAUNCH_MODE=setup"
 if /I "%~1"=="--update" set "GAN_LAUNCH_MODE=update"
 if /I "%~1"=="--help" set "GAN_LAUNCH_MODE=help"
@@ -49,14 +48,12 @@ $ErrorActionPreference = 'Stop'
 $LaunchMode = [string]$env:GAN_LAUNCH_MODE
 $WantSimulate = $LaunchMode -eq 'simulate'
 $WantDiagnose = $LaunchMode -eq 'diagnose'
-$WantMigrate = $LaunchMode -eq 'migrate'
 $WantSetup = $LaunchMode -eq 'setup'
 $WantUpdate = $LaunchMode -eq 'update'
 $WantHelp = $LaunchMode -eq 'help'
 $AppArgs = switch ($LaunchMode) {
     'simulate' { @('--simulate') }
     'diagnose' { @('--diagnose') }
-    'migrate' { @('--migrate') }
     default { @() }
 }
 
@@ -75,8 +72,7 @@ if ($WantHelp) {
     Write-Host "  RUN-GAN-FET.bat              Normal launch (Interactive Menu / Live Hardware)"
     Write-Host "  RUN-GAN-FET.bat --simulate   Run Simulation Mode (Virtual SCPI instruments)"
     Write-Host "  RUN-GAN-FET.bat --diagnose   Run hardware self-test diagnostic connectivity check"
-    Write-Host "  RUN-GAN-FET.bat --migrate    Import legacy Device Data tree into database"
-    Write-Host "  RUN-GAN-FET.bat --setup      Run environment bootstrap & create desktop shortcut"
+        Write-Host "  RUN-GAN-FET.bat --setup      Run environment bootstrap & create desktop shortcut"
     Write-Host "  RUN-GAN-FET.bat --update     Force check and install latest release update`n"
     exit 0
 }
@@ -357,13 +353,6 @@ if ($WantDiagnose) {
     exit $LASTEXITCODE
 }
 
-if ($WantMigrate) {
-    Write-Banner "Importing Legacy Device Data Tree..."
-    Set-Location -LiteralPath $InstallDir
-    & $VenvPython -m gan_fet @AppArgs
-    exit $LASTEXITCODE
-}
-
 if ($WantSetup) {
     New-DesktopShortcut -InstallDir $InstallDir
     Write-Host "`nSetup complete!" -ForegroundColor Green
@@ -377,13 +366,12 @@ Write-Banner "GaN Device Test Runner v$CurrentVer - Control Panel"
 Write-Host "  Installed Version: v$CurrentVer" -ForegroundColor White
 Write-Host "  Installation Path: $InstallDir`n" -ForegroundColor White
 
-Write-Host "Select an option [1-6, default 1]:" -ForegroundColor Yellow
+Write-Host "Select an option [1-5, default 1]:" -ForegroundColor Yellow
 Write-Host "  [1] Run GaN FET Test Runner          (Live Bench Hardware)" -ForegroundColor Green
 Write-Host "  [2] Run Simulation Mode             (Virtual SCPI Instruments for Safe Testing)" -ForegroundColor Cyan
 Write-Host "  [3] Run Hardware Diagnostics        (--diagnose self-test)"
-Write-Host "  [4] Import Legacy Device Data       (--migrate)"
-Write-Host "  [5] Create Desktop Shortcut         (Generate 'GaN Device Test Runner.lnk')"
-Write-Host "  [6] Exit`n"
+Write-Host "  [4] Create Desktop Shortcut         (Generate 'GaN Device Test Runner.lnk')"
+Write-Host "  [5] Exit`n"
 
 $Choice = Read-Host "Select option [default 1]"
 if ([string]::IsNullOrWhiteSpace($Choice)) { $Choice = '1' }
@@ -402,12 +390,6 @@ switch ($Choice.Trim()) {
         $AppExitCode = $LASTEXITCODE
     }
     '4' {
-        Write-Banner "Importing Legacy Device Data..."
-        Set-Location -LiteralPath $InstallDir
-        & $VenvPython -m gan_fet --migrate
-        $AppExitCode = $LASTEXITCODE
-    }
-    '5' {
         New-DesktopShortcut -InstallDir $InstallDir
         $AppExitCode = 0
     }

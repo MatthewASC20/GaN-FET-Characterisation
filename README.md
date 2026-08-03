@@ -64,15 +64,11 @@ Requires Python ≥ 3.10 with tkinter available (`python3-tk` on Debian/Ubuntu).
 gan-fet                 # GUI with live bench hardware
 gan-fet --simulate      # GUI with isolated virtual instruments and data
 gan-fet --diagnose      # hardware connectivity self-test
-gan-fet --migrate       # import the legacy "Device Data" CSV tree
 ```
 
 On macOS, you can also double-click `RUN-GAN-FET-SIMULATION.command` in the
 project folder. On Windows, choose **Run Simulation Mode** from
 `RUN-GAN-FET.bat`.
-
-On first launch with an empty database, the app offers the legacy import
-automatically.
 
 ## Safe procedure validation
 
@@ -84,8 +80,7 @@ Simulation constructs only in-process virtual instruments; it does not probe,
 open, diagnose, or shut down the real SDG6022X, HDO4054, or K2410. Google
 Sheets is disabled, and settings, database, SCPI log, screenshots, reports,
 and exports are all pinned below the separate `simulation/` directory.
-`--simulate` cannot be combined with the live `--diagnose` or `--migrate`
-modes.
+`--simulate` cannot be combined with the live `--diagnose` mode.
 
 To rehearse one complete test:
 

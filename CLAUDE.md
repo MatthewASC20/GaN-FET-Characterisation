@@ -15,7 +15,6 @@ pip install -e ".[macos]"    # + tkmacosx coloured buttons
 gan-fet                      # GUI against live bench hardware
 gan-fet --simulate           # GUI against virtual instruments, isolated data
 gan-fet --diagnose           # hardware connectivity self-test
-gan-fet --migrate            # import the legacy "Device Data" CSV tree
 
 ruff check gan_fet scripts tests
 mypy gan_fet                 # must stay clean; CI gates on it
@@ -172,7 +171,7 @@ against in-process virtual instruments sharing one `SimulatedRigPlant`.
 - A permanent purple banner reads
   `SIMULATION — VIRTUAL INSTRUMENTS — NO BENCH I/O — NOT MEASURED DATA`.
   Outputs carry `SIMULATION` in their filenames.
-- Mutually exclusive with `--diagnose` and `--migrate`.
+- Mutually exclusive with `--diagnose`.
 
 Readings are deterministic and useful for workflow validation. They are **not a
 circuit-accurate model** and must never be presented as characterisation results.

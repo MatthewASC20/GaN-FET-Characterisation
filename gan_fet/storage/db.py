@@ -26,8 +26,6 @@ from gan_fet.storage.schema import (
     ADDED_COLUMNS,
     PLAN_TABLES_V8,
     RUN_COLUMNS,
-    RUN_NATURAL_KEY_COLUMNS,
-    RUNS_WITHOUT_LEGACY_UNIQUE,
     SCHEMA,
     SCHEMA_VERSION,
     row_to_run,
@@ -123,7 +121,7 @@ class Database:
                 self._net_lock.release()
 
     def _initialize_schema(self) -> None:
-        """Create the current schema and migrate the original one-row-per-point table.
+        """Create the current schema and converge older post-v2 databases.
 
         Structural inspection is deliberate: early builds had no version row, so
         trusting only ``schema_version`` would strand those databases.
@@ -148,25 +146,15 @@ class Database:
         columns = {
             row[1] for row in self._conn.execute("PRAGMA table_info(runs)").fetchall()
         }
-        # Only the historical natural-key UNIQUE forces one-row-per-point
-        # semantics. Unrelated administrative unique indexes must not trigger
-        # a destructive table rebuild.
-        unique_point_index = False
-        for index_row in self._conn.execute("PRAGMA index_list(runs)").fetchall():
-            if not bool(index_row[2]):
-                continue
-            index_name = str(index_row[1]).replace("'", "''")
-            index_columns = tuple(
-                row[2]
-                for row in self._conn.execute(
-                    f"PRAGMA index_info('{index_name}')"
-                ).fetchall()
+        # The pre-attempts rebuild was retired once every known database
+        # had crossed it. Refusing is fail-closed: silently querying a
+        # one-row-per-point table would misread its history.
+        if "attempt_no" not in columns:
+            raise sqlite3.DatabaseError(
+                "this database predates the append-only runs schema; "
+                "open it once with a release that still carries the "
+                "attempts migration"
             )
-            if index_columns == RUN_NATURAL_KEY_COLUMNS:
-                unique_point_index = True
-                break
-        if "attempt_no" not in columns or unique_point_index:
-            self._migrate_runs_to_attempts()
 
         sample_columns = {
             row[1]
@@ -205,19 +193,6 @@ class Database:
         self._migrate_added_columns()
 
         with self._conn:
-            # Early migration builds marked every parseable legacy CSV complete,
-            # even when no FINAL_READINGS row existed. Those imports have a
-            # zero duration and no final metric; preserve their samples while
-            # making the incomplete state explicit.
-            self._conn.execute(
-                """
-                UPDATE runs SET status='legacy_partial'
-                WHERE status='completed'
-                  AND duration_minutes=0.0
-                  AND vin IS NULL AND iin IS NULL AND fsw_hz IS NULL
-                  AND irms IS NULL AND vds_pk IS NULL AND isw_rms IS NULL
-                """
-            )
             self._conn.execute(
                 "INSERT OR IGNORE INTO schema_version(version) VALUES (?)",
                 (SCHEMA_VERSION,),
@@ -354,56 +329,6 @@ class Database:
             self._conn.execute("ALTER TABLE samples ADD COLUMN elapsed_s REAL")
             self._net_lock.assert_owned()
 
-    def _migrate_runs_to_attempts(self) -> None:
-        """Idempotently rebuild ``runs`` without the legacy natural-key UNIQUE."""
-        self._conn.commit()
-        self._net_lock.assert_owned()
-        self._conn.execute("PRAGMA foreign_keys=OFF")
-        try:
-            self._conn.execute("BEGIN IMMEDIATE")
-            self._conn.execute("DROP TABLE IF EXISTS runs_v2")
-            self._conn.execute(RUNS_WITHOUT_LEGACY_UNIQUE)
-            self._conn.execute(
-                """
-                INSERT INTO runs_v2(
-                    id, device_id, config, frequency_hz, duty_pct, temperature_c,
-                    voltage_v, duration_minutes, started_at, completed_at, status,
-                    bus_voltage_v, v_zvs, vin, iin, fsw_hz, irms, vds_pk, isw_rms,
-                    screenshot_path, attempt_no
-                )
-                SELECT
-                    id, device_id, config, frequency_hz, duty_pct, temperature_c,
-                    voltage_v, duration_minutes, started_at, completed_at, status,
-                    bus_voltage_v, v_zvs, vin, iin, fsw_hz, irms, vds_pk, isw_rms,
-                    screenshot_path, 1
-                FROM runs
-                """
-            )
-            self._conn.execute("DROP TABLE runs")
-            self._conn.execute("ALTER TABLE runs_v2 RENAME TO runs")
-            self._conn.execute(
-                """
-                CREATE INDEX idx_runs_point
-                ON runs(
-                    device_id, config, frequency_hz, duty_pct,
-                    temperature_c, voltage_v, id
-                )
-                """
-            )
-            self._conn.execute("CREATE INDEX idx_runs_status ON runs(status)")
-            self._net_lock.assert_owned()
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
-        finally:
-            self._conn.execute("PRAGMA foreign_keys=ON")
-
-        violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
-        if violations:
-            raise sqlite3.IntegrityError(
-                f"foreign-key violations after runs migration: {violations[:5]}"
-            )
 
     @contextmanager
     def transaction(self):

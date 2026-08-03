@@ -1,7 +1,6 @@
 """Composition root and CLI entry point.
 
     gan-fet             launch the GUI
-    gan-fet --migrate   import the legacy ``Device Data/`` CSV tree, then exit
 """
 
 from __future__ import annotations
@@ -13,9 +12,8 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
-from gan_fet.settings import LEGACY_DATA_ROOT, Settings, SettingsLoadError
+from gan_fet.settings import Settings, SettingsLoadError
 from gan_fet.storage.db import Database
-from gan_fet.storage.migrate import migrate_legacy_tree
 
 log = logging.getLogger(__name__)
 
@@ -95,21 +93,6 @@ def _open_runtime_database(path: Path) -> tuple[Database, int]:
         )
     return db, recovered
 
-
-def _maybe_offer_migration(db: Database, root) -> None:
-    """On first launch with an empty DB, offer to import the legacy tree."""
-    if db.list_devices() or not LEGACY_DATA_ROOT.is_dir():
-        return
-    from tkinter import messagebox
-
-    if messagebox.askyesno(
-        "Import Legacy Data",
-        "The database is empty, but a legacy 'Device Data' folder was found.\n\n"
-        "Import all previous experiment results now?",
-        parent=root,
-    ):
-        report = migrate_legacy_tree(db, LEGACY_DATA_ROOT)
-        messagebox.showinfo("Import Complete", report.summary(), parent=root)
 
 
 def _fast_instrument_probe(settings: Settings) -> bool:
@@ -207,8 +190,6 @@ def run_gui(settings: Settings, simulate: bool = False) -> int:
             close_resources=resources.close,
         )
         sheets.status = window._status_async
-        if not simulate:
-            _maybe_offer_migration(db, window)
         if hardware_offline:
             window.status_bar.set_message(
                 "DISCONNECTED: One or more configured instruments are unreachable. "
@@ -232,20 +213,6 @@ def run_gui(settings: Settings, simulate: bool = False) -> int:
     return 0
 
 
-def run_migration(settings: Settings, source: Path) -> int:
-    # Live bench records take the project lease; simulation does not, so a
-    # crashed practice run cannot leave a file that blocks the next start.
-    db = Database(
-        settings.db_path,
-        use_project_lock=not settings.is_simulation_runtime,
-    )
-    try:
-        report = migrate_legacy_tree(db, source)
-        print(report.summary())
-        return 0 if not report.errors else 1
-    finally:
-        db.close()
-
 
 def run_diagnostics(settings: Settings) -> int:
     from gan_fet.core.diagnostics import run_hardware_diagnostics
@@ -258,14 +225,6 @@ def run_diagnostics(settings: Settings) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="gan-fet", description=__doc__)
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument(
-        "--migrate",
-        nargs="?",
-        const=str(LEGACY_DATA_ROOT),
-        metavar="PATH",
-        help="import a legacy 'Device Data' CSV tree into the database and exit "
-        f"(default source: {LEGACY_DATA_ROOT})",
-    )
     mode.add_argument(
         "--diagnose",
         action="store_true",
@@ -297,8 +256,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.diagnose:
         return run_diagnostics(settings)
-    if args.migrate is not None:
-        return run_migration(settings, Path(args.migrate))
     return run_gui(settings, simulate=args.simulate)
 
 

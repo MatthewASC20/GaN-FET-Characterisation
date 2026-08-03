@@ -21,7 +21,6 @@ APP_NAME = "GaN-FET-Characterisation"
 # ``APP_DIR`` remains the legacy checkout/install root.  Runtime files no
 # longer default here, but it is still where older releases stored their data.
 APP_DIR = Path(__file__).resolve().parent.parent
-LEGACY_DATA_ROOT = APP_DIR / "Device Data"
 
 
 def _user_config_dir() -> Path:
