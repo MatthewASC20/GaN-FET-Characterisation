@@ -371,8 +371,8 @@ class SmuLimitsEditor(ttk.LabelFrame):
         ("NPLC", "smu", "nplc", float),
         ("Sample interval (s)", "smu", "sample_interval_s", float),
         ("Ramp step (V)", "smu", "ramp_step_v", float),
-        ("ZVS search window (± V)", "zvs", "window_v", float),
-        ("ZVS step (V)", "zvs", "step_v", float),
+        ("DC voltage tune window (± V)", "zvs", "window_v", float),
+        ("DC voltage tune step (V)", "zvs", "step_v", float),
         ("Max DC current (A)", "safety", "max_dc_current_a", float),
         ("Max Vds peak (V)", "safety", "max_vds_peak_v", float),
         ("Peak tolerance (V)", "peak_control", "tolerance_v", float),
@@ -437,7 +437,7 @@ class RampRatesSliderEditor(ttk.LabelFrame):
     DUTY_RANGE = (1.0, 100.0)
 
     def __init__(self, master, settings: Settings, on_applied: Callable[[], None]):
-        super().__init__(master, text="Autotune & Ramp Speed Sliders")
+        super().__init__(master, text="Ramp Rate Sliders")
         self.settings = settings
         self.on_applied = on_applied
         self._dirty = False
@@ -460,7 +460,7 @@ class RampRatesSliderEditor(ttk.LabelFrame):
         self.v_slider.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
 
         # Frequency Autotune Ramp Rate (kHz/s)
-        ttk.Label(self, text="Frequency Autotune Rate (kHz/s):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(self, text="Frequency Ramp Rate (kHz/s):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
         current_freq_rate = getattr(self.settings.zvs, "autotune_freq_rate_khz_s", 200.0)
         self.freq_rate_var = tk.DoubleVar(value=current_freq_rate)
         self.freq_label = ttk.Label(self, text=f"{current_freq_rate:.0f} kHz/s", width=12)

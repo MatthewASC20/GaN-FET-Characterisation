@@ -241,13 +241,15 @@ def resolve_confirm_presentation(
         tuning_candidate_hz is not None and not tuner_busy and frequency_actions
     )
     if autotune_enabled and tuning_candidate_hz is not None:
-        autotune_text = f"Autotune: {tuning_candidate_hz / 1e6:.2f} MHz"
+        autotune_text = (
+            f"Recall Tuned Frequency: {tuning_candidate_hz / 1e6:.2f} MHz"
+        )
     elif hardware_actions and not frequency_actions:
         # Name the cause: a live bus is something the operator can fix, unlike
         # simply having no prior run to tune towards.
-        autotune_text = "Autotune: Bus On"
+        autotune_text = "Recall Tuned Frequency (Bus On)"
     else:
-        autotune_text = "Autotune Unavailable"
+        autotune_text = "No Tuned Frequency Stored"
 
     return ConfirmPresentation(
         confirm_state=confirm_state,

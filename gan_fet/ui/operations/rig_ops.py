@@ -83,9 +83,9 @@ class ZvsDecision:
 
 #: Offered when the wavegen still holds different settings from the selection.
 _APPLY_FIRST_PROMPT = (
-    "Find ZVS",
+    "Tune DC Voltage",
     "The wavegen does not match the selected parameters. Apply them before "
-    "the ZVS search?",
+    "the DC voltage tune?",
 )
 
 
@@ -97,13 +97,13 @@ def zvs_precondition(
     max_vds_peak_v: float,
     wavegen_pending: bool,
 ) -> ZvsDecision:
-    """Decide what "Find ZVS Now" does, in the order the checks must happen.
+    """Decide what "Tune DC Voltage Now" does, in the order the checks must happen.
 
     ``target_peak_v`` is ``None`` when the field could not be read at all,
     which is treated exactly like an out-of-range value: an unreadable target
     is not a target.
 
-    Assumes no ZVS search is already running — see :class:`ZvsAction`.
+    Assumes no DC voltage tune is already running — see :class:`ZvsAction`.
     """
     if hardware_offline:
         return ZvsDecision(ZvsAction.HARDWARE_OFFLINE)
@@ -114,7 +114,7 @@ def zvs_precondition(
         return ZvsDecision(
             ZvsAction.REFUSE,
             Refusal(
-                "Find ZVS",
+                "Tune DC Voltage",
                 "Reset the latched safety interlock before energizing the rig.",
             ),
         )
@@ -127,7 +127,7 @@ def zvs_precondition(
         return ZvsDecision(
             ZvsAction.REFUSE,
             Refusal(
-                "Find ZVS",
+                "Tune DC Voltage",
                 "The selected Vds target must be positive and no greater than "
                 f"the {max_vds_peak_v:g} V safety limit.",
                 severity="error",
@@ -143,7 +143,7 @@ def zvs_precondition(
 
 
 class AutotuneAction(Enum):
-    """What pressing Autotune should do."""
+    """What pressing Recall Tuned Frequency should do."""
 
     HARDWARE_OFFLINE = auto()
     REFUSE = auto()
@@ -159,19 +159,21 @@ class AutotuneDecision:
 
 
 _AUTOTUNE_APPLY_FIRST = (
-    "Autotune",
+    "Recall Tuned Frequency",
     "Wavegen settings have not been applied yet. Apply them first?",
 )
 
-#: Why autotune is refused with the bus live. Spelled out rather than
+#: Why frequency recall is refused with the bus live. Spelled out rather than
 #: shortened: the operator is being told to do something else instead, and
 #: needs to know that the alternative is not the same operation.
 BUS_ENERGISED_MESSAGE = (
     "The SMU bus is energised.\n\n"
-    "Autotune ramps the gate frequency, which moves the resonant operating "
-    "point and therefore Vds peak, with no closed-loop peak control.\n\n"
-    "Switch the bus off first, or use 'Find frequency before run', which "
-    "holds Vds peak on target throughout the search."
+    "Recalling a tuned frequency ramps the gate frequency, which moves the "
+    "resonant operating point and therefore Vds peak, with no closed-loop "
+    "peak control.\n\n"
+    "Switch the bus off first, or enable 'Tune frequency at operating point' "
+    "(Configuration > Advanced), which holds Vds peak on target throughout "
+    "the search."
 )
 
 
@@ -184,7 +186,7 @@ def autotune_precondition(
 ) -> AutotuneDecision:
     """Decide whether the gate frequency may be ramped to a stored value.
 
-    The bus check is the substance. Autotune moves frequency with no
+    The bus check is the substance. Frequency recall moves frequency with no
     closed-loop peak control behind it, so with the bus live the resonant
     operating point — and therefore Vds peak — moves uncontrolled. It is
     checked here as well as on the button because widget state is refreshed by
@@ -194,13 +196,14 @@ def autotune_precondition(
         return AutotuneDecision(AutotuneAction.HARDWARE_OFFLINE)
     if bus_energised:
         return AutotuneDecision(
-            AutotuneAction.REFUSE, Refusal("Autotune", BUS_ENERGISED_MESSAGE)
+            AutotuneAction.REFUSE,
+            Refusal("Recall Tuned Frequency", BUS_ENERGISED_MESSAGE),
         )
     if not has_candidate:
         return AutotuneDecision(
             AutotuneAction.REFUSE,
             Refusal(
-                "Autotune",
+                "Recall Tuned Frequency",
                 "No tuned frequency is available for the current settings.",
                 severity="info",
             ),

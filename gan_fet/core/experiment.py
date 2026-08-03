@@ -523,23 +523,26 @@ class ExperimentEngine:
 
             v_zvs: Optional[float] = None
             if params.find_zvs:
-                self._update_status("Searching for ZVS point...")
+                self._update_status(
+                    "Tuning DC voltage (searching for the ZVS point)..."
+                )
                 result = self.zvs_tuner.find_minimum(
                     cancel_check=self._cancelled, status=self._update_status
                 )
                 if result is None:
                     if self._cancelled():
                         raise ExperimentCancelled(
-                            "Experiment cancelled during ZVS search."
+                            "Experiment cancelled during the DC voltage tune."
                         )
                     raise ZvsMeasurementError(
-                        "Requested ZVS search returned no measurement result"
+                        "Requested DC voltage tune returned no measurement "
+                        "result"
                     )
                 v_zvs = result.v_zvs
                 bus_voltage = result.v_zvs
                 self._update_status(
-                    f"ZVS point: {result.v_zvs:.1f} V "
-                    f"({result.i_min * 1000:.2f} mA)"
+                    f"DC voltage tuned to {result.v_zvs:.1f} V "
+                    f"(ZVS point, {result.i_min * 1000:.2f} mA)"
                 )
 
             if self._cancelled():

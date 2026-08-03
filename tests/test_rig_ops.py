@@ -103,7 +103,7 @@ def test_a_stale_wavegen_offers_to_apply_first():
     assert decision.action is ZvsAction.APPLY_WAVEGEN_FIRST
     assert decision.prompt is not None
     title, message = decision.prompt
-    assert title == "Find ZVS"
+    assert title == "Tune DC Voltage"
     assert "does not match" in message
 
 
@@ -135,7 +135,7 @@ def _abort(*, cancelled=False, trip_reason=None):
         cancelled=lambda: cancelled,
         safety=_Safety(trip_reason),
         trip_error=_Trip,
-        what="ZVS search",
+        what="DC voltage tune",
     )
 
 
@@ -144,7 +144,7 @@ def test_a_clear_rig_passes_the_guard():
 
 
 def test_cancellation_stops_the_next_step():
-    with pytest.raises(InterruptedError, match="ZVS search cancelled"):
+    with pytest.raises(InterruptedError, match="DC voltage tune cancelled"):
         _abort(cancelled=True)
 
 
@@ -188,7 +188,7 @@ def test_the_guard_is_re_evaluated_on_every_call():
         cancelled=lambda: state["cancelled"],
         safety=_Safety(),
         trip_error=_Trip,
-        what="ZVS search",
+        what="DC voltage tune",
     )
     assert guard() is None
     state["cancelled"] = True
@@ -231,10 +231,11 @@ def test_a_live_bus_refuses_autotune():
 
 
 def test_the_refusal_names_the_alternative_that_is_safe():
-    """The operator is being told to do something else. 'Find frequency before
-    run' holds Vds peak on target throughout, which autotune does not."""
+    """The operator is being told to do something else. 'Tune frequency at
+    operating point' holds Vds peak on target throughout, which a frequency
+    recall does not. The name must match the actual Config checkbox."""
     decision = _autotune(bus_energised=True)
-    assert "Find frequency before run" in decision.refusal.message
+    assert "Tune frequency at operating point" in decision.refusal.message
 
 
 def test_a_live_bus_outranks_a_missing_candidate():
@@ -257,7 +258,7 @@ def test_a_stale_wavegen_offers_to_apply_before_autotuning():
 
     decision = _autotune(wavegen_pending=True)
     assert decision.action is AutotuneAction.APPLY_WAVEGEN_FIRST
-    assert decision.prompt[0] == "Autotune"
+    assert decision.prompt[0] == "Recall Tuned Frequency"
 
 
 def test_a_live_bus_is_refused_before_the_wavegen_is_offered():

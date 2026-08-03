@@ -357,6 +357,6 @@ class WavegenController:
                     breach[0], self.peak_ceiling_v or 0.0, float(actual)
                 )
             if status is not None:
-                status(f"Autotune: {actual / 1e6:.2f} MHz")
+                status(f"Gate frequency: {actual / 1e6:.2f} MHz")
             log.info("Autotune ramp complete: %.0f Hz → %.0f Hz", start, actual)
             return float(start)

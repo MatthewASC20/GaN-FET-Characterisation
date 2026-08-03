@@ -660,19 +660,19 @@ def test_autotune_names_a_live_bus_as_the_reason():
         tuning_candidate_hz=6.4e6, hardware_actions=True, frequency_actions=False
     )
     assert result.autotune_enabled is False
-    assert result.autotune_text == "Autotune: Bus On"
+    assert result.autotune_text == "Recall Tuned Frequency (Bus On)"
 
 
 def test_autotune_is_generically_unavailable_without_a_candidate():
     result = _presentation(tuning_candidate_hz=None)
     assert result.autotune_enabled is False
-    assert result.autotune_text == "Autotune Unavailable"
+    assert result.autotune_text == "No Tuned Frequency Stored"
 
 
 def test_autotune_shows_the_frequency_it_would_move_to():
     result = _presentation(tuning_candidate_hz=6_432_100.0)
     assert result.autotune_enabled is True
-    assert result.autotune_text == "Autotune: 6.43 MHz"
+    assert result.autotune_text == "Recall Tuned Frequency: 6.43 MHz"
 
 
 def test_a_busy_tuner_blocks_a_second_autotune():
@@ -727,7 +727,10 @@ def test_emergency_stop_is_never_disabled_by_any_control_state() -> None:
 def test_the_zvs_button_becomes_a_stop_button_while_a_search_runs() -> None:
     panel = _FakeSmuPanel()
     panel.apply_control_state(_controls(stop_zvs=True, hardware_actions=False))
-    assert panel.zvs_button.options == {"state": "normal", "text": "Stop ZVS"}
+    assert panel.zvs_button.options == {
+        "state": "normal",
+        "text": "Stop Voltage Tune",
+    }
 
 
 def test_a_stoppable_search_stays_enabled_even_with_no_hardware_actions() -> None:

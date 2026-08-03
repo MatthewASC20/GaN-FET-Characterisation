@@ -212,7 +212,7 @@ class PlannerTab(ttk.Frame):
         self.find_zvs_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             ctrl_frame,
-            text="Find ZVS before each run",
+            text="Tune DC Voltage before each run",
             variable=self.find_zvs_var,
         ).pack(side="left", padx=15)
 

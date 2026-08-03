@@ -2,6 +2,23 @@
 
 `gan_fet` is the production package.
 
+## Naming glossary
+
+Operator-facing and code vocabulary follows a fixed grammar. When adding a
+feature or label, pick the word from this table rather than inventing a new
+one:
+
+| Word | Reserved meaning |
+|---|---|
+| **Tune** | a live, measured search that moves one named knob (Tune DC Voltage, Tune Frequency) |
+| **Recall** | applying a stored result from a prior run — no search (Recall Tuned Frequency) |
+| **Controller** | closed-loop regulation to a setpoint, not a search (`PeakVoltageController`) |
+| **ZVS** | the measured physical phenomenon only — the scope's dwell measurement (P4), its threshold, and the ZVS *point* a voltage tune lands on |
+
+The DC voltage tune was historically called the "ZVS search" and the frequency
+recall was called "Autotune"; internal identifiers (`zvs_tuner`, `find_zvs`,
+`autotune`) still carry the old names until the code-identifier rename lands.
+
 ## Layering
 
 Dependencies point down this list:

@@ -149,13 +149,13 @@ EXPERIMENT_PLOT_ROWSPAN = int(ExperimentRow.FLEX_SPACER) + 1
 
 HARDWARE_OPERATION_LABELS = {
     "apply_wavegen": "apply wavegen settings",
-    "autotune": "autotune the wavegen",
+    "autotune": "recall the tuned frequency",
     "bus_off": "control the bus output",
     "experiment": "start an experiment",
     "reset_safety": "reset the safety interlock",
     "sequence": "start an auto sequence",
     "simulation_validation": "start the simulated validation run",
-    "zvs": "run a ZVS search",
+    "zvs": "tune the DC voltage",
 }
 
 # Confirm-button state colours (unchanged from v1)
@@ -412,7 +412,7 @@ class MainWindow(tk.Tk):
         self._refresh_control_states()
 
     def _apply_zvs_visibility(self) -> None:
-        """Show or hide the voltage-only ZVS control per the Config setting."""
+        """Show or hide the DC voltage tune control per the Config setting."""
         controls = getattr(self, "run_controls", None)
         if controls is None:
             return
@@ -921,7 +921,7 @@ class MainWindow(tk.Tk):
         ttk.Separator(advanced, orient="horizontal").pack(fill="x", padx=8)
         ttk.Checkbutton(
             advanced,
-            text="Show voltage-only ZVS sweep",
+            text="Show DC voltage tune controls",
             variable=self.show_zvs_sweep_var,
             command=self._on_show_zvs_sweep_toggled,
         ).pack(anchor="w", padx=8, pady=6)
@@ -929,8 +929,8 @@ class MainWindow(tk.Tk):
             advanced,
             text=(
                 "The frequency search holds Vds peak on target.\n"
-                "The ZVS sweep moves the bus off it, and is kept\n"
-                "mainly to exercise the two independently."
+                "The DC voltage tune moves the bus off it, and is\n"
+                "kept mainly to exercise the two independently."
             ),
             justify="left",
         ).pack(anchor="w", padx=8, pady=(0, 6))

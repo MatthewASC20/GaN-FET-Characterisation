@@ -91,8 +91,8 @@ To rehearse one complete test:
 
 1. Select the device and matrix point. `SIMULATED-DUT` is created for a new
    simulation profile.
-2. Leave **Find ZVS before run** unchecked for a quick check, or enable it to
-   rehearse the real ZVS search too.
+2. Leave **Tune DC Voltage before run** unchecked for a quick check, or enable
+   it to rehearse the real DC voltage tune too.
 3. Click **Run 6 s Procedure Validation**. This applies the virtual wavegen
    settings and executes the normal experiment engine: HDO4054 identity check,
    gate arming, SMU soft start, closed-loop Vds control, sampling, final
@@ -117,17 +117,19 @@ target Vds peak) the app:
 1. soft-starts the SMU from 0 V and **closed-loop ramps the bus until the
    scope-measured Vds peak equals the selected 200/300/400 V target** —
    no manual bench-supply adjustment;
-2. optionally runs a **ZVS search** (steps the bus voltage to find the DC
-   input-current minimum) before sampling;
+2. optionally runs a **DC voltage tune** (steps the bus voltage to the DC
+   input-current minimum — the ZVS point) before sampling;
 3. samples DC current/voltage on a fixed cadence into SQLite, with a live
    plot;
 4. captures final readings (Vin, Iin, tuned fsw, Irms, Vds pk, Isw RMS)
    and an oscilloscope screenshot;
 5. ramps the bus back to 0 V and switches the output off.
 
-**Autotune** ramps the gate frequency to the switching frequency measured in
-a previous run of the same point (same temperature/config first, then other
-configs, then 25 °C equivalents). **Auto Sequence** runs every remaining
+**Recall Tuned Frequency** (formerly *Autotune*) ramps the gate frequency to
+the switching frequency measured in a previous run of the same point (same
+temperature/config first, then other configs, then 25 °C equivalents). It
+recalls a stored result; the live search is the **Tune frequency at operating
+point** option in Configuration > Advanced. **Auto Sequence** runs every remaining
 matrix point at the selected frequency, pausing only for chamber
 temperature changes.
 

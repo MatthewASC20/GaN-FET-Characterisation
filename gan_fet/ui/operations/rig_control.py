@@ -489,12 +489,13 @@ class RigOperations:
             )
             actual = self.wavegen_controller.tuned_freq_hz
             if token.cancel_event.is_set():
-                raise InterruptedError("autotune cancelled")
+                raise InterruptedError("frequency recall cancelled")
             # Readback, not "the call returned": a ramp that stopped short
             # leaves the gate at a frequency nobody chose.
             if actual is None or abs(actual - target) > 1.0:
                 raise RuntimeError(
-                    "Autotune stopped before the target frequency was applied"
+                    "Frequency recall stopped before the target frequency "
+                    "was applied"
                 )
 
         self.run(
@@ -522,19 +523,23 @@ class RigOperations:
                 # which is why this says where it stopped and what to do, not
                 # just that it failed.
                 self.ui.show_error(
-                    "Autotune Stopped",
+                    "Frequency Recall Stopped",
                     f"{error}\n\nThe gate is left at the frequency reached, "
                     "not the target. Reduce the bus voltage before retrying.",
                 )
                 self.ui.set_status(
-                    f"Autotune stopped at {error.frequency_hz / 1e6:.4f} MHz "
+                    f"Frequency recall stopped at "
+                    f"{error.frequency_hz / 1e6:.4f} MHz "
                     f"(Vds peak {error.peak_v:.0f} V)"
                 )
             elif not isinstance(error, InterruptedError):
-                self.ui.show_error("Autotune Error", f"Autotune failed: {error}")
-                self.ui.set_status("Autotune failed.")
+                self.ui.show_error(
+                    "Recall Tuned Frequency",
+                    f"Frequency recall failed: {error}",
+                )
+                self.ui.set_status("Frequency recall failed.")
             else:
-                self.ui.set_status("Autotune cancelled.")
+                self.ui.set_status("Frequency recall cancelled.")
         else:
             self.ui.flash(
                 f"Tuned frequency {int(target)} Hz applied\n"
@@ -559,7 +564,7 @@ class RigOperations:
             return False
         self.operations.cancel_active()
         self.ui.zvs_stopping()
-        self.ui.set_status("Stopping ZVS search safely...")
+        self.ui.set_status("Stopping the DC voltage tune safely...")
         return True
 
     def launch_zvs(self, *, target_peak_v: float, config: str) -> None:
@@ -575,14 +580,14 @@ class RigOperations:
         if token is None:
             return
         self.ui.set_tuning(True)
-        self.ui.set_status("Preparing the HDO4054-verified ZVS search...")
+        self.ui.set_status("Preparing the HDO4054-verified DC voltage tune...")
 
         abort_check = partial(
             raise_if_aborted,
             cancelled=token.cancel_event.is_set,
             safety=self.safety,
             trip_error=SafetyTrip,
-            what="ZVS search",
+            what="DC voltage tune",
         )
 
         def worker() -> None:
@@ -616,7 +621,7 @@ class RigOperations:
                     status=self.ui.set_status_async,
                 )
                 if token.cancel_event.is_set():
-                    raise InterruptedError("ZVS search cancelled")
+                    raise InterruptedError("DC voltage tune cancelled")
             except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
                 error = exc
             finally:
@@ -648,7 +653,7 @@ class RigOperations:
                     )
             except BaseException as cleanup_exc:
                 error = RuntimeError(
-                    f"ZVS cleanup was not confirmed: {cleanup_exc}"
+                    f"DC voltage tune cleanup was not confirmed: {cleanup_exc}"
                 )
                 try:
                     # A failed output-off confirmation is a safety event even
@@ -677,15 +682,17 @@ class RigOperations:
         self.ui.smu_state_changed()
         if error is not None:
             if not isinstance(error, InterruptedError):
-                self.ui.show_error("Find ZVS", f"ZVS search failed: {error}")
-                self.ui.set_status("ZVS search failed.")
+                self.ui.show_error(
+                    "Tune DC Voltage", f"DC voltage tune failed: {error}"
+                )
+                self.ui.set_status("DC voltage tune failed.")
             else:
-                self.ui.set_status("ZVS search cancelled; outputs are OFF.")
+                self.ui.set_status("DC voltage tune cancelled; outputs are OFF.")
         elif result is None:
-            self.ui.set_status("ZVS search found no improvement.")
+            self.ui.set_status("DC voltage tune found no improvement.")
         else:
             self.ui.set_status(
-                f"ZVS point: {result.v_zvs:.1f} V "
-                f"({result.i_min * 1000:.2f} mA). "
-                "Search complete; bus and gate outputs are OFF."
+                f"DC voltage tuned to {result.v_zvs:.1f} V "
+                f"(ZVS point, {result.i_min * 1000:.2f} mA). "
+                "Bus and gate outputs are OFF."
             )

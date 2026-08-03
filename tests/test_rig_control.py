@@ -23,7 +23,7 @@ from gan_fet.ui.widgets import OperationCoordinator
 LABELS = {
     "apply_wavegen": "apply wavegen settings",
     "bus_off": "control the bus output",
-    "zvs": "run a ZVS search",
+    "zvs": "tune the DC voltage",
     "reset_safety": "reset the safety interlock",
 }
 
@@ -756,7 +756,7 @@ def _zvs(safety=None, engine=None, wavegen=None, smu=None):
 def test_a_clean_zvs_search_reports_the_point_it_found():
     engine = _ZvsEngine(result=SimpleNamespace(v_zvs=95.4, i_min=0.0327))
     rig, ui, _safety = _zvs(engine=engine)
-    assert _said(ui, "ZVS point: 95.4 V (32.70 mA)")
+    assert _said(ui, "DC voltage tuned to 95.4 V (ZVS point, 32.70 mA)")
     assert _said(ui, "outputs are OFF")
 
 
@@ -825,7 +825,7 @@ def test_a_trip_landing_mid_arm_never_energizes_the_bus():
     )
     rig, ui, _safety = _zvs(safety=safety)
     assert safety.bus_enable_attempts == 0
-    assert _said(ui, "ZVS search failed.") or ui.errors
+    assert _said(ui, "DC voltage tune failed.") or ui.errors
 
 
 def test_a_gate_that_does_not_confirm_armed_never_energizes_the_bus():
@@ -840,7 +840,7 @@ def test_stopping_a_running_search_reports_and_cancels():
     assert token is not None
     assert rig.request_zvs_stop() is True
     assert token.cancel_event.is_set()
-    assert _said(ui, "Stopping ZVS search safely...")
+    assert _said(ui, "Stopping the DC voltage tune safely...")
 
 
 def test_stopping_when_nothing_is_running_does_nothing():

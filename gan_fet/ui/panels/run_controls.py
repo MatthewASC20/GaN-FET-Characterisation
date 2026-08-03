@@ -1,8 +1,8 @@
-"""The run-setup row: duration, the ZVS sweep toggle, and the two rig buttons.
+"""The run-setup row: duration, the DC voltage tune toggle, and the rig buttons.
 
 Owns construction, layout and the one piece of layout logic that is genuinely
-its own — whether the voltage-only ZVS checkbox is on screen at all. Everything
-these buttons do belongs to the window.
+its own — whether the voltage-only tune checkbox is on screen at all.
+Everything these buttons do belongs to the window.
 """
 
 from __future__ import annotations
@@ -15,9 +15,9 @@ from gan_fet.ui.telemetry_format import last_current_text
 from gan_fet.ui.widgets import ColorButton, RigControlState, set_widget_enabled
 
 #: Shared geometry for the two rig buttons, which are sized to hold their
-#: longest label ("Apply Wavegen Settings", "Autotune Unavailable").
+#: longest label ("Apply Wavegen Settings", "Recall Tuned Frequency: 27.12 MHz").
 _RIG_BUTTON = {
-    "width": 170,
+    "width": 230,
     "height": 36,
     "borderless": 1,
     "highlightthickness": 1,
@@ -25,7 +25,7 @@ _RIG_BUTTON = {
 
 
 class RunControls:
-    """Duration, ZVS toggle, last-current readout and the two rig buttons.
+    """Duration, DC voltage tune toggle, last-current readout and rig buttons.
 
     Not a widget subclass: these span two rows of the experiment grid and have
     to land in the parent's geometry rather than in a frame of their own.
@@ -56,10 +56,11 @@ class RunControls:
 
         # Frequency tuning is on by default and lives in Config > Advanced:
         # it is part of establishing the operating point, not a per-run choice.
-        # The voltage-only ZVS sweep is kept mainly to exercise the frequency
-        # search independently, so it stays hidden unless revealed in Config.
+        # The voltage-only DC voltage tune is kept mainly to exercise the
+        # frequency search independently, so it stays hidden unless revealed
+        # in Config.
         self.find_zvs_checkbox = ttk.Checkbutton(
-            parent, text="Find ZVS before run", variable=find_zvs_var
+            parent, text="Tune DC Voltage before run", variable=find_zvs_var
         )
 
         self.last_current_label = ttk.Label(parent, text=last_current_text(None))
@@ -79,7 +80,7 @@ class RunControls:
 
         self.autotune_button = ColorButton(
             parent,
-            text="Autotune Unavailable",
+            text="No Tuned Frequency Stored",
             command=on_autotune,
             **_RIG_BUTTON,
         )
@@ -88,7 +89,7 @@ class RunControls:
         )
 
     def set_zvs_sweep_visible(self, visible: bool) -> None:
-        """Show or hide the voltage-only ZVS control.
+        """Show or hide the voltage-only DC voltage tune control.
 
         Hiding it clears it. A control the operator cannot see must not keep
         silently steering the run.
@@ -112,11 +113,11 @@ class RunControls:
     def apply_control_state(self, controls: RigControlState) -> None:
         """Enable or disable these controls for one snapshot of rig state.
 
-        Autotune is only ever *disabled* here, never enabled. Whether it can
-        run depends on more than the rig state — there has to be a tuning
-        candidate to move to — and that is resolved separately by the
-        confirm-state refresh. Enabling it from here would offer a button that
-        does nothing.
+        The recall button is only ever *disabled* here, never enabled. Whether
+        it can run depends on more than the rig state — there has to be a
+        stored tuned frequency to move to — and that is resolved separately by
+        the confirm-state refresh. Enabling it from here would offer a button
+        that does nothing.
         """
         set_widget_enabled(self.duration_entry, controls.edit_inputs)
         set_widget_enabled(self.find_zvs_checkbox, controls.edit_inputs)

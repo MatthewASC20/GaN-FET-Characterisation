@@ -180,7 +180,10 @@ class ZvsTuner:
             if next_i is None:
                 break
             if status is not None:
-                status(f"ZVS search: {next_v:.1f} V → {next_i * 1000:.2f} mA")
+                status(
+                    f"DC voltage tune: {next_v:.1f} V → "
+                    f"{next_i * 1000:.2f} mA"
+                )
             if next_i < best_i - cfg.min_improvement_a:
                 best_v, best_i = next_v, next_i
             else:
