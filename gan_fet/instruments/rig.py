@@ -73,25 +73,12 @@ def resolve_instrument_roles(settings: Settings) -> dict[str, str]:
         (SCOPE_INSTRUMENT_KEY,),
         f"{SCOPE_INSTRUMENT_KEY} oscilloscope",
     )
-    smu_candidates = (
-        "K2410",
-        "K2400",
-        "Keithley2410",
-        "Keithley2400",
-        *(
-            name
-            for name in settings.instruments
-            if name.upper().startswith("K24")
-            or "KEITHLEY" in name.upper()
-            or "SMU" in name.upper()
-        ),
-    )
     return {
         "wavegen": _first_configured(
             settings, ("SDG6022X",), "waveform generator"
         ),
         "scope": scope_key,
-        "smu": _first_configured(settings, smu_candidates, "SMU"),
+        "smu": _first_configured(settings, ("K2410",), "SMU"),
     }
 
 
@@ -109,20 +96,13 @@ def build_instrument_rig(settings: Settings, *, simulate: bool = False) -> Instr
     plant = SimulatedRigPlant(resonant_model=True) if simulate else None
     clients: list[Any] = []
 
-    def make_client(name: str, *, is_smu: bool = False) -> Any:
+    def make_client(name: str) -> Any:
         if simulate:
             created: Any = MockScpiTcpClient(name, shared_plant=plant)
             log.info("Using virtual instrument %s", name)
         else:
             address = settings.instruments[name]
-            created = ScpiTcpClient(
-                name,
-                address.ip,
-                address.port,
-                prologix_addr=(
-                    settings.smu.prologix_gpib_addr if is_smu else None
-                ),
-            )
+            created = ScpiTcpClient(name, address.ip, address.port)
             description = getattr(getattr(created, "transport", None), "description", None)
             log.info("Instrument %s resolved to %s", name, description or address.ip)
         clients.append(created)
@@ -136,7 +116,7 @@ def build_instrument_rig(settings: Settings, *, simulate: bool = False) -> Instr
             if "SDM3055" in settings.instruments
             else None
         )
-        smu = Keithley2410(make_client(roles["smu"], is_smu=True), settings.smu)
+        smu = Keithley2410(make_client(roles["smu"]), settings.smu)
         # The controller gets the scope and a ramp ceiling below the interlock,
         # so a standalone frequency move is halted before a trip rather than
         # after one. Sits under the hard ceiling by the same margin the

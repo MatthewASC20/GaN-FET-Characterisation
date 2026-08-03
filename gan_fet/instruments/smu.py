@@ -1,12 +1,9 @@
 """Keithley 2400-series SMU (2400/2410/...) — DC bus source AND input-current meter.
 
 Replaces both the manual bench PSU and the legacy Prologix-USB GPIB ammeter.
-Reached over the network via a GPIB/serial-to-LAN bridge:
-
-* transparent bridge → plain SCPI over the TCP socket (leave
-  `prologix_gpib_addr` unset);
-* Prologix GPIB-ETHERNET → set `prologix_gpib_addr`; the transport sends
-  the `++` controller framing before any SCPI (default bridge port 1234).
+Reached over direct VISA, plain TCP, or a Prologix bridge; the connection
+target expresses the transport (a `prologix+...` URI carries the GPIB
+address), so this driver never handles controller framing itself.
 
 The SMU sources voltage and senses current, so a single `:READ?` yields the
 bus voltage at its terminals and the DC input current of the rig.
@@ -37,22 +34,6 @@ class Keithley2400(SmuInterface):
         self._setpoint_v = 0.0
         self._output_on = False
         self._initialized = False
-
-        # Legacy application code constructs every instrument client from an
-        # (ip, port) pair and only the SMU settings know the GPIB address.
-        # Configure the transport here, before any command can open it.  VISA
-        # clients explicitly decline the wrapper because VISA owns addressing.
-        gpib_addr = self.settings.prologix_gpib_addr
-        if gpib_addr is not None and not getattr(
-            self.client, "handles_prologix_framing", False
-        ):
-            configure = getattr(self.client, "configure_prologix", None)
-            if callable(configure):
-                configure(gpib_addr)
-            elif not getattr(self.client, "is_visa", False):
-                log.warning(
-                    "SMU client cannot configure Prologix framing; using plain SCPI"
-                )
 
     # -- lifecycle -------------------------------------------------------
 

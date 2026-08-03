@@ -196,8 +196,7 @@ def test_smu_never_sends_prologix_commands_to_direct_visa():
     client = ScpiTcpClient("K2410", "GPIB0::24::INSTR", 9600)
     recorder = RecordingTransport()
     client.transport = recorder
-    settings = SmuSettings(prologix_gpib_addr=24)
-    smu = Keithley2400(client, settings)
+    smu = Keithley2400(client, SmuSettings())
 
     assert smu.initialize()
     smu.go_local()
@@ -207,9 +206,9 @@ def test_smu_never_sends_prologix_commands_to_direct_visa():
     assert all(not command.startswith("++") for command in recorder.writes)
 
 
-def test_legacy_tcp_smu_is_wrapped_before_first_command():
-    client = ScpiTcpClient("K2410", "127.0.0.1", 1234)
-    Keithley2400(client, SmuSettings(prologix_gpib_addr=24))
+def test_a_prologix_uri_target_is_wrapped_before_first_command():
+    """The bridge lives in the target URI; no driver involvement needed."""
+    client = ScpiTcpClient("K2410", "prologix+tcp://127.0.0.1:1234?addr=24", 0)
 
     assert client.uses_prologix
     assert isinstance(client.transport, PrologixFraming)

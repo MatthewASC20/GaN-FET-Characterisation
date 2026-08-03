@@ -229,11 +229,10 @@ def _normalize_scope_payload(
 class SmuSettings:
     """Keithley 2400-series SMU source/measure configuration.
 
-    The GPIB address is needed only for a Prologix serial/Ethernet bridge.
-    Direct VISA resources already contain their GPIB address.
+    A Prologix bridge is expressed in the instrument target URI
+    (``prologix+tcp://host:port?addr=N``), never as a separate field.
     """
 
-    prologix_gpib_addr: Optional[int] = None
     max_voltage_v: float = 1100.0
     current_compliance_a: float = 0.1
     nplc: float = 1.0
@@ -816,6 +815,69 @@ class Settings:
         ):
             if legacy in raw and current not in raw:
                 raw[current] = raw.pop(legacy)
+
+        # smu.prologix_gpib_addr used to pair with a legacy host/port target;
+        # the bridge is now expressed in the target itself
+        # (prologix+tcp://host:port?addr=N). Fold the pair into that URI and
+        # retire the field. A VISA resource performs its own GPIB addressing,
+        # so there the address is dropped outright.
+        smu_raw = raw.get("smu")
+        if isinstance(smu_raw, dict) and "prologix_gpib_addr" in smu_raw:
+            smu_raw = dict(smu_raw)
+            addr = smu_raw.pop("prologix_gpib_addr")
+            raw["smu"] = smu_raw
+            entry = None
+            instruments = raw.get("instruments")
+            if isinstance(instruments, dict):
+                for key, value in instruments.items():
+                    up = str(key).upper()
+                    if (
+                        up.startswith("K24")
+                        or "KEITHLEY" in up
+                        or "SMU" in up
+                    ) and isinstance(value, dict):
+                        entry = value
+                        break
+            valid = (
+                isinstance(addr, int)
+                and not isinstance(addr, bool)
+                and 0 <= addr <= 30
+            )
+            if entry is not None and valid:
+                target = str(entry.get("ip", "")).strip()
+                port = entry.get("port")
+                if (
+                    "://" in target
+                    or target.upper().startswith("GPIB")
+                    or "::" in target
+                ):
+                    log.warning(
+                        "Dropping smu.prologix_gpib_addr: target %s carries "
+                        "its own addressing",
+                        target,
+                    )
+                elif target.upper().startswith("COM") or target.startswith("/"):
+                    baud = (
+                        port
+                        if isinstance(port, int)
+                        and not isinstance(port, bool)
+                        and port > 0
+                        else 9600
+                    )
+                    entry["ip"] = (
+                        f"prologix+serial://{target}?baud={baud}&addr={addr}"
+                    )
+                    entry["port"] = 0
+                elif target:
+                    tcp_port = (
+                        port
+                        if isinstance(port, int)
+                        and not isinstance(port, bool)
+                        and 0 < port <= 65535
+                        else 1234
+                    )
+                    entry["ip"] = f"prologix+tcp://{target}:{tcp_port}?addr={addr}"
+                    entry["port"] = 0
         settings = cls()
 
         instrument_raw = raw.get("instruments")
@@ -828,7 +890,14 @@ class Settings:
             for name, value in ordered:
                 if not isinstance(value, dict):
                     continue
-                canonical = "K2410" if name == "K2400" else str(name)
+                up = str(name).upper()
+                canonical = (
+                    "K2410"
+                    if up.startswith("K24")
+                    or "KEITHLEY" in up
+                    or "SMU" in up
+                    else str(name)
+                )
                 try:
                     if isinstance(value.get("port"), bool):
                         raise ValueError("boolean port")
@@ -1009,18 +1078,6 @@ class Settings:
             )
             settings.safety.max_vds_peak_v = defaults.safety.max_vds_peak_v
 
-        gpib = settings.smu.prologix_gpib_addr
-        if gpib is not None:
-            if (
-                isinstance(gpib, bool)
-                or not isinstance(gpib, int)
-                or not 0 <= gpib <= 30
-            ):
-                log.warning(
-                    "Invalid setting smu.prologix_gpib_addr=%r; disabling it",
-                    gpib,
-                )
-                settings.smu.prologix_gpib_addr = None
 
         for name, address in list(settings.instruments.items()):
             target = address.ip.strip() if isinstance(address.ip, str) else ""
@@ -1049,28 +1106,6 @@ class Settings:
                 else:
                     settings.instruments[name] = dataclasses.replace(fallback)
 
-        # A VISA resource already performs GPIB addressing. Older settings and
-        # the pre-refactor editor could persist both modes at once, causing
-        # Prologix controller commands to be sent directly to the Keithley.
-        smu_address = next(
-            (
-                address
-                for name, address in settings.instruments.items()
-                if name.upper().startswith("K24")
-                or "KEITHLEY" in name.upper()
-                or "SMU" in name.upper()
-            ),
-            None,
-        )
-        if smu_address is not None:
-            target = smu_address.ip.strip()
-            if target.upper().startswith("GPIB") or "::" in target:
-                if settings.smu.prologix_gpib_addr is not None:
-                    log.warning(
-                        "Ignoring smu.prologix_gpib_addr for direct VISA resource %s",
-                        target,
-                    )
-                settings.smu.prologix_gpib_addr = None
 
         google = settings.google
         default_google = defaults.google

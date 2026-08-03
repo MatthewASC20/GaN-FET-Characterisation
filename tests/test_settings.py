@@ -234,7 +234,7 @@ def test_malformed_settings_are_not_overwritten(tmp_path):
     assert path.read_text() == original
 
 
-def test_direct_visa_disables_legacy_prologix_framing():
+def test_direct_visa_drops_the_legacy_prologix_field():
     loaded = Settings._from_dict(
         {
             "instruments": {"K2410": {"ip": "GPIB0::24::INSTR", "port": 9600}},
@@ -242,7 +242,35 @@ def test_direct_visa_disables_legacy_prologix_framing():
         }
     )
 
-    assert loaded.smu.prologix_gpib_addr is None
+    assert not hasattr(loaded.smu, "prologix_gpib_addr")
+    assert loaded.instruments["K2410"].target == "GPIB0::24::INSTR"
+
+
+def test_legacy_prologix_pair_folds_into_a_target_uri():
+    """A legacy (host, port) + GPIB address pair becomes one prologix+ URI."""
+    loaded = Settings._from_dict(
+        {
+            "instruments": {"K2410": {"ip": "192.0.2.7", "port": 1234}},
+            "smu": {"prologix_gpib_addr": 24},
+        }
+    )
+
+    address = loaded.instruments["K2410"]
+    assert address.target == "prologix+tcp://192.0.2.7:1234?addr=24"
+    assert address.port == 0
+
+
+def test_legacy_prologix_serial_pair_folds_with_its_baud():
+    loaded = Settings._from_dict(
+        {
+            "instruments": {"Keithley2400": {"ip": "COM3", "port": 19200}},
+            "smu": {"prologix_gpib_addr": 12},
+        }
+    )
+
+    address = loaded.instruments["K2410"]
+    assert address.target == "prologix+serial://COM3?baud=19200&addr=12"
+    assert address.port == 0
 
 
 def test_explicit_transport_uri_accepts_zero_legacy_port():

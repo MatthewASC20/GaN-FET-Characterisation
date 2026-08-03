@@ -20,9 +20,9 @@ current readback is the DC input current — no separate series ammeter.
 **GPIB connection:** A bench using direct VISA can set the Keithley target to
 `GPIB0::24::INSTR`. For a Prologix bridge, use an explicit target such as
 `prologix+serial://COM3?baud=9600&addr=24` or
-`prologix+tcp://bridge-host:1234?addr=24`. Legacy host/port settings can use
-the separate optional Prologix address. Direct VISA is never sent `++`
-controller commands.
+`prologix+tcp://bridge-host:1234?addr=24`. Older settings files that used the
+separate Prologix address field are folded into that URI form automatically on
+load. Direct VISA is never sent `++` controller commands.
 
 The shipped bench defaults assume the control PC is `10.11.13.10/24`, the
 SDG6022X is `10.11.13.230:5025`, and the HDO4054 is `10.11.13.231`. The PC

@@ -194,8 +194,11 @@ circuit-accurate model** and must never be presented as characterisation results
 - Scope Remote mode must be **LXI** (VXI-11). Raw line TCP and direct VICP
   sockets are not supported — VICP needs framing a newline-delimited socket
   cannot provide.
-- `smu.prologix_gpib_addr` is for legacy TCP/serial address pairs only. Leave
-  blank for direct VISA. A VISA resource is never wrapped in Prologix framing.
+- A Prologix bridge is expressed in the instrument target itself
+  (`prologix+tcp://host:port?addr=N`); there is no separate GPIB-address
+  setting. A VISA resource is never wrapped in Prologix framing. Settings
+  files from before this change fold the retired `smu.prologix_gpib_addr`
+  field into the URI on load.
 
 ## Conventions
 

@@ -82,9 +82,9 @@ is now a transport-neutral target. Supported forms include:
 - Prologix: `prologix+serial://COM3?baud=9600&addr=24` or
   `prologix+tcp://bridge-host:1234?addr=24`.
 
-`smu.prologix_gpib_addr` exists only for legacy TCP/serial address pairs. Leave
-it blank for direct VISA and explicit URIs. A VISA resource is never wrapped in
-Prologix framing.
+A Prologix bridge is expressed in the target URI itself; the retired
+`smu.prologix_gpib_addr` field is folded into that URI when an old settings
+file is loaded. A VISA resource is never wrapped in Prologix framing.
 
 The shipped bench defaults are `10.11.13.230:5025` for the SDG6022X,
 `TCPIP0::10.11.13.231::inst0::INSTR` for the HDO4054, and

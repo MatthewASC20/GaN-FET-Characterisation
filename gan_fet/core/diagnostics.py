@@ -51,11 +51,6 @@ class DiagnosticReport:
         return "\n".join(lines)
 
 
-def _is_smu_name(name: str) -> bool:
-    """Recognize historical names used for the 2400-series SMU."""
-    upper = name.upper()
-    return upper.startswith("K24") or "KEITHLEY" in upper or "SMU" in upper
-
 
 def run_hardware_diagnostics(settings: Settings, timeout_s: float = 2.0) -> DiagnosticReport:
     """Check connectivity and validate configured instrument identities.
@@ -73,19 +68,10 @@ def run_hardware_diagnostics(settings: Settings, timeout_s: float = 2.0) -> Diag
         start_time = time.time()
         client: Optional[ScpiTcpClient] = None
         try:
-            prologix_addr = (
-                settings.smu.prologix_gpib_addr if _is_smu_name(name) else None
-            )
             # Construction belongs inside the per-instrument guard: address
             # parsing can fail before a connection exists, and one malformed
             # entry must not prevent diagnostics for the remaining bench.
-            client = ScpiTcpClient(
-                name,
-                addr.ip,
-                addr.port,
-                timeout=timeout_s,
-                prologix_addr=prologix_addr,
-            )
+            client = ScpiTcpClient(name, addr.ip, addr.port, timeout=timeout_s)
             if not client.connect():
                 raise ConnectionError(f"could not open connection to {addr.ip}:{addr.port}")
             response: Optional[str]

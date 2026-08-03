@@ -17,7 +17,6 @@ from gan_fet.ui.config_tab import (
     SmuLimitsEditor,
     options_without_indices,
     validate_instrument_target,
-    validate_optional_prologix_address,
 )
 from gan_fet.ui.main_window import (
     EXPERIMENT_CONTROL_COLUMNS,
@@ -483,16 +482,6 @@ def test_instrument_editor_validation_is_transport_neutral() -> None:
         validate_instrument_target("unsupported://target", "0")
 
 
-def test_optional_prologix_address_cannot_conflict_with_owned_addressing() -> None:
-    assert validate_optional_prologix_address("", "GPIB0::24::INSTR") is None
-    assert validate_optional_prologix_address("24", "192.0.2.5") == 24
-    with pytest.raises(ValueError):
-        validate_optional_prologix_address("24", "GPIB0::24::INSTR")
-    with pytest.raises(ValueError):
-        validate_optional_prologix_address(
-            "24", "prologix+serial://COM3?baud=9600&addr=24"
-        )
-
 
 def test_instrument_apply_rolls_back_scope_address_on_save_failure(
     monkeypatch,
@@ -509,7 +498,6 @@ def test_instrument_apply_rolls_back_scope_address_on_save_failure(
         def __init__(self) -> None:
             self.instruments = original_instruments
             self.scope_model = "HDO4054"
-            self.smu = SimpleNamespace(prologix_gpib_addr=None)
 
         def save(self) -> None:
             raise OSError("disk full")
@@ -517,7 +505,6 @@ def test_instrument_apply_rolls_back_scope_address_on_save_failure(
     settings = _FailingSettings()
     editor = object.__new__(InstrumentConfigEditor)
     editor.settings = settings
-    editor.prologix_addr_entry = _FakeVar("")
     editor.instrument_entries = {
         "HDO4054": {
             "target": _FakeVar("TCPIP0::192.0.2.50::inst0::INSTR"),
@@ -548,7 +535,6 @@ def test_instrument_apply_rolls_back_scope_address_on_save_failure(
         == "TCPIP0::192.0.2.10::inst0::INSTR"
     )
     assert settings.scope_model == "HDO4054"
-    assert settings.smu.prologix_gpib_addr is None
     assert not applied
     assert errors and "disk full" in errors[0][1]
 
@@ -566,7 +552,6 @@ def test_instrument_apply_updates_fixed_hdo_connection_without_changing_identity
                 "K2410": InstrumentAddress("GPIB0::24::INSTR", 0),
             }
             self.scope_model = "HDO4054"
-            self.smu = SimpleNamespace(prologix_gpib_addr=None)
             self.save_calls = 0
 
         def save(self) -> None:
@@ -575,7 +560,6 @@ def test_instrument_apply_updates_fixed_hdo_connection_without_changing_identity
     settings = _Settings()
     editor = object.__new__(InstrumentConfigEditor)
     editor.settings = settings
-    editor.prologix_addr_entry = _FakeVar("")
     editor.instrument_entries = {
         SCOPE_INSTRUMENT_KEY: {
             "target": _FakeVar("TCPIP0::192.0.2.50::inst0::INSTR"),

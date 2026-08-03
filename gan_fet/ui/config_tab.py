@@ -57,30 +57,6 @@ def validate_instrument_target(target_raw: str, port_raw: str) -> tuple[str, int
     return target, port
 
 
-def validate_optional_prologix_address(raw: str, smu_target: str) -> Optional[int]:
-    """Parse the legacy bridge address, rejecting modes that already own it."""
-
-    cleaned = raw.strip()
-    if not cleaned:
-        return None
-    target = smu_target.strip()
-    if "://" in target:
-        raise ValueError(
-            "leave Prologix address blank for explicit transport URIs; "
-            "put addr= in a prologix+ URI instead"
-        )
-    if target.upper().startswith("GPIB") or "::" in target:
-        raise ValueError(
-            "leave Prologix address blank for direct VISA resources"
-        )
-    try:
-        address = int(cleaned, 10)
-    except ValueError as exc:
-        raise ValueError("Prologix GPIB address must be blank or an integer") from exc
-    if not 0 <= address <= 30:
-        raise ValueError("Prologix GPIB address must be between 0 and 30")
-    return address
-
 
 class ParameterListEditor(ttk.LabelFrame):
     """Edit one option list (values with derived labels)."""
@@ -196,7 +172,11 @@ class ParameterListEditor(ttk.LabelFrame):
 
 
 class InstrumentConfigEditor(ttk.Frame):
-    """Transport-neutral instrument targets plus optional Prologix framing."""
+    """Transport-neutral instrument targets, one per instrument.
+
+    A Prologix bridge is part of the target itself
+    (``prologix+tcp://host:port?addr=N``), never a separate field.
+    """
 
     def __init__(self, master, settings: Settings, on_applied: Callable[[], None]):
         super().__init__(master)
@@ -277,27 +257,6 @@ class InstrumentConfigEditor(ttk.Frame):
         )
         connections.grid_columnconfigure(1, weight=1)
 
-        bridge = ttk.LabelFrame(self, text="Optional K2410 Prologix Framing")
-        bridge.pack(fill="x", expand=True, padx=2, pady=(0, 6))
-        ttk.Label(bridge, text="GPIB address:").grid(
-            row=0, column=0, padx=5, pady=5, sticky="w"
-        )
-        self.prologix_addr_entry = ttk.Entry(bridge, width=10)
-        prologix = self.settings.smu.prologix_gpib_addr
-        self.prologix_addr_entry.insert(0, "" if prologix is None else str(prologix))
-        self.prologix_addr_entry.grid(
-            row=0, column=1, padx=5, pady=5, sticky="w"
-        )
-        ttk.Label(
-            bridge,
-            text=(
-                "Leave blank for direct VISA, transparent TCP/serial SCPI, or an "
-                "explicit URI. Set 0–30 only for a legacy Prologix bridge target."
-            ),
-            wraplength=430,
-            justify="left",
-        ).grid(row=1, column=0, columnspan=2, padx=5, pady=(0, 5), sticky="w")
-        bridge.grid_columnconfigure(1, weight=1)
 
         ttk.Button(self, text="Apply Instrument Changes", command=self._apply).pack(
             fill="x", padx=2, pady=5
@@ -319,36 +278,13 @@ class InstrumentConfigEditor(ttk.Frame):
 
         pending = edited_addresses
 
-        smu_address = pending.get("K2410")
-        if smu_address is None:
-            smu_address = next(
-                (
-                    address
-                    for name, address in pending.items()
-                    if name.upper().startswith("K24")
-                    or "KEITHLEY" in name.upper()
-                    or "SMU" in name.upper()
-                ),
-                None,
-            )
-        try:
-            prologix_addr = validate_optional_prologix_address(
-                self.prologix_addr_entry.get(),
-                smu_address.ip if smu_address is not None else "",
-            )
-        except ValueError as exc:
-            messagebox.showerror("Validation Error", str(exc), parent=self)
-            return
 
         previous_instruments = self.settings.instruments
-        previous_prologix = self.settings.smu.prologix_gpib_addr
         self.settings.instruments = pending
-        self.settings.smu.prologix_gpib_addr = prologix_addr
         try:
             self.settings.save()
         except Exception as exc:
             self.settings.instruments = previous_instruments
-            self.settings.smu.prologix_gpib_addr = previous_prologix
             messagebox.showerror(
                 "Save Error", f"Could not save instrument settings: {exc}", parent=self
             )
