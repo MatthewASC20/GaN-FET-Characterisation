@@ -117,7 +117,6 @@ class PlannerTab(ttk.Frame):
         master,
         db: Database,
         get_device_name: Callable[[], str],
-        on_start_sequence: Callable[[PlanSummary, float, bool], None],
         on_apply_plan: Callable[[Optional[PlanSummary]], bool],
         on_delete_run: Optional[Callable[[MatrixPoint], None]] = None,
         can_delete_run: Optional[Callable[[], bool]] = None,
@@ -125,7 +124,6 @@ class PlannerTab(ttk.Frame):
         super().__init__(master)
         self.db = db
         self.get_device_name = get_device_name
-        self.on_start_sequence = on_start_sequence
         self.on_apply_plan = on_apply_plan
         self.on_delete_run = on_delete_run
         self.can_delete_run = can_delete_run
@@ -293,14 +291,6 @@ class PlannerTab(ttk.Frame):
         actions_frame = ttk.Frame(plan_tab)
         actions_frame.pack(fill="x", padx=5, pady=(5, 10))
 
-        self.run_btn = ttk.Button(
-            actions_frame,
-            text="Run Planned Sequence",
-            command=self._start_sequence,
-            state="disabled",
-        )
-        self.run_btn.pack(side="left", padx=(0, 10))
-
         self.export_btn = ttk.Button(
             actions_frame,
             text="Export Plan to CSV",
@@ -406,7 +396,6 @@ class PlannerTab(ttk.Frame):
         self.lbl_temp_prompts.config(text="Thermal Chamber Prompts: —")
 
         self.tree.delete(*self.tree.get_children())
-        self.run_btn.config(state="disabled")
         self.export_btn.config(state="disabled")
 
     def _display_plan(self, plan: PlanSummary, duration: float) -> None:
@@ -434,7 +423,6 @@ class PlannerTab(ttk.Frame):
         self._save_selections()
 
         has_runnable_points = len(plan.points) > 0
-        self.run_btn.config(state="normal" if has_runnable_points else "disabled")
         self.export_btn.config(state="normal" if has_runnable_points else "disabled")
 
     def _selection_state(self) -> tuple:
@@ -522,37 +510,6 @@ class PlannerTab(ttk.Frame):
         """Make the current plan the one the rig is working from."""
         plan = self.generate_plan(show_errors=True)
         self.on_apply_plan(plan)
-
-    def _start_sequence(self) -> None:
-        # Rebuilt at click time so edits made since the last apply cannot
-        # launch a stale matrix.
-        plan = self.generate_plan(show_errors=True)
-        if not plan or not plan.points:
-            messagebox.showwarning(
-                "No Test Plan",
-                "There is nothing to run. Select parameters above to build a "
-                "plan first.",
-            )
-            return
-
-        try:
-            duration = parse_positive_duration(self.duration_entry.get())
-        except (TypeError, ValueError) as exc:
-            messagebox.showerror(
-                "Input Error",
-                f"Please enter a finite, positive duration per test point.\n\n{exc}",
-                parent=self,
-            )
-            return
-
-        tune_voltage = self.tune_voltage_var.get()
-        # Apply first, and only start if it took. Declining the "replace the
-        # applied plan?" prompt and then starting anyway would leave the
-        # Planned Tests table describing one plan while the sequence ran
-        # another — the divergence this whole arrangement exists to prevent.
-        if not self.on_apply_plan(plan):
-            return
-        self.on_start_sequence(plan, duration, tune_voltage)
 
     def _export_csv(self) -> None:
         if not self.current_plan or not self.current_plan.points:

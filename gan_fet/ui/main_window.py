@@ -33,7 +33,6 @@ from gan_fet.ui.run_request import (
     InputRejected,
     build_experiment_params,
     build_matrix_point,
-    parse_positive_duration,
     require_populated_options,
     tuning_candidate,
 )
@@ -465,7 +464,6 @@ class MainWindow(tk.Tk):
             self.notebook,
             db=self.db,
             get_device_name=lambda: self.device_name_var.get(),
-            on_start_sequence=self._start_planned_sequence,
             on_apply_plan=self._apply_test_plan,
             on_delete_run=self.sheets.enqueue_clear,
             can_delete_run=lambda: not self.operations.busy and not self._closing,
@@ -1859,9 +1857,14 @@ class MainWindow(tk.Tk):
                 decision.title, decision.message, parent=self
             )
             return
-        params = self._build_params()
-        if params is None:
-            return
+        # Duration and the DC voltage tune option belong to the applied
+        # plan: the planner saved them with the selections, so the queue
+        # runs what was applied, not whatever the run fields say today.
+        stored = self.db.load_plan_selections(
+            self.device_name_var.get().strip()
+        )
+        duration_minutes = float(stored[2]) if stored else 1.0
+        tune_voltage = bool(stored[3]) if stored else True
         if not messagebox.askyesno(
             "Start Auto Sequence",
             f"This will run {len(plan)} tests across configurations, duties, voltages "
@@ -1873,7 +1876,7 @@ class MainWindow(tk.Tk):
         token = self._begin_operation("sequence")
         if token is None:
             return
-        if self.sequence.start(plan, params.duration_minutes, params.tune_voltage):
+        if self.sequence.start(plan, duration_minutes, tune_voltage):
             self.sequence_button.config(
                 text=(
                     "Stop Simulated Sequence"
@@ -1950,66 +1953,6 @@ class MainWindow(tk.Tk):
             "Test plan cleared. The queue follows the parameter selections again."
         )
         self._refresh_control_states()
-
-    def _start_planned_sequence(
-        self, plan_summary: Any, duration_minutes: float, tune_voltage: bool
-    ) -> None:
-        if not self._ensure_hardware_online(
-            HARDWARE_OPERATION_LABELS["sequence"]
-        ):
-            return
-        if self._safety_is_tripped():
-            messagebox.showwarning(
-                "Safety Interlock",
-                "Reset the latched safety trip before starting a sequence.",
-                parent=self,
-            )
-            return
-        if self.operations.busy or self.sequence.active:
-            messagebox.showinfo(
-                "Auto Sequence", "Another rig operation is already running.", parent=self
-            )
-            return
-        plan = [p.point for p in plan_summary.points]
-        if not plan:
-            messagebox.showwarning(
-                "Auto Sequence", "No test points in plan to execute.", parent=self
-            )
-            return
-        if not messagebox.askyesno(
-            "Start Planned Sequence",
-            f"This will run {len(plan)} planned test point(s).\n\n"
-            f"Estimated duration: {plan_summary.estimated_duration_minutes:.1f} minutes.\n\n"
-            "Voltage is set automatically by the SMU; you will only be prompted for chamber temperature changes.\n\n"
-            "Continue?",
-            parent=self,
-        ):
-            return
-        try:
-            duration_minutes = parse_positive_duration(str(duration_minutes))
-        except (TypeError, ValueError) as exc:
-            messagebox.showerror(
-                "Auto Sequence", f"Invalid test duration: {exc}", parent=self
-            )
-            return
-        token = self._begin_operation("sequence")
-        if token is None:
-            return
-        if self.sequence.start(plan, duration_minutes, tune_voltage):
-            self.sequence_button.config(
-                text=(
-                    "Stop Simulated Sequence"
-                    if self.is_simulated
-                    else "Stop Auto Sequence"
-                )
-            )
-            self.status_bar.set_message("Planned auto sequence starting...")
-            self.notebook.select(self.experiment_tab)
-        else:
-            self._finish_operation(token)
-            messagebox.showerror(
-                "Auto Sequence", "The planned sequence could not start.", parent=self
-            )
 
     def _prompt_operator(self, title: str, message: str) -> bool:
         if self.is_simulated:
