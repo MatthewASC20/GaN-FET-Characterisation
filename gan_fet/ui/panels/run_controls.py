@@ -12,7 +12,7 @@ from tkinter import ttk
 from typing import Callable
 
 from gan_fet.ui.telemetry_format import last_current_text
-from gan_fet.ui.widgets import ColorButton
+from gan_fet.ui.widgets import ColorButton, RigControlState, set_widget_enabled
 
 #: Shared geometry for the two rig buttons, which are sized to hold their
 #: longest label ("Apply Wavegen Settings", "Autotune Unavailable").
@@ -108,3 +108,18 @@ class RunControls:
 
     def set_last_current(self, amps: float | None) -> None:
         self.last_current_label.config(text=last_current_text(amps))
+
+    def apply_control_state(self, controls: RigControlState) -> None:
+        """Enable or disable these controls for one snapshot of rig state.
+
+        Autotune is only ever *disabled* here, never enabled. Whether it can
+        run depends on more than the rig state — there has to be a tuning
+        candidate to move to — and that is resolved separately by the
+        confirm-state refresh. Enabling it from here would offer a button that
+        does nothing.
+        """
+        set_widget_enabled(self.duration_entry, controls.edit_inputs)
+        set_widget_enabled(self.find_zvs_checkbox, controls.edit_inputs)
+        set_widget_enabled(self.confirm_button, controls.hardware_actions)
+        if not controls.frequency_actions:
+            self.autotune_button.config(state="disabled")

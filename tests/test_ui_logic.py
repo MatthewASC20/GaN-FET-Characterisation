@@ -29,8 +29,10 @@ from gan_fet.ui.main_window import (
     SIMULATION_VALIDATION_DURATION_MINUTES,
     mode_banner_presentation,
 )
+from gan_fet.ui.panels.smu_panel import SmuPanel
 from gan_fet.ui.tracker_view import format_run_details
 from gan_fet.ui.widgets import (
+    RigControlState,
     OperationCoordinator,
     resolve_confirm_presentation,
     resolve_rig_control_state,
@@ -67,6 +69,22 @@ class _FakeWidget:
 
     def config(self, **kwargs) -> None:
         self.options.update(kwargs)
+
+
+class _FakeSmuPanel:
+    """Stands in for SmuPanel, which cannot be built without a Tk root."""
+
+    def __init__(self) -> None:
+        self.zvs_button = _FakeWidget()
+        self.bus_off_button = _FakeWidget()
+        self.reset_safety_button = _FakeWidget()
+        self.estop_button = _FakeWidget()
+
+    def set_zvs_stopping(self) -> None:
+        self.zvs_button.config(text="Stopping...", state="disabled")
+
+    def apply_control_state(self, controls) -> None:
+        SmuPanel.apply_control_state(self, controls)
 
 
 class _FakeVar:
@@ -304,7 +322,7 @@ def test_manual_zvs_button_requests_cooperative_stop_before_hardware_checks() ->
     window.operations = OperationCoordinator()
     token = window.operations.try_begin("zvs")
     assert token is not None
-    window.zvs_button = _FakeWidget()
+    window.smu_panel = _FakeSmuPanel()
     messages = []
     window.status_bar = SimpleNamespace(set_message=messages.append)
     window._ensure_hardware_online = lambda _action: pytest.fail(
@@ -314,7 +332,7 @@ def test_manual_zvs_button_requests_cooperative_stop_before_hardware_checks() ->
     MainWindow._find_zvs_now(window)
 
     assert token.cancel_event.is_set()
-    assert window.zvs_button.options == {
+    assert window.smu_panel.zvs_button.options == {
         "text": "Stopping...",
         "state": "disabled",
     }
@@ -957,3 +975,72 @@ def test_a_busy_tuner_blocks_a_second_autotune():
 def test_confirm_follows_hardware_availability():
     assert _presentation(hardware_actions=False).confirm_enabled is False
     assert _presentation(hardware_actions=True).confirm_enabled is True
+
+
+# -- panels apply their own slice of the control state ------------------------
+
+
+def _controls(**overrides):
+    """A permissive control state, so each test names only what it varies."""
+    fields = {
+        "edit_inputs": True,
+        "local_actions": True,
+        "hardware_actions": True,
+        "frequency_actions": True,
+        "shutdown_actions": True,
+        "configuration": True,
+        "reset_safety": True,
+        "stop_sequence": False,
+        "stop_zvs": False,
+        "pause_experiment": True,
+        "cancel_operation": True,
+    }
+    fields.update(overrides)
+    return RigControlState(**fields)
+
+
+def test_emergency_stop_is_never_disabled_by_any_control_state() -> None:
+    """The states that disable everything else — an operation running, the
+    safety latch set, the instruments offline — are exactly the ones in which
+    emergency stop is needed. SmuPanel.apply_control_state must not touch it.
+    """
+    panel = _FakeSmuPanel()
+    for controls in (
+        _controls(),
+        _controls(hardware_actions=False, shutdown_actions=False),
+        _controls(edit_inputs=False, reset_safety=False, configuration=False),
+        _controls(stop_zvs=True),
+    ):
+        panel.apply_control_state(controls)
+    assert panel.estop_button.options == {}, (
+        "emergency stop was disabled by a control-state refresh"
+    )
+
+
+def test_the_zvs_button_becomes_a_stop_button_while_a_search_runs() -> None:
+    panel = _FakeSmuPanel()
+    panel.apply_control_state(_controls(stop_zvs=True, hardware_actions=False))
+    assert panel.zvs_button.options == {"state": "normal", "text": "Stop ZVS"}
+
+
+def test_a_stoppable_search_stays_enabled_even_with_no_hardware_actions() -> None:
+    """Stopping is not a new hardware action. A search that has become
+    unstoppable because the rig went busy is a search that cannot be stopped."""
+    panel = _FakeSmuPanel()
+    panel.apply_control_state(_controls(stop_zvs=True, hardware_actions=False))
+    assert panel.zvs_button.options["state"] == "normal"
+
+
+def test_bus_off_follows_shutdown_actions_not_hardware_actions() -> None:
+    """Making the rig safe must stay available when starting things is not."""
+    panel = _FakeSmuPanel()
+    panel.apply_control_state(
+        _controls(hardware_actions=False, shutdown_actions=True)
+    )
+    assert panel.bus_off_button.options["state"] == "normal"
+
+
+def test_reset_safety_follows_its_own_permission() -> None:
+    panel = _FakeSmuPanel()
+    panel.apply_control_state(_controls(reset_safety=False))
+    assert panel.reset_safety_button.options["state"] == "disabled"

@@ -12,6 +12,8 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Sequence
 
+from gan_fet.ui.widgets import RigControlState, set_widget_enabled
+
 
 class DeviceBar:
     """The device row, gridded into a caller-owned frame.
@@ -67,9 +69,14 @@ class DeviceBar:
 
     def set_enabled(self, enabled: bool) -> None:
         """Enable or disable every control in the row together."""
-        state = "normal" if enabled else "disabled"
         for widget in (self.dropdown, self.add_button, self.remove_button):
-            try:
-                widget.config(state=state)
-            except (tk.TclError, AttributeError):  # pragma: no cover - defensive
-                pass
+            set_widget_enabled(widget, enabled)
+
+    def apply_control_state(self, controls: RigControlState) -> None:
+        """Enable or disable the row for one snapshot of rig state.
+
+        The whole row moves together: choosing a different device mid-run would
+        change which device the samples are being recorded against, so there is
+        no state in which selecting is safe but adding or removing is not.
+        """
+        self.set_enabled(controls.edit_inputs)

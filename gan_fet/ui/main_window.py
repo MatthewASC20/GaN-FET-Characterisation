@@ -94,6 +94,7 @@ from gan_fet.ui.plot import LivePlot
 from gan_fet.ui.tracker_view import UpNextView
 from gan_fet.ui.widgets import (
     resolve_confirm_presentation,
+    set_widget_enabled,
     OperationCoordinator,
     OperationToken,
     ParamButtonGroup,
@@ -558,10 +559,8 @@ class MainWindow(tk.Tk):
             on_apply_wavegen=self._apply_wavegen,
             on_autotune=self._start_autotune,
         )
-        # Enabled state and confirm/autotune styling are resolved by the
-        # window, so these stay addressable from it.
-        self.duration_entry = self.run_controls.duration_entry
-        self.find_zvs_checkbox = self.run_controls.find_zvs_checkbox
+        # Confirm/autotune styling is resolved by the window from the
+        # wavegen's pending state, so those two stay addressable here.
         self.last_current_label = self.run_controls.last_current_label
         self.confirm_button = self.run_controls.confirm_button
         self.autotune_button = self.run_controls.autotune_button
@@ -632,12 +631,7 @@ class MainWindow(tk.Tk):
             padx=5,
             pady=5,
         )
-        # Enabled state is decided by resolve_rig_control_state and applied
-        # here, so the buttons stay addressable from the window.
         self.smu_status_label = self.smu_panel.status_label
-        self.zvs_button = self.smu_panel.zvs_button
-        self.bus_off_button = self.smu_panel.bus_off_button
-        self.reset_safety_button = self.smu_panel.reset_safety_button
         self.estop_button = self.smu_panel.estop_button
 
     def _build_action_buttons(self) -> None:
@@ -1004,29 +998,17 @@ class MainWindow(tk.Tk):
             return
         controls = self._control_state()
 
-        def state(widget, enabled: bool) -> None:
-            if widget is not None:
-                try:
-                    widget.config(state="normal" if enabled else "disabled")
-                except (tk.TclError, AttributeError):
-                    pass
+        state = set_widget_enabled
+
+        # Each panel applies its own slice; the window keeps only the controls
+        # that do not belong to one. Panels are absent during teardown and
+        # before the window is fully built, which is ordinary on those paths.
+        for panel_name in ("device_bar", "run_controls", "smu_panel"):
+            panel = getattr(self, panel_name, None)
+            if panel is not None:
+                panel.apply_control_state(controls)
 
         state(getattr(self, "start_button", None), controls.hardware_actions)
-        if hasattr(self, "zvs_button"):
-            if controls.stop_zvs:
-                self.zvs_button.config(state="normal", text="Stop ZVS")
-            else:
-                self.zvs_button.config(
-                    state="normal" if controls.hardware_actions else "disabled",
-                    text="Find ZVS Now",
-                )
-        state(getattr(self, "bus_off_button", None), controls.shutdown_actions)
-        state(getattr(self, "confirm_button", None), controls.hardware_actions)
-        device_bar = getattr(self, "device_bar", None)
-        if device_bar is not None:
-            device_bar.set_enabled(controls.edit_inputs)
-        state(getattr(self, "duration_entry", None), controls.edit_inputs)
-        state(getattr(self, "find_zvs_checkbox", None), controls.edit_inputs)
         state(
             getattr(self, "sim_validation_button", None),
             controls.hardware_actions,
@@ -1040,10 +1022,6 @@ class MainWindow(tk.Tk):
                 self.configuration_tab,
                 state="normal" if controls.configuration else "disabled",
             )
-        state(
-            getattr(self, "reset_safety_button", None),
-            controls.reset_safety,
-        )
         planner_run = getattr(getattr(self, "planner_tab", None), "run_btn", None)
         planner_points = getattr(
             getattr(self, "planner_tab", None), "current_plan", None
@@ -1329,7 +1307,7 @@ class MainWindow(tk.Tk):
             "duty": self.duty_var.get(),
             "temperature": self.temperature_var.get(),
             "voltage": self.voltage_var.get(),
-            "duration": self.duration_entry.get(),
+            "duration": self.run_controls.duration_entry.get(),
         }
         self.settings.find_zvs_before_run = bool(self.find_zvs_var.get())
         self.settings.tune_frequency_at_operating_point = bool(
@@ -1680,8 +1658,8 @@ class MainWindow(tk.Tk):
         if self.operations.active_kind != "zvs":
             return False
         self.operations.cancel_active()
-        if hasattr(self, "zvs_button"):
-            self.zvs_button.config(text="Stopping...", state="disabled")
+        if hasattr(self, "smu_panel"):
+            self.smu_panel.set_zvs_stopping()
         if hasattr(self, "status_bar"):
             self.status_bar.set_message("Stopping ZVS search safely...")
         return True
@@ -1974,7 +1952,7 @@ class MainWindow(tk.Tk):
         try:
             return build_experiment_params(
                 point,
-                self.duration_entry.get(),
+                self.run_controls.duration_entry.get(),
                 find_zvs=bool(self.find_zvs_var.get()),
                 tune_frequency=bool(self.tune_frequency_var.get()),
             )

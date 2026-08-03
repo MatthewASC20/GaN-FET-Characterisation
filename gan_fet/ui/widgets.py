@@ -325,6 +325,23 @@ def resolve_rig_control_state(
 parse_positive_duration = _parse_positive_duration
 
 
+def set_widget_enabled(widget, enabled: bool) -> None:
+    """Enable or disable one control, tolerating one that is not there.
+
+    Control-state refresh runs on every operation transition, including during
+    teardown and before the whole window has been built. A missing or
+    already-destroyed widget is an ordinary case on those paths, not a fault,
+    and must not stop the rest of the controls being updated — a half-applied
+    refresh could leave an energising action enabled when it should not be.
+    """
+    if widget is None:
+        return
+    try:
+        widget.config(state="normal" if enabled else "disabled")
+    except (tk.TclError, AttributeError):
+        pass
+
+
 class ColorButton(_ColorButtonBase):
     """tk.Button (or tkmacosx.Button on macOS) accepting colour kwargs."""
 
