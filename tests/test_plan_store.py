@@ -151,17 +151,17 @@ def test_with_no_applied_plan_the_queue_says_to_build_one():
 def test_an_applied_plan_names_where_it_came_from():
     store = PlanStore()
     applied = store.apply([_point()] * 10, source="Planner")
-    heading = queue_heading(applied, 7, 5)
-    assert "Applied plan" in heading
-    assert "Planner" in heading
+    assert "Planner" in queue_heading(applied, 7, 5)
 
 
-def test_an_applied_plan_shows_how_much_is_left_of_how_much():
+def test_a_truncated_view_distinguishes_shown_from_remaining_from_planned():
+    """Three different numbers, and confusing them is how the operator ends up
+    believing a plan is smaller than it is."""
     store = PlanStore()
     applied = store.apply([_point()] * 10, source="Planner")
     heading = queue_heading(applied, 7, 5)
-    assert "next 5 of 7" in heading
-    assert "10 total" in heading
+    assert "Showing 5 of 7" in heading
+    assert "10 planned" in heading
 
 
 def test_a_finished_applied_plan_says_it_is_complete():
@@ -285,18 +285,19 @@ def test_an_applied_queue_shows_the_pending_points_in_order():
     applied = store.apply([a, b, c], source="Planner")
     contents = applied_queue(applied, set())
     assert contents.rows == [a, b, c]
-    assert "Applied plan" in contents.heading
+    assert "3 test(s) to run, in order" in contents.heading
 
 
-def test_an_applied_queue_is_capped_but_the_heading_says_the_total():
-    """Five rows fit; the operator still needs to know how many there are."""
+def test_an_explicit_cap_still_reports_the_true_total():
+    """The cap is no longer the default, but if anything asks for one the
+    heading must not let it look like the whole plan."""
     from gan_fet.ui.plan_store import applied_queue
 
     store = PlanStore()
     applied = store.apply([_point(v) for v in range(100, 900, 100)], source="Planner")
-    contents = applied_queue(applied, set())
+    contents = applied_queue(applied, set(), limit=5)
     assert len(contents.rows) == 5
-    assert "next 5 of 8" in contents.heading
+    assert "Showing 5 of 8" in contents.heading
 
 
 def test_a_fully_measured_applied_queue_says_complete_rather_than_going_blank():
@@ -363,3 +364,34 @@ def test_starting_a_finished_plan_says_so_rather_than_offering_the_planner():
     assert decision.action is StartAction.ALREADY_COMPLETE
     assert "already been measured" in decision.message
     assert "clear this one" in decision.message
+
+
+# -- how much of the plan is shown ---------------------------------------------
+
+
+def test_the_table_shows_every_remaining_point_by_default():
+    """A plan you can only see the first five of does not answer "what did I
+    just apply"."""
+    from gan_fet.ui.plan_store import applied_queue
+
+    store = PlanStore()
+    applied = store.apply([_point(v) for v in range(100, 2100, 100)], source="Planner")
+    contents = applied_queue(applied, set())
+    assert len(contents.rows) == 20
+
+
+def test_showing_everything_says_so_rather_than_counting_twice():
+    from gan_fet.ui.plan_store import applied_queue
+
+    store = PlanStore()
+    applied = store.apply([_point(200), _point(300)], source="Planner")
+    assert "2 test(s) to run, in order" in applied_queue(applied, set()).heading
+
+
+def test_a_capped_view_says_it_is_showing_only_some():
+    from gan_fet.ui.plan_store import applied_queue
+
+    store = PlanStore()
+    applied = store.apply([_point(v) for v in range(100, 900, 100)], source="Planner")
+    heading = applied_queue(applied, set(), limit=3).heading
+    assert "Showing 3 of 8" in heading

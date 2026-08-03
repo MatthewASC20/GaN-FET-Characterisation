@@ -450,11 +450,15 @@ class PlannerTab(ttk.Frame):
         self.on_apply_plan(plan)
 
     def _start_sequence(self) -> None:
-        # Rebuild at click time so edits made after the last explicit
-        # "Generate" action can never launch a stale matrix.
+        # Rebuilt at click time so edits made since the last apply cannot
+        # launch a stale matrix.
         plan = self.generate_plan(show_errors=True)
         if not plan or not plan.points:
-            messagebox.showwarning("No Test Plan", "Please generate a test plan first.")
+            messagebox.showwarning(
+                "No Test Plan",
+                "There is nothing to run. Select parameters above to build a "
+                "plan first.",
+            )
             return
 
         try:
@@ -468,10 +472,12 @@ class PlannerTab(ttk.Frame):
             return
 
         find_zvs = self.find_zvs_var.get()
-        # Apply first: starting switches to the Experiment tab, and its queue
-        # has to describe the sequence that is about to run rather than a
-        # matrix rebuilt from that tab's own selectors.
-        self.on_apply_plan(plan)
+        # Apply first, and only start if it took. Declining the "replace the
+        # applied plan?" prompt and then starting anyway would leave the
+        # Planned Tests table describing one plan while the sequence ran
+        # another — the divergence this whole arrangement exists to prevent.
+        if not self.on_apply_plan(plan):
+            return
         self.on_start_sequence(plan, duration, find_zvs)
 
     def _export_csv(self) -> None:

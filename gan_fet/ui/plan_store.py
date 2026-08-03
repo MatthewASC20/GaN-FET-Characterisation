@@ -164,16 +164,20 @@ class QueueContents:
 
 
 def applied_queue(
-    applied: AppliedPlan, completed: set, *, limit: int = 5
+    applied: AppliedPlan, completed: set, *, limit: Optional[int] = None
 ) -> QueueContents:
     """Rows and heading for an applied plan.
 
-    Extracted from the widget because a blank queue is indistinguishable from
+    Every remaining point by default. The table exists to show what the plan
+    is, and a plan you can only see the first five of is not much of an
+    answer to "what did I just apply".
+
+    Extracted from the widget because a blank table is indistinguishable from
     a broken one on screen, and a bug in here could only be found by running
     the application. Now it can be exercised without a display.
     """
     pending = pending_points(applied, completed)
-    shown = pending[:limit]
+    shown = pending if limit is None else pending[:limit]
     return QueueContents(shown, queue_heading(applied, len(pending), len(shown)))
 
 
@@ -200,9 +204,14 @@ def queue_heading(
         return NO_PLAN_HEADING
     if pending <= 0:
         return f"Applied plan complete — all {len(applied)} points measured."
+    if shown >= pending:
+        return (
+            f"{pending} test(s) to run, in order "
+            f"({applied.source}, {len(applied)} planned)."
+        )
     return (
-        f"Applied plan ({applied.source}): next {shown} of {pending} "
-        f"remaining, {len(applied)} total."
+        f"Showing {shown} of {pending} remaining "
+        f"({applied.source}, {len(applied)} planned)."
     )
 
 

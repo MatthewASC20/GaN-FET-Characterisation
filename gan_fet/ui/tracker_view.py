@@ -413,7 +413,12 @@ class TrackerView(tk.Frame):
 
 
 class UpNextView(ttk.LabelFrame):
-    """Widget displaying the next 5 tests that will run when auto sequence is enabled."""
+    """The applied test plan, in the order it will run.
+
+    Every remaining point, scrollable. This is where the operator confirms
+    that what they applied is what they meant, so showing a truncated five
+    would answer the wrong question.
+    """
 
     def __init__(
         self,
@@ -423,7 +428,7 @@ class UpNextView(ttk.LabelFrame):
         plan_store=None,
         **kwargs,
     ):
-        super().__init__(master, text="Auto Testing Queue (Next 5 Tests)", **kwargs)
+        super().__init__(master, text="Planned Tests", **kwargs)
         self.db = db
         self.get_device_name = get_device_name
         # When a plan has been applied, it is what runs, so it is what this
@@ -435,8 +440,10 @@ class UpNextView(ttk.LabelFrame):
     def _build_ui(self) -> None:
         self.status_lbl = ttk.Label(
             self,
-            text="Next test points scheduled for execution if auto sequence is enabled:",
+            text=NO_PLAN_HEADING,
             font=("TkDefaultFont", 9, "italic"),
+            wraplength=900,
+            justify="left",
         )
         self.status_lbl.pack(anchor="w", padx=10, pady=(5, 2))
 
@@ -444,7 +451,13 @@ class UpNextView(ttk.LabelFrame):
         table_frame.pack(fill="both", expand=True, padx=10, pady=(0, 5))
 
         columns = ("step", "temp", "config", "freq", "duty", "voltage")
-        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=5)
+        self.tree = ttk.Treeview(
+            table_frame, columns=columns, show="headings", height=10
+        )
+        scrollbar = ttk.Scrollbar(
+            table_frame, orient="vertical", command=self.tree.yview
+        )
+        self.tree.configure(yscrollcommand=scrollbar.set)
 
         self.tree.heading("step", text="#")
         self.tree.heading("temp", text="Temp (°C)")
@@ -461,6 +474,7 @@ class UpNextView(ttk.LabelFrame):
         self.tree.column("voltage", width=90, anchor="center")
 
         self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
 
     def refresh(self) -> None:
         """Show the applied plan, or say that there is none.
